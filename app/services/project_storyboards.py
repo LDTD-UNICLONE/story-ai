@@ -230,6 +230,11 @@ async def run_storyboard_analysis_in_worker(
     )
     items = parse_storyboard_items(model_result.content)
     if not items:
+        task_record.extra = {
+            **(task_record.extra or {}),
+            "invalid_model_result_preview": (model_result.content or "")[:2000],
+            "model_result_extra": model_result.extra,
+        }
         raise AppException("分镜分析未返回有效数据", code=50231, status_code=502)
 
     await db.execute(
@@ -291,10 +296,8 @@ async def run_storyboard_analysis_in_worker(
 
 
 def parse_storyboard_items(content: str) -> List[Dict[str, Any]]:
-    payload = _parse_json_object(content)
-    items = payload.get("items") if isinstance(payload, dict) else None
-    if not isinstance(items, list):
-        items = payload.get("shots") if isinstance(payload, dict) else None
+    payload = _parse_json_payload(content)
+    items = _extract_storyboard_items(payload)
     if not isinstance(items, list):
         return []
     return [_normalize_storyboard_item(item, index) for index, item in enumerate(items, start=1) if isinstance(item, dict)]
@@ -348,54 +351,87 @@ def _storyboard_asset_payload(asset: Any) -> Dict[str, Any]:
 
 
 def _normalize_storyboard_item(item: Dict[str, Any], index: int) -> Dict[str, Any]:
-    description_prompt = str(item.get("description_prompt") or "")
-    scenes = _as_string_list(item.get("scenes"))
-    duration = item.get("video_duration_seconds")
+    description_prompt = str(_first_value(item, "description_prompt", "画面描述", "视频提示词") or "")
+    scenes = _as_string_list(_first_value(item, "scenes", "场景", "场景名称"))
+    duration = _first_value(item, "video_duration_seconds", "duration_seconds", "时长", "时长建议")
     if duration not in (None, ""):
         duration_suggestion = f"{_as_int(duration, 5)}s"
     else:
-        duration_suggestion = str(item.get("duration_suggestion") or "")
+        duration_suggestion = str(_first_value(item, "duration_suggestion", "时长建议") or "")
     return {
         **item,
-        "shot_number": item.get("shot_number") or item.get("storyboard_index") or index,
-        "title": item.get("title") or f"分镜{item.get('storyboard_index') or index}",
-        "source_content": item.get("source_content") or item.get("original_text") or "",
-        "scene_name": item.get("scene_name") or (scenes[0] if scenes else ""),
-        "scene_time": item.get("scene_time") or "",
-        "shot_size": item.get("shot_size") or "",
-        "camera_angle": item.get("camera_angle") or "",
-        "camera_movement": item.get("camera_movement") or "",
-        "screen_execution": item.get("screen_execution") or "",
-        "characters": item.get("characters") or [],
-        "props": item.get("props") or [],
-        "action": item.get("action") or description_prompt,
-        "character_action": item.get("character_action") or item.get("action") or "",
-        "character_expression": item.get("character_expression") or item.get("emotion") or "",
-        "dialogue": item.get("dialogue") or "",
-        "sound_effect": item.get("sound_effect") or "",
-        "emotion": item.get("emotion") or "",
-        "visual_description": item.get("visual_description") or description_prompt,
-        "image_prompt": item.get("image_prompt") or "",
-        "video_prompt": item.get("video_prompt") or description_prompt,
+        "shot_number": _first_value(item, "shot_number", "storyboard_index", "分镜序号", "镜头编号") or index,
+        "title": _first_value(item, "title", "标题") or f"分镜{_first_value(item, 'storyboard_index') or index}",
+        "source_content": _first_value(item, "source_content", "original_text", "原文", "原始文本") or "",
+        "scene_name": _first_value(item, "scene_name", "scene", "场景名称") or (scenes[0] if scenes else ""),
+        "scene_time": _first_value(item, "scene_time", "场景时间", "时间") or "",
+        "shot_size": _first_value(item, "shot_size", "景别") or "",
+        "camera_angle": _first_value(item, "camera_angle", "拍摄角度") or "",
+        "camera_movement": _first_value(item, "camera_movement", "运镜", "镜头运动") or "",
+        "screen_execution": _first_value(item, "screen_execution", "画面执行") or "",
+        "characters": _first_value(item, "characters", "角色", "人物") or [],
+        "props": _first_value(item, "props", "道具") or [],
+        "action": _first_value(item, "action", "动作") or description_prompt,
+        "character_action": _first_value(item, "character_action", "角色动作") or _first_value(item, "action", "动作") or "",
+        "character_expression": _first_value(item, "character_expression", "角色表情") or _first_value(item, "emotion", "情绪") or "",
+        "dialogue": _first_value(item, "dialogue", "台词") or "",
+        "sound_effect": _first_value(item, "sound_effect", "音效") or "",
+        "emotion": _first_value(item, "emotion", "情绪") or "",
+        "visual_description": _first_value(item, "visual_description", "画面内容", "画面描述") or description_prompt,
+        "image_prompt": _first_value(item, "image_prompt", "图像提示词") or "",
+        "video_prompt": _first_value(item, "video_prompt", "视频提示词") or description_prompt,
         "duration_suggestion": duration_suggestion,
-        "production_focus": item.get("production_focus") or "",
-        "negative_prompt": item.get("negative_prompt") or "",
+        "production_focus": _first_value(item, "production_focus", "制作重点") or "",
+        "negative_prompt": _first_value(item, "negative_prompt", "负面规避词", "负面规避") or "",
     }
 
 
-def _parse_json_object(content: str) -> Dict[str, Any]:
+def _extract_storyboard_items(payload: Any) -> Optional[List[Any]]:
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return None
+    for key in ("items", "shots", "storyboards", "分镜", "分镜列表"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+    data = payload.get("data") or payload.get("result")
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return _extract_storyboard_items(data)
+    return None
+
+
+def _parse_json_payload(content: str) -> Any:
+    content = _strip_json_code_fence(content or "")
     try:
-        payload = json.loads(content)
-        return payload if isinstance(payload, dict) else {}
+        return json.loads(content)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", content or "", re.S)
-        if not match:
-            return {}
+        pass
+
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"[\{\[]", content):
         try:
-            payload = json.loads(match.group(0))
-            return payload if isinstance(payload, dict) else {}
+            payload, _ = decoder.raw_decode(content[match.start() :])
+            return payload
         except json.JSONDecodeError:
-            return {}
+            continue
+    return {}
+
+
+def _strip_json_code_fence(content: str) -> str:
+    content = content.strip()
+    match = re.search(r"```(?:json)?\s*(.*?)```", content, re.S | re.I)
+    return match.group(1).strip() if match else content
+
+
+def _first_value(item: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = item.get(key)
+        if value not in (None, ""):
+            return value
+    return None
 
 
 def _as_int(value: Any, default: int) -> int:
