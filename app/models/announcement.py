@@ -19,6 +19,7 @@ class Announcement(Base, TimestampMixin):
     )
     title: Mapped[str] = mapped_column(String(128), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_format: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'plain'"))
     image_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     link_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     announcement_type: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'notice'"))

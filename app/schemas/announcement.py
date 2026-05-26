@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
 from pydantic import ConfigDict, Field
@@ -12,6 +12,7 @@ class AnnouncementBaseOut(SchemaBaseModel):
     id: UUID
     title: str
     content: str
+    content_format: str
     image_url: Optional[str] = None
     link_url: Optional[str] = None
     announcement_type: str
@@ -38,6 +39,7 @@ class AnnouncementListOut(SchemaBaseModel):
 class AnnouncementCreateRequest(SchemaBaseModel):
     title: str = Field(..., min_length=1, max_length=128)
     content: str = Field(..., min_length=1)
+    content_format: Literal["plain", "markdown", "html"] = "plain"
     image_url: Optional[str] = Field(default=None, max_length=512)
     link_url: Optional[str] = Field(default=None, max_length=512)
     announcement_type: str = Field(default="notice", min_length=1, max_length=32)
@@ -52,6 +54,7 @@ class AnnouncementCreateRequest(SchemaBaseModel):
 class AnnouncementUpdateRequest(SchemaBaseModel):
     title: Optional[str] = Field(default=None, min_length=1, max_length=128)
     content: Optional[str] = Field(default=None, min_length=1)
+    content_format: Optional[Literal["plain", "markdown", "html"]] = None
     image_url: Optional[str] = Field(default=None, max_length=512)
     link_url: Optional[str] = Field(default=None, max_length=512)
     announcement_type: Optional[str] = Field(default=None, min_length=1, max_length=32)
