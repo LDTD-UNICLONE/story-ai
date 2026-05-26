@@ -199,6 +199,49 @@ async def get_task_record_or_404(
     return record
 
 
+def is_task_record_interrupted(record: UserTaskRecord) -> bool:
+    return bool((record.extra or {}).get("interrupted"))
+
+
+async def refresh_task_record_interrupted(db: AsyncSession, record: UserTaskRecord) -> bool:
+    await db.refresh(record)
+    return is_task_record_interrupted(record)
+
+
+async def interrupt_task_record(
+    db: AsyncSession,
+    task_record_id: UUID,
+    admin_user_id: UUID,
+    reason: Optional[str] = None,
+) -> UserTaskRecord:
+    result = await db.execute(
+        select(UserTaskRecord)
+        .where(UserTaskRecord.id == task_record_id)
+        .with_for_update()
+    )
+    record = result.scalar_one_or_none()
+    if record is None:
+        raise AppException("任务记录不存在", code=40406, status_code=404)
+    if record.status in {"success", "failed"}:
+        raise AppException("任务已结束，不能中断", code=40035, status_code=400)
+
+    public_reason = sanitize_public_message(reason or "任务已被管理员中断，生成失败")
+    record.status = "failed"
+    record.result = public_reason
+    record.extra = {
+        **(record.extra or {}),
+        "failed_reason": public_reason,
+        "interrupted": True,
+        "interrupted_by": str(admin_user_id),
+        "interrupted_at": beijing_datetime().isoformat(),
+    }
+    await _refund_interrupted_task_points(db, record)
+    await _sync_stale_failed_business_state(db, record, public_reason)
+    await db.commit()
+    await db.refresh(record)
+    return record
+
+
 async def reconcile_provider_task_result(db: AsyncSession, record: UserTaskRecord) -> None:
     if record.status not in {"pending", "running"}:
         return
@@ -371,6 +414,23 @@ async def _refund_stale_task_points(db: AsyncSession, record: UserTaskRecord) ->
         amount=record.points_cost,
         transaction_type="refund",
         remark=f"任务超时失败退回积分：{record.title}",
+        auto_commit=False,
+    )
+    record.extra = {
+        **(record.extra or {}),
+        "refund_transaction_id": str(refund_transaction.id),
+    }
+
+
+async def _refund_interrupted_task_points(db: AsyncSession, record: UserTaskRecord) -> None:
+    if record.points_cost <= 0 or (record.extra or {}).get("refund_transaction_id"):
+        return
+    refund_transaction = await change_user_points(
+        db,
+        user_id=record.user_id,
+        amount=record.points_cost,
+        transaction_type="refund",
+        remark=f"任务中断退回积分：{record.title}",
         auto_commit=False,
     )
     record.extra = {
@@ -676,7 +736,7 @@ def _parse_uuid(value: Any) -> Optional[UUID]:
 
 
 def _is_provider_failed_status(status: str) -> bool:
-    return status in {"failed", "failure", "error", "cancelled", "canceled"}
+    return status in {"failed", "failure", "fail", "error", "cancelled", "canceled"}
 
 
 def _is_provider_success_result(model_result: ModelRunResult, status: str) -> bool:

@@ -17,13 +17,13 @@ from app.models.user import User
 from app.schemas.project_asset import ProjectAssetImageGenerateRequest
 from app.services.generated_media import persist_generated_media_to_oss
 from app.core.config import settings
-from app.services.model_points import calculate_model_points_cost
+from app.services.model_points import calculate_submission_points_cost
 from app.services.model_runner import ModelRunResult, query_model_task, run_model
 from app.services.points import change_user_points, consume_user_points
 from app.services.prompts import load_constant_prompt
 from app.services.project_assets import get_project_asset_or_404
 from app.services.projects import get_project_or_404
-from app.services.task_records import create_user_task_record
+from app.services.task_records import create_user_task_record, refresh_task_record_interrupted
 
 
 ASSET_IMAGE_CONFIG: Dict[str, Dict[str, Any]] = {
@@ -46,7 +46,7 @@ async def submit_asset_image_generation(
     asset = await get_project_asset_or_404(db, config["model"], project_id, asset_id, user.id)
     ai_model = await get_enabled_image_model_or_404(db, payload.ai_model_id)
     generation_mode = normalize_generation_mode(payload.generation_mode)
-    points_cost = calculate_model_points_cost(ai_model)
+    points_cost = calculate_submission_points_cost(ai_model, "image", payload.extra or {})
 
     points_transaction = None
     if points_cost > 0:
@@ -145,6 +145,9 @@ async def run_asset_image_generation_in_worker(
     )
     model_result = await _resolve_image_provider_task(model_snapshot, model_result)
     model_result = await persist_generated_media_to_oss("image", model_result)
+    if await refresh_task_record_interrupted(db, task_record):
+        return
+
     if model_result.extra.get("platform_task_status") == "running":
         asset.extra = {
             **(asset.extra or {}),
@@ -290,7 +293,7 @@ async def _resolve_image_provider_task(model_snapshot: SimpleNamespace, model_re
         await asyncio.sleep(settings.provider_task_worker_poll_interval_seconds)
         latest_result = await query_model_task(model_snapshot, "image", str(task_id))
         status = str(latest_result.extra.get("task_status") or "").lower()
-        if status in {"failed", "fail", "error", "canceled", "cancelled"}:
+        if status in {"failed", "failure", "fail", "error", "canceled", "cancelled"}:
             raise AppException(f"模型任务执行失败：{status}", code=50231, status_code=502)
         if status in {"success", "succeeded", "completed", "complete", "finished", "done"}:
             return latest_result

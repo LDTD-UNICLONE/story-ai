@@ -1,4 +1,5 @@
-from typing import Tuple
+import logging
+from typing import Optional, Tuple
 from uuid import UUID
 
 from sqlalchemy import select
@@ -14,6 +15,8 @@ from app.services.model_points import calculate_model_points_cost
 from app.services.points import change_user_points, consume_user_points
 from app.services.project_chapters import get_project_chapter_or_404
 from app.services.task_records import create_user_task_record
+
+logger = logging.getLogger(__name__)
 
 
 async def submit_project_chapter_processing(
@@ -90,8 +93,9 @@ async def submit_project_chapter_processing(
         from app.tasks.project_chapter import run_project_chapter_processing
 
         run_project_chapter_processing.delay(str(task_record.id), str(chapter.id))
-    except Exception:
-        await _mark_chapter_enqueue_failed(db, task_record, chapter)
+    except Exception as exc:
+        logger.exception("Project chapter task enqueue failed: task_record_id=%s", task_record.id)
+        await _mark_chapter_enqueue_failed(db, task_record, chapter, exc)
         await db.refresh(chapter)
     return chapter, task_record, points_cost
 
@@ -118,6 +122,7 @@ async def _mark_chapter_enqueue_failed(
     db: AsyncSession,
     task_record: UserTaskRecord,
     chapter: ProjectChapter,
+    exc: Optional[Exception] = None,
 ) -> None:
     refund_transaction_id = None
     if task_record.points_cost > 0:
@@ -135,6 +140,7 @@ async def _mark_chapter_enqueue_failed(
     task_record.extra = {
         **(task_record.extra or {}),
         "failed_reason": "任务入队失败",
+        "raw_failed_reason": str(exc) if exc else "任务入队失败",
         "refund_transaction_id": refund_transaction_id,
     }
     chapter.process_status = "failed"

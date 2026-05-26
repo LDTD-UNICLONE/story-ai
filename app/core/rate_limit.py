@@ -1,3 +1,4 @@
+import re
 from typing import Optional
 
 from fastapi import Request
@@ -19,7 +20,7 @@ class RedisRateLimitMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         rule = _match_rule(request)
-        identity = _identity(request)
+        identity = _identity(request, rule)
         window = settings.rate_limit_window_seconds
         keys = _rate_limit_keys(rule)
 
@@ -91,15 +92,31 @@ def _limit_for_rule(rule: str) -> int:
     return 0
 
 
-def _identity(request: Request) -> str:
+def _identity(request: Request, rule: str = "global") -> str:
     user_id: Optional[str] = getattr(request.state, "user_id", None)
+    polling_key = _polling_identity_key(request.url.path) if rule == "polling" else None
     if user_id:
-        return f"user:{user_id}"
+        return f"user:{user_id}:{polling_key}" if polling_key else f"user:{user_id}"
     forwarded_for = request.headers.get("x-forwarded-for")
     if forwarded_for:
-        return f"ip:{forwarded_for.split(',')[0].strip()}"
+        identity = f"ip:{forwarded_for.split(',')[0].strip()}"
+        return f"{identity}:{polling_key}" if polling_key else identity
     host = request.client.host if request.client else "unknown"
-    return f"ip:{host}"
+    identity = f"ip:{host}"
+    return f"{identity}:{polling_key}" if polling_key else identity
+
+
+def _polling_identity_key(path: str) -> Optional[str]:
+    generation_task_match = re.search(r"/generation-tasks/([^/]+)$", path)
+    if generation_task_match:
+        return f"generation-task:{generation_task_match.group(1)}"
+    task_record_match = re.search(r"/task-records/([^/]+)$", path)
+    if task_record_match:
+        return f"task-record:{task_record_match.group(1)}"
+    storyboard_match = re.search(r"/storyboards/([^/]+)$", path)
+    if storyboard_match:
+        return f"storyboard:{storyboard_match.group(1)}"
+    return None
 
 
 def _rate_limited_response(rule_name: str, limit: int, retry_after_seconds: int) -> Response:

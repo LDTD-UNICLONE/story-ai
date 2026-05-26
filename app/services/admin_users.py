@@ -6,9 +6,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import AppException
+from app.core.config import settings
 from app.core.security import hash_password
 from app.models.user import User
-from app.schemas.user import AdminUserUpdateRequest
+from app.schemas.user import AdminUserCreateRequest, AdminUserUpdateRequest
+from app.services.points import change_user_points
 
 
 async def list_users(
@@ -52,6 +54,48 @@ async def get_user_or_404(db: AsyncSession, user_id: UUID) -> User:
     user = result.scalar_one_or_none()
     if user is None:
         raise AppException("用户不存在", code=40401, status_code=404)
+    return user
+
+
+async def create_user(db: AsyncSession, payload: AdminUserCreateRequest) -> User:
+    unique_conditions = [User.account == payload.account]
+    if payload.phone:
+        unique_conditions.append(User.phone == payload.phone)
+    if payload.email:
+        unique_conditions.append(User.email == payload.email)
+
+    exists = await db.execute(select(User).where(or_(*unique_conditions)))
+    if exists.scalar_one_or_none() is not None:
+        raise AppException("账号、手机号或邮箱已存在", code=40901, status_code=409)
+
+    user = User(
+        account=payload.account,
+        password_hash=hash_password(payload.password),
+        nickname=payload.nickname,
+        avatar=payload.avatar or settings.default_user_avatar,
+        phone=payload.phone,
+        email=payload.email,
+        is_admin=payload.is_admin,
+        is_enabled=payload.is_enabled,
+    )
+    db.add(user)
+    try:
+        await db.flush()
+        if payload.points_balance > 0:
+            await change_user_points(
+                db,
+                user_id=user.id,
+                amount=payload.points_balance,
+                transaction_type="admin_create",
+                remark="管理员创建用户初始积分",
+                auto_commit=False,
+            )
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise AppException("账号、手机号或邮箱已存在", code=40901, status_code=409) from exc
+
+    await db.refresh(user)
     return user
 
 

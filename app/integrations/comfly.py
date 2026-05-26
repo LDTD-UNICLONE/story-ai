@@ -62,6 +62,7 @@ IMAGE_GENERATION_REQUEST_KEYS = {
     "aspect_ratio",
     "image",
     "n",
+    "response_format",
 }
 
 
@@ -110,14 +111,14 @@ VIDEO_GENERATION_HELPER_KEYS = {
 def _base_url() -> str:
     base_url = settings.comfly_base_url
     if not base_url:
-        raise AppException("COMFLY_BASE_URL 未配置", code=50020, status_code=500)
+        raise AppException("模型服务地址未配置", code=50020, status_code=500)
     return base_url.rstrip("/")
 
 
 def _api_key() -> str:
     api_key = settings.comfly_api_key
     if not api_key:
-        raise AppException("COMFLY_API_KEY 未配置", code=50021, status_code=500)
+        raise AppException("模型服务密钥未配置", code=50021, status_code=500)
     return api_key
 
 
@@ -183,19 +184,19 @@ async def list_provider_models() -> List[Dict[str, Any]]:
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text[:200] if exc.response is not None else ""
         raise AppException(
-            f"获取 Comfly 模型列表失败，HTTP {exc.response.status_code}: {detail}",
+            f"获取模型列表失败，HTTP {exc.response.status_code}: {detail}",
             code=50201,
             status_code=502,
         ) from exc
     except httpx.TimeoutException as exc:
-        raise AppException("获取 Comfly 模型列表超时", code=50205, status_code=502) from exc
+        raise AppException("获取模型列表超时", code=50205, status_code=502) from exc
     except httpx.HTTPError as exc:
-        raise AppException("无法连接 Comfly 模型服务", code=50202, status_code=502) from exc
+        raise AppException("无法连接模型服务", code=50202, status_code=502) from exc
 
     payload = response.json()
     data = payload.get("data")
     if not isinstance(data, list):
-        raise AppException("Comfly 模型列表响应格式错误", code=50203, status_code=502)
+        raise AppException("模型列表响应格式错误", code=50203, status_code=502)
     return data
 
 
@@ -207,14 +208,14 @@ async def _get_json(path: str) -> Dict[str, Any]:
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text[:200] if exc.response is not None else ""
         raise AppException(
-            f"Comfly 任务查询失败，HTTP {exc.response.status_code}: {detail}",
+            f"任务查询失败，HTTP {exc.response.status_code}: {detail}",
             code=50204,
             status_code=502,
         ) from exc
     except httpx.TimeoutException as exc:
-        raise AppException("Comfly 任务查询超时", code=50206, status_code=502) from exc
+        raise AppException("任务查询超时", code=50206, status_code=502) from exc
     except httpx.HTTPError as exc:
-        raise AppException("无法连接 Comfly 模型服务", code=50202, status_code=502) from exc
+        raise AppException("无法连接模型服务", code=50202, status_code=502) from exc
 
     return response.json()
 
@@ -231,14 +232,14 @@ async def _post_json(
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text[:200] if exc.response is not None else ""
         raise AppException(
-            f"Comfly 模型调用失败，HTTP {exc.response.status_code}: {detail}",
+            f"模型调用失败，HTTP {exc.response.status_code}: {detail}",
             code=50204,
             status_code=502,
         ) from exc
     except httpx.TimeoutException as exc:
-        raise AppException("Comfly 模型调用超时", code=50206, status_code=502) from exc
+        raise AppException("模型调用超时", code=50206, status_code=502) from exc
     except httpx.HTTPError as exc:
-        raise AppException("无法连接 Comfly 模型服务", code=50202, status_code=502) from exc
+        raise AppException("无法连接模型服务", code=50202, status_code=502) from exc
 
     return response.json()
 
@@ -256,14 +257,14 @@ async def _post_multipart(
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text[:200] if exc.response is not None else ""
         raise AppException(
-            f"Comfly 图像编辑调用失败，HTTP {exc.response.status_code}: {detail}",
+            f"图像编辑调用失败，HTTP {exc.response.status_code}: {detail}",
             code=50204,
             status_code=502,
         ) from exc
     except httpx.TimeoutException as exc:
-        raise AppException("Comfly 图像编辑调用超时", code=50206, status_code=502) from exc
+        raise AppException("图像编辑调用超时", code=50206, status_code=502) from exc
     except httpx.HTTPError as exc:
-        raise AppException("无法连接 Comfly 模型服务", code=50202, status_code=502) from exc
+        raise AppException("无法连接模型服务", code=50202, status_code=502) from exc
 
     return response.json()
 
@@ -450,7 +451,8 @@ async def query_image_generation(task_id: str) -> Dict[str, Any]:
 
 async def create_video_generation(model: str, prompt: str, extra: Dict[str, Any]) -> Dict[str, Any]:
     payload: Dict[str, Any] = {"model": model, "prompt": prompt}
-    _normalize_video_first_last_frames(payload, extra)
+    allowed_keys = allowed_video_request_keys(model, extra.get("_model_capabilities") or {})
+    _normalize_video_images(payload, extra, allowed_keys)
     _merge_video_extra(payload, model, extra, VIDEO_GENERATION_HELPER_KEYS)
     return await _post_json("/v2/videos/generations", payload)
 
@@ -516,14 +518,25 @@ def _merge_video_extra(
     adapt_video_dimensions(payload, extra, allowed_keys)
 
 
-def _normalize_video_first_last_frames(payload: Dict[str, Any], extra: Dict[str, Any]) -> None:
-    video_mode = str(extra.get("video_mode") or extra.get("capability") or "").strip()
-    if video_mode != "first_last_frame":
+def _normalize_video_images(payload: Dict[str, Any], extra: Dict[str, Any], allowed_keys: Set[str]) -> None:
+    if "images" not in allowed_keys:
         return
 
-    frame_urls = _collect_first_last_frame_urls(extra)
-    if frame_urls:
-        payload["images"] = frame_urls
+    image_urls = _collect_video_image_urls(extra)
+    if image_urls:
+        payload["images"] = image_urls
+
+
+def _collect_video_image_urls(extra: Dict[str, Any]) -> List[str]:
+    video_mode = str(extra.get("video_mode") or extra.get("capability") or "").strip()
+    if video_mode == "first_last_frame":
+        return _collect_first_last_frame_urls(extra)
+
+    values: List[Any] = []
+    for key in ("images", "image", "image_url", "image_urls", "reference_images", "reference_image_urls"):
+        if key in extra:
+            values.extend(_as_list(extra[key]))
+    return _collect_urls(values)
 
 
 def _collect_first_last_frame_urls(extra: Dict[str, Any]) -> List[str]:

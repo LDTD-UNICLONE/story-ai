@@ -77,6 +77,8 @@ class ConversationSendMessageOut(SchemaBaseModel):
     user_message: ConversationMessageOut
     assistant_message: ConversationMessageOut
     points_cost: int
+    task_record_id: Optional[UUID] = None
+    task_status: str = "pending"
 
 
 class ConversationGenerationTaskOut(SchemaBaseModel):
@@ -89,6 +91,8 @@ class ConversationGenerationTaskOut(SchemaBaseModel):
     result: Optional[str] = None
     extra: Dict[str, Any]
     assistant_message: Optional[ConversationMessageOut] = None
+    stop_polling: bool = False
+    next_poll_seconds: Optional[int] = None
     created_at: datetime
     updated_at: datetime
 

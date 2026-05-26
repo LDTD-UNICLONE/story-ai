@@ -13,7 +13,7 @@ from app.models.user import User
 from app.schemas.conversation import ConversationCreateRequest, ConversationSendMessageRequest, ConversationUpdateRequest
 from app.services.model_runner import ModelRunResult, query_model_task
 from app.services.generated_media import persist_generated_media_to_oss
-from app.services.model_points import calculate_model_points_cost
+from app.services.model_points import calculate_submission_points_cost
 from app.services.points import change_user_points, consume_user_points
 from app.services.task_records import (
     create_user_task_record,
@@ -321,9 +321,17 @@ async def send_conversation_message(
     conversation_type = conversation.conversation_type
     ai_model_db_id = ai_model.id
     ai_model_nickname = ai_model.nickname
-    ai_model_points_cost = calculate_model_points_cost(ai_model)
     if conversation.ai_model_id != ai_model_db_id:
         conversation.ai_model_id = ai_model_db_id
+
+    message_extra = await _build_message_extra_with_context(
+        db,
+        conversation_id=conversation_db_id,
+        conversation_type=conversation_type,
+        content=payload.content,
+        extra=payload.extra or {},
+    )
+    ai_model_points_cost = calculate_submission_points_cost(ai_model, conversation_type, message_extra)
 
     points_transaction = None
     if ai_model_points_cost > 0:
@@ -334,14 +342,6 @@ async def send_conversation_message(
             remark=f"对话模型调用：{ai_model_nickname}",
             auto_commit=False,
         )
-
-    message_extra = await _build_message_extra_with_context(
-        db,
-        conversation_id=conversation_db_id,
-        conversation_type=conversation_type,
-        content=payload.content,
-        extra=payload.extra or {},
-    )
 
     user_message = ConversationMessage(
         conversation_id=conversation_db_id,

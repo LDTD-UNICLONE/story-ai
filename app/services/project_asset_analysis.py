@@ -14,14 +14,14 @@ from app.models.project_chapter import ProjectChapter
 from app.models.task_record import UserTaskRecord
 from app.models.user import User
 from app.schemas.project_asset import ProjectAssetAnalyzeRequest
-from app.services.model_points import calculate_model_points_cost
+from app.services.model_points import calculate_model_points_cost, settle_text_task_points
 from app.services.model_runner import run_model
 from app.services.points import change_user_points, consume_user_points
 from app.services.project_chapter_processing import get_enabled_text_model_or_404
 from app.services.project_chapters import get_project_chapter_or_404
 from app.services.prompts import render_system_prompt
 from app.services.projects import get_project_or_404
-from app.services.task_records import create_user_task_record
+from app.services.task_records import create_user_task_record, refresh_task_record_interrupted
 
 
 ASSET_CONFIG: Dict[str, Dict[str, Any]] = {
@@ -161,9 +161,20 @@ async def run_asset_analysis_in_worker(
         model_prompt,
         (task_record.extra or {}).get("model_extra") or {},
     )
+    if await refresh_task_record_interrupted(db, task_record):
+        return
+
     items = parse_asset_items(model_result.content)
     if not items:
         raise AppException("资源分析未返回有效数据", code=50231, status_code=502)
+
+    await settle_text_task_points(
+        db,
+        task_record,
+        ai_model,
+        model_result.extra,
+        remark_prefix=str(config["title"]),
+    )
 
     model = config["model"]
     for item in items:

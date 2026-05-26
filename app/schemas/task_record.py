@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
-from pydantic import ConfigDict, field_serializer
+from pydantic import ConfigDict, Field, field_serializer
 
 from app.core.public_messages import sanitize_public_data, sanitize_public_message
 from app.schemas.base import SchemaBaseModel
@@ -52,3 +52,7 @@ class TaskRecordOptionsOut(SchemaBaseModel):
     business_types: List[Dict[str, str]]
     generation_types: List[TaskRecordGenerationTypeOption]
     statuses: List[Dict[str, str]]
+
+
+class AdminTaskRecordInterruptRequest(SchemaBaseModel):
+    reason: Optional[str] = Field(default=None, max_length=200)

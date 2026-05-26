@@ -17,8 +17,10 @@ from app.models.ai_model import AiModel
 from app.models.conversation import Conversation, ConversationMessage
 from app.models.task_record import UserTaskRecord
 from app.services.generated_media import persist_generated_media_to_oss
+from app.services.model_points import settle_text_task_points
 from app.services.model_runner import ModelRunResult, query_model_task, run_model
 from app.services.points import change_user_points
+from app.services.task_records import refresh_task_record_interrupted
 from app.worker import celery_app
 
 
@@ -144,6 +146,9 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
             )
             return
 
+        if await refresh_task_record_interrupted(db, task_record):
+            return
+
         assistant_message.content = model_result.content
         assistant_message.extra = {
             **(assistant_message.extra or {}),
@@ -165,6 +170,9 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
                 .values(updated_at=beijing_datetime())
             )
         await db.commit()
+
+        if task_record.generation_type == "text":
+            await _settle_text_points_after_success(db, task_record.id, ai_model, model_result.extra)
 
 
 async def _mark_failed(
@@ -206,6 +214,36 @@ async def _mark_failed(
         "task_record_id": str(task_record.id),
     }
     await db.commit()
+
+
+async def _settle_text_points_after_success(
+    db,
+    task_record_id: UUID,
+    ai_model: AiModel,
+    model_result_extra: dict,
+) -> None:
+    task_record = await db.get(UserTaskRecord, task_record_id)
+    if task_record is None or task_record.status != "success":
+        return
+    try:
+        await settle_text_task_points(
+            db,
+            task_record,
+            ai_model,
+            model_result_extra,
+            remark_prefix="对话模型调用",
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        task_record = await db.get(UserTaskRecord, task_record_id)
+        if task_record is None or task_record.status != "success":
+            return
+        task_record.extra = {
+            **(task_record.extra or {}),
+            "points_settlement_failed": "积分结算失败，已保留生成结果",
+        }
+        await db.commit()
 
 
 async def _mark_retrying(
@@ -274,7 +312,7 @@ def _is_provider_success_result(model_result: ModelRunResult, status: str) -> bo
 
 
 def _is_provider_failed_status(status: str) -> bool:
-    return status in {"failed", "fail", "error", "canceled", "cancelled"}
+    return status in {"failed", "failure", "fail", "error", "canceled", "cancelled"}
 
 
 def _is_retryable_provider_error(exc: Exception) -> bool:

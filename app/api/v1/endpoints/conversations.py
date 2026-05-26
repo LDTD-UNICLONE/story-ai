@@ -1,7 +1,8 @@
+import asyncio
 from typing import Any, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
@@ -102,12 +103,14 @@ async def update_my_conversation(
 @router.get("/{conversation_id}/messages")
 async def my_conversation_messages(
     conversation_id: UUID,
+    response: Response,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=200),
     order: str = Query(default="desc", pattern="^(asc|desc)$"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    response.headers["Cache-Control"] = "no-store"
     messages, total = await list_conversation_messages(
         db,
         conversation_id=conversation_id,
@@ -129,16 +132,27 @@ async def my_conversation_messages(
 async def my_conversation_generation_task(
     conversation_id: UUID,
     task_record_id: UUID,
+    response: Response,
+    wait_seconds: int = Query(default=0, ge=0, le=15),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    task_record, assistant_message = await get_conversation_generation_task_status(
-        db,
-        conversation_id=conversation_id,
-        user_id=current_user.id,
-        task_record_id=task_record_id,
-    )
+    response.headers["Cache-Control"] = "no-store"
+    deadline = asyncio.get_running_loop().time() + wait_seconds
+    while True:
+        task_record, assistant_message = await get_conversation_generation_task_status(
+            db,
+            conversation_id=conversation_id,
+            user_id=current_user.id,
+            task_record_id=task_record_id,
+        )
+        if task_record.status not in {"pending", "running"} or asyncio.get_running_loop().time() >= deadline:
+            break
+        await asyncio.sleep(0.5)
     assistant_message_id = (task_record.extra or {}).get("assistant_message_id")
+    next_poll_seconds = (task_record.extra or {}).get("next_poll_seconds")
+    if task_record.status in {"pending", "running"} and next_poll_seconds is None:
+        next_poll_seconds = max(1, wait_seconds or 3)
     data = ConversationGenerationTaskOut(
         task_record_id=task_record.id,
         conversation_id=conversation_id,
@@ -149,6 +163,8 @@ async def my_conversation_generation_task(
         result=task_record.result,
         extra=task_record.extra or {},
         assistant_message=ConversationMessageOut.model_validate(assistant_message) if assistant_message else None,
+        stop_polling=task_record.status in {"success", "failed"},
+        next_poll_seconds=next_poll_seconds,
         created_at=task_record.created_at,
         updated_at=task_record.updated_at,
     )
@@ -179,6 +195,8 @@ async def send_my_conversation_message(
         user_message=ConversationMessageOut.model_validate(user_message),
         assistant_message=ConversationMessageOut.model_validate(assistant_message),
         points_cost=points_cost,
+        task_record_id=_parse_uuid((assistant_message.extra or {}).get("task_record_id")),
+        task_status=(assistant_message.extra or {}).get("task_status") or "pending",
     )
     return success(data=data.model_dump(mode="json"), message="发送成功")
 

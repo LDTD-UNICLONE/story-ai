@@ -9,6 +9,7 @@ from app.core.responses import success
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.task_record import (
+    AdminTaskRecordInterruptRequest,
     TaskRecordOptionsOut,
     UserTaskRecordListOut,
     UserTaskRecordOut,
@@ -16,6 +17,7 @@ from app.schemas.task_record import (
 from app.services.task_records import (
     get_task_record_options,
     get_task_record_or_404,
+    interrupt_task_record,
     list_task_records,
 )
 
@@ -66,4 +68,20 @@ async def admin_task_record_detail(
     current_admin: User = Depends(get_current_admin_user),
 ):
     record = await get_task_record_or_404(db, task_record_id)
+    return success(data=UserTaskRecordOut.model_validate(record).model_dump(mode="json"))
+
+
+@router.post("/{task_record_id}/interrupt")
+async def admin_interrupt_task_record(
+    task_record_id: UUID,
+    payload: Optional[AdminTaskRecordInterruptRequest] = None,
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(get_current_admin_user),
+):
+    record = await interrupt_task_record(
+        db,
+        task_record_id=task_record_id,
+        admin_user_id=current_admin.id,
+        reason=payload.reason if payload else None,
+    )
     return success(data=UserTaskRecordOut.model_validate(record).model_dump(mode="json"))

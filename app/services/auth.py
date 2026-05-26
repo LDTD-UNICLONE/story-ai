@@ -10,11 +10,14 @@ from app.core.exceptions import AppException
 from app.core.security import create_access_token, hash_password, verify_password
 from app.models.user import User
 from app.schemas.user import LoginRequest, RegisterRequest, SendRegisterSmsCodeRequest, TokenOut, UserOut
+from app.services.points import change_user_points
 from app.services.phone_verification import (
     assert_register_sms_code,
     consume_register_sms_code,
     send_register_sms_code,
 )
+
+NEW_USER_REGISTER_POINTS = 100
 
 
 async def get_user_by_id(db: AsyncSession, user_id: UUID) -> Optional[User]:
@@ -53,6 +56,16 @@ async def register_user(db: AsyncSession, payload: RegisterRequest) -> User:
     )
     db.add(user)
     try:
+        await db.flush()
+        if NEW_USER_REGISTER_POINTS > 0:
+            await change_user_points(
+                db,
+                user_id=user.id,
+                amount=NEW_USER_REGISTER_POINTS,
+                transaction_type="gift",
+                remark="新人注册赠送积分",
+                auto_commit=False,
+            )
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()

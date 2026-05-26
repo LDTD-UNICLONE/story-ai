@@ -176,6 +176,8 @@ async def _mark_retrying(
 
 def _is_retryable_provider_error(exc: Exception) -> bool:
     if isinstance(exc, AppException):
+        if exc.code == 50231:
+            return False
         if _is_non_retryable_provider_error_text(str(exc)):
             return False
         return exc.status_code >= 500 or exc.code in {50202, 50204, 50206}

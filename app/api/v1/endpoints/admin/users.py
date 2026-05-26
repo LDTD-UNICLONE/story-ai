@@ -15,11 +15,13 @@ from app.schemas.points import (
 )
 from app.schemas.user import (
     AdminPasswordResetRequest,
+    AdminUserCreateRequest,
     AdminUserUpdateRequest,
     UserListOut,
     UserOut,
 )
 from app.services.admin_users import (
+    create_user,
     delete_user,
     get_user_or_404,
     list_users,
@@ -54,6 +56,16 @@ async def admin_list_users(
         page_size=page_size,
     )
     return success(data=data.model_dump(mode="json"))
+
+
+@router.post("")
+async def admin_create_user(
+    payload: AdminUserCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(get_current_admin_user),
+):
+    user = await create_user(db, payload)
+    return success(data=UserOut.model_validate(user).model_dump(mode="json"), message="创建成功")
 
 
 @router.get("/{user_id}")

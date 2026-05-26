@@ -26,6 +26,18 @@ class UserListOut(SchemaBaseModel):
     page_size: int
 
 
+class AdminUserCreateRequest(SchemaBaseModel):
+    account: str = Field(..., min_length=3, max_length=64)
+    password: str = Field(..., min_length=6, max_length=128)
+    nickname: str = Field(..., min_length=1, max_length=64)
+    avatar: Optional[str] = Field(default=None, max_length=512)
+    phone: Optional[str] = Field(default=None, max_length=32)
+    email: Optional[str] = Field(default=None, max_length=255)
+    is_admin: bool = False
+    is_enabled: bool = True
+    points_balance: int = Field(default=0, ge=0)
+
+
 class AdminUserUpdateRequest(SchemaBaseModel):
     account: Optional[str] = Field(default=None, min_length=3, max_length=64)
     nickname: Optional[str] = Field(default=None, min_length=1, max_length=64)

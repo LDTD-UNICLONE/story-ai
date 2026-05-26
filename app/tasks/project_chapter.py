@@ -16,9 +16,11 @@ from app.integrations.volcengine_ark import close_volcengine_ark_client
 from app.models.ai_model import AiModel
 from app.models.project_chapter import ProjectChapter
 from app.models.task_record import UserTaskRecord
+from app.services.model_points import settle_text_task_points
 from app.services.model_runner import run_model
 from app.services.points import change_user_points
 from app.services.prompts import render_system_prompt
+from app.services.task_records import refresh_task_record_interrupted
 from app.worker import celery_app
 
 
@@ -122,6 +124,17 @@ async def _execute_processing(task_record_id: UUID, chapter_id: UUID) -> None:
                 raw_reason=str(exc) or "模型调用失败",
             )
             return
+
+        if await refresh_task_record_interrupted(db, task_record):
+            return
+
+        await settle_text_task_points(
+            db,
+            task_record,
+            ai_model,
+            model_result.extra,
+            remark_prefix="章节文本处理",
+        )
 
         chapter.processed_content = model_result.content
         chapter.process_status = "success"

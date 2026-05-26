@@ -16,14 +16,18 @@ from app.models.project_storyboard import ProjectStoryboard
 from app.models.task_record import UserTaskRecord
 from app.models.user import User
 from app.schemas.project_storyboard import ProjectStoryboardAnalyzeRequest, ProjectStoryboardUpdateRequest
-from app.services.model_points import calculate_model_points_cost
+from app.services.model_points import calculate_model_points_cost, settle_text_task_points
 from app.services.model_runner import run_model
 from app.services.points import change_user_points, consume_user_points
 from app.services.project_chapter_processing import get_enabled_text_model_or_404
 from app.services.project_chapters import get_project_chapter_or_404
 from app.services.prompts import render_system_prompt
 from app.services.projects import get_project_or_404
-from app.services.task_records import create_user_task_record, reconcile_provider_task_result
+from app.services.task_records import (
+    create_user_task_record,
+    reconcile_provider_task_result,
+    refresh_task_record_interrupted,
+)
 
 
 async def list_project_storyboards(
@@ -228,6 +232,9 @@ async def run_storyboard_analysis_in_worker(
         task_record.prompt,
         (task_record.extra or {}).get("model_extra") or {},
     )
+    if await refresh_task_record_interrupted(db, task_record):
+        return
+
     items = parse_storyboard_items(model_result.content)
     if not items:
         task_record.extra = {
@@ -236,6 +243,14 @@ async def run_storyboard_analysis_in_worker(
             "model_result_extra": model_result.extra,
         }
         raise AppException("分镜分析未返回有效数据", code=50231, status_code=502)
+
+    await settle_text_task_points(
+        db,
+        task_record,
+        ai_model,
+        model_result.extra,
+        remark_prefix="分镜分析",
+    )
 
     await db.execute(
         update(ProjectStoryboard)
@@ -395,12 +410,63 @@ def _extract_storyboard_items(payload: Any) -> Optional[List[Any]]:
         value = payload.get(key)
         if isinstance(value, list):
             return value
+        if isinstance(value, dict) and _looks_like_storyboard_item(value):
+            return [value]
     data = payload.get("data") or payload.get("result")
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
-        return _extract_storyboard_items(data)
+        nested_items = _extract_storyboard_items(data)
+        if nested_items:
+            return nested_items
+    if _looks_like_storyboard_item(payload):
+        return [payload]
+    for value in payload.values():
+        if isinstance(value, list) and any(isinstance(item, dict) for item in value):
+            return value
+        if isinstance(value, dict):
+            nested_items = _extract_storyboard_items(value)
+            if nested_items:
+                return nested_items
     return None
+
+
+def _looks_like_storyboard_item(value: Dict[str, Any]) -> bool:
+    keys = set(value.keys())
+    storyboard_keys = {
+        "shot_number",
+        "storyboard_index",
+        "title",
+        "source_content",
+        "original_text",
+        "scene_name",
+        "scene_time",
+        "shot_size",
+        "camera_angle",
+        "camera_movement",
+        "screen_execution",
+        "character_action",
+        "character_expression",
+        "visual_description",
+        "image_prompt",
+        "video_prompt",
+        "duration_suggestion",
+        "production_focus",
+        "negative_prompt",
+        "分镜序号",
+        "镜头编号",
+        "标题",
+        "场景时间",
+        "景别",
+        "拍摄角度",
+        "运镜",
+        "画面执行",
+        "角色动作",
+        "角色表情",
+        "图像提示词",
+        "视频提示词",
+    }
+    return bool(keys & storyboard_keys)
 
 
 def _parse_json_payload(content: str) -> Any:
