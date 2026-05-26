@@ -306,8 +306,11 @@ async def _resolve_provider_task_result(
 
 def _is_provider_success_result(model_result: ModelRunResult, status: str) -> bool:
     terminal_success_statuses = {"success", "succeeded", "completed", "complete", "finished", "done"}
+    pending_statuses = {"not_start", "in_progress", "running", "pending", "processing", "queued"}
     if status in terminal_success_statuses:
         return True
+    if status in pending_statuses:
+        return False
     return bool(model_result.content and model_result.content != "生成任务处理中")
 
 

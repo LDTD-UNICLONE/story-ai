@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from app.core.exceptions import AppException
 from app.integrations import comfly
@@ -194,11 +194,19 @@ def _extract_chat_content(payload: Dict[str, Any]) -> str:
 
 
 def _extract_media_content(payload: Dict[str, Any]) -> str:
+    output_urls = _extract_provider_output_urls(payload)
+    if output_urls:
+        return ",".join(output_urls)
+
     for key in ("url", "video_url", "image_url", "b64_json", "output", "result"):
         value = _find_first_value(payload, (key,))
         if value:
             if isinstance(value, list):
-                return ",".join(str(item) for item in value)
+                urls = _collect_media_urls(value)
+                return ",".join(urls) if urls else ",".join(str(item) for item in value)
+            if isinstance(value, dict):
+                urls = _collect_media_urls(value)
+                return ",".join(urls) if urls else str(value)
             return str(value)
     return "生成任务处理中" if _extract_task_id(payload) else ""
 
@@ -234,6 +242,85 @@ def _empty_content_message(payload: Dict[str, Any]) -> str:
 def _extract_status(payload: Dict[str, Any]) -> Optional[str]:
     value = _find_first_value(payload, ("status", "state"))
     return str(value) if value else None
+
+
+def _extract_provider_output_urls(payload: Dict[str, Any]) -> List[str]:
+    data = payload.get("data")
+    candidates: List[Any] = []
+    if isinstance(data, dict):
+        candidates.extend(
+            [
+                data.get("output"),
+                data.get("outputs"),
+                data.get("url"),
+                data.get("urls"),
+                data.get("image_url"),
+                data.get("image_urls"),
+                data.get("video_url"),
+                data.get("video_urls"),
+                data.get("result"),
+            ]
+        )
+    candidates.extend(
+        [
+            payload.get("output"),
+            payload.get("outputs"),
+            payload.get("url"),
+            payload.get("urls"),
+            payload.get("image_url"),
+            payload.get("image_urls"),
+            payload.get("video_url"),
+            payload.get("video_urls"),
+            payload.get("result"),
+        ]
+    )
+
+    urls: List[str] = []
+    for candidate in candidates:
+        urls.extend(_collect_media_urls(candidate))
+    return _dedupe(urls)
+
+
+def _collect_media_urls(value: Any) -> List[str]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        urls: List[str] = []
+        for key in (
+            "url",
+            "uri",
+            "image_url",
+            "video_url",
+            "file_url",
+            "oss_url",
+            "cdn_url",
+            "cover_url",
+            "b64_json",
+        ):
+            urls.extend(_collect_media_urls(value.get(key)))
+        for key in ("output", "outputs", "result", "results", "data", "images", "videos"):
+            urls.extend(_collect_media_urls(value.get(key)))
+        return urls
+    if isinstance(value, list):
+        urls: List[str] = []
+        for item in value:
+            urls.extend(_collect_media_urls(item))
+        return urls
+    return []
+
+
+def _dedupe(values: Iterable[str]) -> List[str]:
+    result: List[str] = []
+    seen = set()
+    for value in values:
+        normalized = str(value).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
 
 
 def _find_first_value(data: Any, keys: Iterable[str]) -> Any:

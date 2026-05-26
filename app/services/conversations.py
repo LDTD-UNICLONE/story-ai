@@ -18,6 +18,7 @@ from app.services.points import change_user_points, consume_user_points
 from app.services.task_records import (
     create_user_task_record,
     expire_stale_task_record,
+    expire_stale_task_records,
     reconcile_provider_task_result,
 )
 from app.tasks.model_generation import run_conversation_generation
@@ -68,6 +69,8 @@ async def list_conversations(
     page: int,
     page_size: int,
 ) -> Tuple[List[Conversation], int]:
+    await expire_stale_task_records(db, user_id=user_id, business_type="conversation")
+
     count_result = await db.execute(
         select(func.count())
         .select_from(Conversation)

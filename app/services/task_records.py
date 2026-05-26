@@ -742,5 +742,7 @@ def _is_provider_failed_status(status: str) -> bool:
 def _is_provider_success_result(model_result: ModelRunResult, status: str) -> bool:
     if status in {"success", "succeeded", "completed", "complete", "finished", "done"}:
         return True
+    if status in {"not_start", "in_progress", "running", "pending", "processing", "queued"}:
+        return False
     content = (model_result.content or "").strip()
     return bool(content and content != "生成任务处理中" and not content.startswith("模型任务仍在生成中"))

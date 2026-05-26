@@ -28,6 +28,7 @@ from app.services.task_records import (
     reconcile_provider_task_result,
     refresh_task_record_interrupted,
 )
+from app.services.text_model_extra import normalize_text_analysis_extra
 
 
 async def list_project_storyboards(
@@ -159,6 +160,7 @@ async def submit_storyboard_analysis(
             auto_commit=False,
         )
 
+    model_extra = normalize_text_analysis_extra(payload.extra)
     prompt = payload.analysis_prompt or render_system_prompt(
         "storyboard_analysis.md",
         input_text=chapter.processed_content,
@@ -183,7 +185,7 @@ async def submit_storyboard_analysis(
             "project_id": str(project_id),
             "chapter_id": str(chapter_id),
             "chapter_title": chapter.title,
-            "model_extra": payload.extra or {},
+            "model_extra": model_extra,
         },
     )
     chapter.extra = {

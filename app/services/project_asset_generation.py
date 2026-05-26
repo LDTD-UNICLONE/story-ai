@@ -297,6 +297,8 @@ async def _resolve_image_provider_task(model_snapshot: SimpleNamespace, model_re
             raise AppException(f"模型任务执行失败：{status}", code=50231, status_code=502)
         if status in {"success", "succeeded", "completed", "complete", "finished", "done"}:
             return latest_result
+        if status in {"not_start", "in_progress", "running", "pending", "processing", "queued"}:
+            continue
         if latest_result.content and latest_result.content != "生成任务处理中":
             return latest_result
 

@@ -22,6 +22,7 @@ from app.services.project_chapters import get_project_chapter_or_404
 from app.services.prompts import render_system_prompt
 from app.services.projects import get_project_or_404
 from app.services.task_records import create_user_task_record, refresh_task_record_interrupted
+from app.services.text_model_extra import normalize_text_analysis_extra
 
 
 ASSET_CONFIG: Dict[str, Dict[str, Any]] = {
@@ -78,6 +79,7 @@ async def submit_asset_analysis(
             auto_commit=False,
         )
 
+    model_extra = normalize_text_analysis_extra(payload.extra)
     prompt_source = "custom" if payload.analysis_prompt else "system"
     prompt = payload.analysis_prompt or render_system_prompt(
         config["prompt_file"],
@@ -107,7 +109,7 @@ async def submit_asset_analysis(
             "chapter_title": chapter.title,
             "asset_type": asset_type,
             "prompt_source": prompt_source,
-            "model_extra": payload.extra or {},
+            "model_extra": model_extra,
         },
     )
     if prompt_source == "custom":

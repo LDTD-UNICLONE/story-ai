@@ -362,6 +362,8 @@ async def _resolve_video_provider_task(model_snapshot: SimpleNamespace, model_re
         if status in {"success", "succeeded", "completed", "complete", "finished", "done"}:
             latest_result.extra = {**latest_result.extra, "platform_task_status": "success"}
             return latest_result
+        if status in {"not_start", "in_progress", "running", "pending", "processing", "queued"}:
+            continue
         if latest_result.content and latest_result.content != "生成任务处理中":
             latest_result.extra = {**latest_result.extra, "platform_task_status": "success"}
             return latest_result

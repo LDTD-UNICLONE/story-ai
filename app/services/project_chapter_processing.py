@@ -15,6 +15,7 @@ from app.services.model_points import calculate_model_points_cost
 from app.services.points import change_user_points, consume_user_points
 from app.services.project_chapters import get_project_chapter_or_404
 from app.services.task_records import create_user_task_record
+from app.services.text_model_extra import normalize_text_analysis_extra
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +48,14 @@ async def submit_project_chapter_processing(
         else "系统提示词"
     )
 
+    model_extra = normalize_text_analysis_extra(payload.extra)
+
     chapter.ai_model_id = ai_model.id
     chapter.processing_prompt = payload.processing_prompt
     chapter.process_status = "pending"
     chapter.extra = {
         **(chapter.extra or {}),
-        "process_extra": payload.extra or {},
+        "process_extra": model_extra,
         "prompt_source": prompt_source,
     }
     task_record = await create_user_task_record(
@@ -73,7 +76,7 @@ async def submit_project_chapter_processing(
             "chapter_id": str(chapter.id),
             "chapter_title": chapter.title,
             "prompt_source": prompt_source,
-            "model_extra": payload.extra or {},
+            "model_extra": model_extra,
         },
     )
     if payload.processing_prompt:
