@@ -174,9 +174,11 @@ async def _mark_retrying(db, task_record: UserTaskRecord, asset, reason: str) ->
 
 def _is_retryable_provider_error(exc: Exception) -> bool:
     if isinstance(exc, AppException):
+        if exc.code == 50231 or exc.status_code in {400, 401, 403}:
+            return False
         if _is_non_retryable_provider_error_text(str(exc)):
             return False
-        return exc.status_code >= 500 or exc.code in {50202, 50204, 50206}
+        return exc.status_code >= 500 or exc.code in {50202, 50206}
     return False
 
 

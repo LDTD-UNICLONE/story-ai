@@ -11,7 +11,7 @@ from app.models.project_chapter import ProjectChapter
 from app.models.task_record import UserTaskRecord
 from app.models.user import User
 from app.schemas.project_chapter import ProjectChapterProcessRequest
-from app.services.model_points import calculate_model_points_cost
+from app.services.model_points import calculate_text_submission_points_cost
 from app.services.points import change_user_points, consume_user_points
 from app.services.project_chapters import get_project_chapter_or_404
 from app.services.task_records import create_user_task_record
@@ -29,7 +29,7 @@ async def submit_project_chapter_processing(
 ) -> Tuple[ProjectChapter, UserTaskRecord, int]:
     chapter = await get_project_chapter_or_404(db, project_id, chapter_id, user.id)
     ai_model = await get_enabled_text_model_or_404(db, payload.ai_model_id)
-    points_cost = calculate_model_points_cost(ai_model)
+    points_cost = calculate_text_submission_points_cost(ai_model)
     points_transaction = None
     if points_cost > 0:
         points_transaction = await consume_user_points(

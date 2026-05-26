@@ -182,12 +182,7 @@ async def list_provider_models() -> List[Dict[str, Any]]:
         response = await client.get(_url("/v1/models"), headers=_headers())
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        detail = exc.response.text[:200] if exc.response is not None else ""
-        raise AppException(
-            f"获取模型列表失败，HTTP {exc.response.status_code}: {detail}",
-            code=50201,
-            status_code=502,
-        ) from exc
+        _raise_model_service_http_error(exc, "获取模型列表失败")
     except httpx.TimeoutException as exc:
         raise AppException("获取模型列表超时", code=50205, status_code=502) from exc
     except httpx.HTTPError as exc:
@@ -206,12 +201,7 @@ async def _get_json(path: str) -> Dict[str, Any]:
         response = await client.get(_url(path), headers=_headers())
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        detail = exc.response.text[:200] if exc.response is not None else ""
-        raise AppException(
-            f"任务查询失败，HTTP {exc.response.status_code}: {detail}",
-            code=50204,
-            status_code=502,
-        ) from exc
+        _raise_model_service_http_error(exc, "任务查询失败")
     except httpx.TimeoutException as exc:
         raise AppException("任务查询超时", code=50206, status_code=502) from exc
     except httpx.HTTPError as exc:
@@ -230,12 +220,7 @@ async def _post_json(
         response = await client.post(_url(path), headers=_headers(), json=payload, params=params)
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        detail = exc.response.text[:200] if exc.response is not None else ""
-        raise AppException(
-            f"模型调用失败，HTTP {exc.response.status_code}: {detail}",
-            code=50204,
-            status_code=502,
-        ) from exc
+        _raise_model_service_http_error(exc, "模型调用失败")
     except httpx.TimeoutException as exc:
         raise AppException("模型调用超时", code=50206, status_code=502) from exc
     except httpx.HTTPError as exc:
@@ -255,18 +240,24 @@ async def _post_multipart(
         response = await client.post(_url(path), headers=_auth_headers(), data=data, files=files, params=params)
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        detail = exc.response.text[:200] if exc.response is not None else ""
-        raise AppException(
-            f"图像编辑调用失败，HTTP {exc.response.status_code}: {detail}",
-            code=50204,
-            status_code=502,
-        ) from exc
+        _raise_model_service_http_error(exc, "图像编辑调用失败")
     except httpx.TimeoutException as exc:
         raise AppException("图像编辑调用超时", code=50206, status_code=502) from exc
     except httpx.HTTPError as exc:
         raise AppException("无法连接模型服务", code=50202, status_code=502) from exc
 
     return response.json()
+
+
+def _raise_model_service_http_error(exc: httpx.HTTPStatusError, fallback: str) -> None:
+    status_code = exc.response.status_code if exc.response is not None else 502
+    if status_code in {429, 500, 502, 503, 504}:
+        raise AppException("模型服务繁忙，请稍后再试", code=50204, status_code=502) from exc
+    if status_code in {401, 403}:
+        raise AppException("模型服务认证失败，请检查服务配置", code=50231, status_code=502) from exc
+    if status_code == 400:
+        raise AppException("模型请求参数不正确，请调整后重试", code=50231, status_code=502) from exc
+    raise AppException(fallback, code=50204, status_code=502) from exc
 
 
 def _merge_extra(

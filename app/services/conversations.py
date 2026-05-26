@@ -409,7 +409,10 @@ async def send_conversation_message(
     await db.refresh(user_message)
     await db.refresh(assistant_message)
     try:
-        run_conversation_generation.delay(str(task_record.id), str(assistant_message.id))
+        run_conversation_generation.apply_async(
+            args=(str(task_record.id), str(assistant_message.id)),
+            queue=_conversation_generation_queue(conversation_type),
+        )
     except Exception:
         await _mark_conversation_generation_enqueue_failed(
             db,
@@ -421,6 +424,16 @@ async def send_conversation_message(
         )
         await db.refresh(assistant_message)
     return user_message, assistant_message, ai_model_points_cost
+
+
+def _conversation_generation_queue(conversation_type: str) -> str:
+    if conversation_type == "image":
+        return "story_ai_image"
+    if conversation_type == "video":
+        return "story_ai_video"
+    if conversation_type == "text":
+        return "story_ai_text"
+    return "story_ai_default"
 
 
 async def _build_message_extra_with_context(

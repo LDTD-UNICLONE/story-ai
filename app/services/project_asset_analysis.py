@@ -14,7 +14,7 @@ from app.models.project_chapter import ProjectChapter
 from app.models.task_record import UserTaskRecord
 from app.models.user import User
 from app.schemas.project_asset import ProjectAssetAnalyzeRequest
-from app.services.model_points import calculate_model_points_cost, settle_text_task_points
+from app.services.model_points import calculate_text_submission_points_cost, settle_text_task_points
 from app.services.model_runner import run_model
 from app.services.points import change_user_points, consume_user_points
 from app.services.project_chapter_processing import get_enabled_text_model_or_404
@@ -68,7 +68,7 @@ async def submit_asset_analysis(
         raise AppException("章节还没有处理后的内容，无法分析资源", code=40011, status_code=400)
 
     ai_model = await get_enabled_text_model_or_404(db, payload.ai_model_id)
-    points_cost = calculate_model_points_cost(ai_model)
+    points_cost = calculate_text_submission_points_cost(ai_model)
     points_transaction = None
     if points_cost > 0:
         points_transaction = await consume_user_points(

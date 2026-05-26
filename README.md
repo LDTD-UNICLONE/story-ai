@@ -27,7 +27,10 @@ python -m uvicorn app.main:app --reload
 
 ```bash
 source .venv/bin/activate
-python -m celery -A app.worker.celery_app worker -l info -E --concurrency=2
+python -m celery -A app.worker.celery_app worker -l info -E --concurrency=1 --queues=celery,story_ai_default
+python -m celery -A app.worker.celery_app worker -l info -E --concurrency=2 --queues=story_ai_text --hostname=story-ai-text@%h
+python -m celery -A app.worker.celery_app worker -l info -E --concurrency=1 --queues=story_ai_image --hostname=story-ai-image@%h
+python -m celery -A app.worker.celery_app worker -l info -E --concurrency=2 --queues=story_ai_video --hostname=story-ai-video@%h
 ```
 
 查看 Celery 队列可以启动 Flower：
@@ -418,7 +421,10 @@ Authorization: Bearer <access_token>
 ## Celery
 
 ```bash
-python -m celery -A app.worker.celery_app worker -l info -E --concurrency=2
+python -m celery -A app.worker.celery_app worker -l info -E --concurrency=1 --queues=celery,story_ai_default
+python -m celery -A app.worker.celery_app worker -l info -E --concurrency=2 --queues=story_ai_text --hostname=story-ai-text@%h
+python -m celery -A app.worker.celery_app worker -l info -E --concurrency=1 --queues=story_ai_image --hostname=story-ai-image@%h
+python -m celery -A app.worker.celery_app worker -l info -E --concurrency=2 --queues=story_ai_video --hostname=story-ai-video@%h
 ```
 
 或使用脚本：

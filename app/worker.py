@@ -1,5 +1,6 @@
 from celery import Celery
 from celery.signals import worker_process_shutdown
+from kombu import Queue
 
 from app.core.config import settings
 from app.core.logging import configure_logging
@@ -24,6 +25,20 @@ celery_app = Celery(
 celery_app.conf.update(
     timezone=settings.timezone,
     enable_utc=False,
+    task_default_queue="story_ai_default",
+    task_queues=(
+        Queue("story_ai_default"),
+        Queue("story_ai_text"),
+        Queue("story_ai_image"),
+        Queue("story_ai_video"),
+    ),
+    task_routes={
+        "tasks.project_chapter.run_project_chapter_processing": {"queue": "story_ai_text"},
+        "tasks.project_asset_analysis.run_project_asset_analysis": {"queue": "story_ai_text"},
+        "tasks.project_storyboard.run_project_storyboard_analysis": {"queue": "story_ai_text"},
+        "tasks.project_asset_generation.run_project_asset_image_generation": {"queue": "story_ai_image"},
+        "tasks.project_storyboard_video.run_project_storyboard_video_generation": {"queue": "story_ai_video"},
+    },
     task_serializer="json",
     accept_content=["json"],
     result_serializer="json",
@@ -31,7 +46,7 @@ celery_app.conf.update(
     task_acks_late=True,
     task_reject_on_worker_lost=True,
     task_time_limit=settings.celery_task_time_limit_seconds,
-    task_soft_time_limit=settings.celery_task_soft_time_limit_seconds,
+      task_soft_time_limit=settings.celery_task_soft_time_limit_seconds,
     worker_prefetch_multiplier=1,
     worker_max_tasks_per_child=settings.celery_worker_max_tasks_per_child,
     result_expires=settings.celery_result_expires_seconds,

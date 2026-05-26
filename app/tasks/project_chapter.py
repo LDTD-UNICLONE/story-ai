@@ -40,7 +40,7 @@ def run_project_chapter_processing(self, task_record_id: str, chapter_id: str) -
     except SoftTimeLimitExceeded:
         asyncio.run(_fail_processing(UUID(task_record_id), UUID(chapter_id), "任务执行超时"))
     except Exception as exc:
-        if self.request.retries < settings.celery_task_max_retries:
+        if self.request.retries < settings.celery_task_max_retries and _is_retryable_provider_error(exc):
             raise self.retry(exc=exc, countdown=_retry_countdown(self.request.retries)) from exc
         asyncio.run(
             _fail_processing(
@@ -236,9 +236,11 @@ async def _mark_retrying(
 
 def _is_retryable_provider_error(exc: Exception) -> bool:
     if isinstance(exc, AppException):
+        if exc.code == 50231 or exc.status_code in {400, 401, 403}:
+            return False
         if _is_non_retryable_provider_error_text(str(exc)):
             return False
-        return exc.status_code >= 500 or exc.code in {50202, 50204, 50206}
+        return exc.status_code >= 500 or exc.code in {50202, 50206}
     return False
 
 
