@@ -153,14 +153,18 @@ async def my_conversation_generation_task(
     next_poll_seconds = (task_record.extra or {}).get("next_poll_seconds")
     if task_record.status in {"pending", "running"} and next_poll_seconds is None:
         next_poll_seconds = max(1, wait_seconds or 3)
+    content = conversation_task_content(task_record, assistant_message)
+    failed_reason = task_record.result if task_record.status == "failed" else None
     data = ConversationGenerationTaskOut(
         task_record_id=task_record.id,
         conversation_id=conversation_id,
         assistant_message_id=_parse_uuid(assistant_message_id),
         status=task_record.status,
         task_status=task_record.status,
-        content=conversation_task_content(task_record, assistant_message),
+        content=content,
         result=task_record.result,
+        message=content,
+        failed_reason=failed_reason,
         extra=task_record.extra or {},
         assistant_message=ConversationMessageOut.model_validate(assistant_message) if assistant_message else None,
         stop_polling=task_record.status in {"success", "failed"},

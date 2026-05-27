@@ -108,7 +108,10 @@ async def _run_volcengine_ark(
         raise AppException("当前模型仅支持视频生成", code=40007, status_code=400)
 
     provider_extra = dict(extra)
-    provider_extra["_model_capabilities"] = merge_ark_video_capabilities(ai_model.capabilities or {})
+    provider_extra["_model_capabilities"] = merge_ark_video_capabilities(
+        ai_model.model_id,
+        ai_model.capabilities or {},
+    )
     payload = await volcengine_ark.create_video_generation(ai_model.model_id, prompt, provider_extra)
     video_mode = str(extra.get("video_mode") or extra.get("capability") or "generation")
     task_id = _extract_task_id(payload)

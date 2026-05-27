@@ -8,7 +8,7 @@ from app.schemas.base import SchemaBaseModel
 from app.schemas.style import StyleBaseOut
 
 
-ProjectGenerationRatio = Literal["9:16", "16:9"]
+ProjectGenerationRatio = Literal["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
 
 
 class ProjectOut(SchemaBaseModel):

@@ -78,7 +78,7 @@ RATE_LIMIT_GLOBAL_REQUESTS=300
 RATE_LIMIT_AUTH_REQUESTS=30
 RATE_LIMIT_UPLOAD_REQUESTS=30
 RATE_LIMIT_GENERATION_REQUESTS=60
-RATE_LIMIT_POLLING_REQUESTS=60
+RATE_LIMIT_POLLING_REQUESTS=300
 CELERY_TASK_TIME_LIMIT_SECONDS=300
 CELERY_TASK_SOFT_TIME_LIMIT_SECONDS=240
 CELERY_TASK_MAX_RETRIES=5
@@ -116,7 +116,7 @@ WECHAT_PAY_PRIVATE_KEY_PATH=key/apiclient_key.pem
 WECHAT_PAY_PLATFORM_CERT_PATH=key/wechatpay_platform.pem
 WECHAT_PAY_NOTIFY_URL=https://你的后端域名/api/v1/points/wechat/notify
 WECHAT_PAY_TIMEOUT_SECONDS=30
-WECHAT_PAY_NATIVE_EXPIRE_MINUTES=120
+WECHAT_PAY_NATIVE_EXPIRE_MINUTES=30
 WECHAT_PAY_MOCK_ENABLED=false
 ```
 
@@ -176,6 +176,20 @@ POST /api/v1/auth/login
 ```http
 GET /api/v1/auth/me
 Authorization: Bearer <access_token>
+```
+
+修改当前用户资料：
+
+```http
+PATCH /api/v1/users/me/profile
+Authorization: Bearer <access_token>
+```
+
+```json
+{
+  "nickname": "新的昵称",
+  "avatar": "https://example.com/avatar.png"
+}
 ```
 
 ## 管理员用户管理
@@ -267,6 +281,15 @@ Authorization: Bearer <admin_access_token>
 
 ```http
 GET /api/v1/admin/users/{user_id}/points/transactions?page=1&page_size=20
+Authorization: Bearer <admin_access_token>
+```
+
+管理员查看平台充值记录和消耗记录：
+
+```http
+GET /api/v1/admin/point-records?page=1&page_size=20
+GET /api/v1/admin/point-records/recharges?page=1&page_size=20
+GET /api/v1/admin/point-records/consumes?page=1&page_size=20
 Authorization: Bearer <admin_access_token>
 ```
 

@@ -17,7 +17,7 @@ from app.models.ai_model import AiModel
 from app.models.conversation import Conversation, ConversationMessage
 from app.models.task_record import UserTaskRecord
 from app.services.generated_media import persist_generated_media_to_oss
-from app.services.model_points import settle_text_task_points
+from app.services.model_points import settle_text_task_points, settle_video_task_points
 from app.services.model_runner import ModelRunResult, query_model_task, run_model
 from app.services.points import change_user_points
 from app.services.task_records import refresh_task_record_interrupted
@@ -173,6 +173,8 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
 
         if task_record.generation_type == "text":
             await _settle_text_points_after_success(db, task_record.id, ai_model, model_result.extra)
+        elif task_record.generation_type == "video":
+            await _settle_video_points_after_success(db, task_record.id, ai_model)
 
 
 async def _mark_failed(
@@ -202,6 +204,7 @@ async def _mark_failed(
     task_record.extra = {
         **(task_record.extra or {}),
         "failed_reason": reason,
+        "display_message": f"任务执行失败：{reason}",
         "raw_failed_reason": raw_reason or reason,
         "refund_transaction_id": refund_transaction_id,
     }
@@ -210,7 +213,7 @@ async def _mark_failed(
         **(assistant_message.extra or {}),
         "task_status": "failed",
         "failed_reason": reason,
-        "raw_failed_reason": raw_reason or reason,
+        "display_message": f"任务执行失败：{reason}",
         "task_record_id": str(task_record.id),
     }
     await db.commit()
@@ -232,6 +235,35 @@ async def _settle_text_points_after_success(
             ai_model,
             model_result_extra,
             remark_prefix="对话模型调用",
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        task_record = await db.get(UserTaskRecord, task_record_id)
+        if task_record is None or task_record.status != "success":
+            return
+        task_record.extra = {
+            **(task_record.extra or {}),
+            "points_settlement_failed": "积分结算失败，已保留生成结果",
+        }
+        await db.commit()
+
+
+async def _settle_video_points_after_success(
+    db,
+    task_record_id: UUID,
+    ai_model: AiModel,
+) -> None:
+    task_record = await db.get(UserTaskRecord, task_record_id)
+    if task_record is None or task_record.status != "success":
+        return
+    try:
+        await settle_video_task_points(
+            db,
+            task_record,
+            ai_model,
+            (task_record.extra or {}).get("user_message_extra") or {},
+            remark_prefix="对话视频生成",
         )
         await db.commit()
     except Exception:

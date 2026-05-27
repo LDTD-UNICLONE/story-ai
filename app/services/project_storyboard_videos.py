@@ -19,7 +19,7 @@ from app.models.task_record import UserTaskRecord
 from app.models.user import User
 from app.schemas.project_storyboard import ProjectStoryboardVideoGenerateRequest
 from app.services.generated_media import persist_generated_media_to_oss
-from app.services.model_points import calculate_submission_points_cost
+from app.services.model_points import calculate_submission_points_cost, settle_video_task_points
 from app.services.model_runner import ModelRunResult, query_model_task, run_model
 from app.services.points import change_user_points, consume_user_points
 from app.services.project_storyboards import get_project_storyboard_or_404
@@ -180,6 +180,13 @@ async def run_storyboard_video_generation_in_worker(
         "model_result_extra": model_result.extra,
         "storyboard_video_result": model_result.content,
     }
+    await settle_video_task_points(
+        db,
+        task_record,
+        ai_model,
+        (task_record.extra or {}).get("model_extra") or {},
+        remark_prefix="分镜视频生成",
+    )
 
 
 async def _get_project_with_style_or_404(db: AsyncSession, project_id: UUID, user_id: UUID) -> Project:

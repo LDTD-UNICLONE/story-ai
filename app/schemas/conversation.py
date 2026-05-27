@@ -89,6 +89,8 @@ class ConversationGenerationTaskOut(SchemaBaseModel):
     task_status: str
     content: Optional[str] = None
     result: Optional[str] = None
+    message: Optional[str] = None
+    failed_reason: Optional[str] = None
     extra: Dict[str, Any]
     assistant_message: Optional[ConversationMessageOut] = None
     stop_polling: bool = False
@@ -96,7 +98,7 @@ class ConversationGenerationTaskOut(SchemaBaseModel):
     created_at: datetime
     updated_at: datetime
 
-    @field_serializer("content", "result")
+    @field_serializer("content", "result", "message", "failed_reason")
     def serialize_optional_text(self, value: Optional[str]) -> Optional[str]:
         return sanitize_public_message(value) if value is not None else None
 

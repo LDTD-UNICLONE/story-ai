@@ -251,12 +251,21 @@ async def _post_multipart(
 
 def _raise_model_service_http_error(exc: httpx.HTTPStatusError, fallback: str) -> None:
     status_code = exc.response.status_code if exc.response is not None else 502
+    response_text = exc.response.text if exc.response is not None else ""
+    if response_text:
+        logger.warning(
+            "Comfly request failed: status=%s response=%s",
+            status_code,
+            response_text[:1000],
+        )
     if status_code in {429, 500, 502, 503, 504}:
         raise AppException("模型服务繁忙，请稍后再试", code=50204, status_code=502) from exc
     if status_code in {401, 403}:
         raise AppException("模型服务认证失败，请检查服务配置", code=50231, status_code=502) from exc
     if status_code == 400:
-        raise AppException("模型请求参数不正确，请调整后重试", code=50231, status_code=502) from exc
+        if any(token in response_text.lower() for token in ("sensitive", "privacy", "real person", "content policy", "敏感")):
+            raise AppException("输入内容未通过模型安全校验，请更换内容后重试", code=40017, status_code=400) from exc
+        raise AppException("当前模型不支持所选参数组合，请调整参数后重试", code=40016, status_code=400) from exc
     raise AppException(fallback, code=50204, status_code=502) from exc
 
 

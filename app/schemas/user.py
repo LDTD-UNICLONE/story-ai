@@ -48,6 +48,13 @@ class AdminUserUpdateRequest(SchemaBaseModel):
     is_enabled: Optional[bool] = None
 
 
+class UserProfileUpdateRequest(SchemaBaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    nickname: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    avatar: Optional[str] = Field(default=None, max_length=512)
+
+
 class AdminPasswordResetRequest(SchemaBaseModel):
     password: str = Field(..., min_length=6, max_length=128)
 

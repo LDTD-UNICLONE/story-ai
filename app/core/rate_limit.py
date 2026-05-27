@@ -121,8 +121,9 @@ def _polling_identity_key(path: str) -> Optional[str]:
 
 def _rate_limited_response(rule_name: str, limit: int, retry_after_seconds: int) -> Response:
     retry_after_seconds = max(1, retry_after_seconds)
+    message = "轮询过于频繁，请稍后再试" if rule_name == "polling" else "请求过于频繁，请稍后再试"
     response = error(
-        message="请求过于频繁，请稍后再试",
+        message=message,
         code=42900,
         data={
             "rule": rule_name,

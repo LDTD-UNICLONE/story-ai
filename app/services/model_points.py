@@ -4,9 +4,26 @@ from typing import Any, Dict, Optional, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import AppException
+from app.integrations.volcengine_ark_video_specs import (
+    is_volcengine_ark_video_model,
+    merge_video_capabilities as merge_ark_video_capabilities,
+    normalize_video_resolution,
+)
 from app.models.ai_model import AiModel
 from app.models.task_record import UserTaskRecord
 from app.services.points import change_user_points
+
+
+SEEDANCE_VIDEO_UNIT_POINTS = {
+    "doubao-seedance-2-0-260128": {
+        "no_video": {"480p": 6, "720p": 12, "1080p": 30},
+        "with_video": {"480p": 7, "720p": 13, "1080p": 35},
+    },
+    "doubao-seedance-2-0-fast-260128": {
+        "no_video": {"480p": 5, "720p": 10},
+        "with_video": {"480p": 6, "720p": 12},
+    },
+}
 
 
 def calculate_model_points_cost(
@@ -36,7 +53,7 @@ def calculate_submission_points_cost(
     if generation_type == "image":
         return calculate_image_model_points_cost(ai_model)
     if generation_type == "video":
-        return calculate_video_model_points_cost(extra or {})
+        return calculate_video_submission_points_cost(ai_model)
     return calculate_model_points_cost(ai_model)
 
 
@@ -48,9 +65,13 @@ def calculate_image_model_points_cost(ai_model: AiModel) -> int:
     return max(0, int(ai_model.points_cost or 0))
 
 
-def calculate_video_model_points_cost(extra: Dict[str, Any]) -> int:
+def calculate_video_submission_points_cost(ai_model: AiModel) -> int:
+    return max(0, int(ai_model.points_cost or 0))
+
+
+def calculate_video_model_points_cost(ai_model: AiModel, extra: Dict[str, Any]) -> int:
     seconds = _normalize_video_duration_seconds(extra)
-    unit_points = 15 if _has_video_reference(extra) else 10
+    unit_points = _video_unit_points(ai_model, extra)
     return seconds * unit_points
 
 
@@ -150,11 +171,79 @@ async def settle_text_task_points(
         except AppException as exc:
             if exc.code != 40003:
                 raise
-            settlement_extra["points_settlement_failed"] = "积分余额不足，未完成补扣"
+            settlement_extra["points_settlement_failed"] = "积分不足，请充值，未完成补扣"
             settlement_extra["points_settlement_delta"] = delta
 
     task_record.points_cost = actual_points
     task_record.extra = {**(task_record.extra or {}), **settlement_extra}
+
+
+async def settle_video_task_points(
+    db: AsyncSession,
+    task_record: UserTaskRecord,
+    ai_model: AiModel,
+    request_extra: Optional[Dict[str, Any]] = None,
+    *,
+    remark_prefix: str,
+) -> None:
+    billing_extra = request_extra or _task_request_extra(task_record)
+    actual_points = calculate_video_model_points_cost(ai_model, billing_extra)
+    charged_points = task_record.points_cost
+    delta = actual_points - charged_points
+    duration_seconds = _normalize_video_duration_seconds(billing_extra)
+    has_video_reference = _has_video_reference(billing_extra)
+    unit_points = _video_unit_points(ai_model, billing_extra)
+    settlement_extra: Dict[str, Any] = {
+        "points_billing": {
+            "billing_type": "video",
+            "duration_seconds": duration_seconds,
+            "has_video_reference": has_video_reference,
+            "resolution": _video_billing_resolution(ai_model, billing_extra),
+            "unit_points": unit_points,
+            "points_cost": actual_points,
+        },
+        "points_charged_before_settlement": charged_points,
+        "points_settled_cost": actual_points,
+    }
+
+    if delta < 0:
+        transaction = await change_user_points(
+            db,
+            user_id=task_record.user_id,
+            amount=abs(delta),
+            transaction_type="refund",
+            remark=f"{remark_prefix}按实际视频参数退回积分：{task_record.title}",
+            auto_commit=False,
+        )
+        settlement_extra["points_refund_transaction_id"] = str(transaction.id)
+    elif delta > 0:
+        try:
+            transaction = await change_user_points(
+                db,
+                user_id=task_record.user_id,
+                amount=-delta,
+                transaction_type="consume",
+                remark=f"{remark_prefix}按实际视频参数补扣积分：{task_record.title}",
+                auto_commit=False,
+            )
+            settlement_extra["points_supplement_transaction_id"] = str(transaction.id)
+        except AppException as exc:
+            if exc.code != 40003:
+                raise
+            settlement_extra["points_settlement_failed"] = "积分不足，请充值，未完成补扣"
+            settlement_extra["points_settlement_delta"] = delta
+
+    task_record.points_cost = actual_points
+    task_record.extra = {**(task_record.extra or {}), **settlement_extra}
+
+
+def _task_request_extra(task_record: UserTaskRecord) -> Dict[str, Any]:
+    extra = task_record.extra or {}
+    for key in ("user_message_extra", "model_extra"):
+        value = extra.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
 
 
 def _extract_usage(response_extra: Dict[str, Any]) -> Dict[str, Any]:
@@ -182,6 +271,38 @@ def _normalize_video_duration_seconds(extra: Dict[str, Any]) -> int:
     if seconds <= 0:
         seconds = 5
     return min(max(seconds, 5), 15)
+
+
+def _video_unit_points(ai_model: AiModel, extra: Dict[str, Any]) -> int:
+    seedance_model_id = _seedance_billing_model_id(ai_model.model_id)
+    has_video_reference = _has_video_reference(extra)
+    if seedance_model_id:
+        group = "with_video" if has_video_reference else "no_video"
+        resolution = _normalize_seedance_billing_resolution(ai_model, extra)
+        return SEEDANCE_VIDEO_UNIT_POINTS[seedance_model_id][group][resolution]
+    return 15 if has_video_reference else 10
+
+
+def _seedance_billing_model_id(model_id: str) -> Optional[str]:
+    normalized = model_id.strip().lower()
+    for supported_model_id in SEEDANCE_VIDEO_UNIT_POINTS:
+        if normalized == supported_model_id or normalized.endswith(supported_model_id) or supported_model_id in normalized:
+            return supported_model_id
+    if is_volcengine_ark_video_model(normalized):
+        return None
+    return None
+
+
+def _normalize_seedance_billing_resolution(ai_model: AiModel, extra: Dict[str, Any]) -> str:
+    capabilities = merge_ark_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
+    return normalize_video_resolution(extra.get("resolution"), capabilities)
+
+
+def _video_billing_resolution(ai_model: AiModel, extra: Dict[str, Any]) -> Optional[str]:
+    if _seedance_billing_model_id(ai_model.model_id):
+        return _normalize_seedance_billing_resolution(ai_model, extra)
+    raw_resolution = extra.get("resolution")
+    return str(raw_resolution) if raw_resolution not in (None, "") else None
 
 
 def _has_video_reference(extra: Dict[str, Any]) -> bool:

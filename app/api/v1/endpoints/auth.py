@@ -5,7 +5,12 @@ from app.api.deps import get_current_user
 from app.core.responses import success
 from app.db.session import get_db
 from app.models.user import User
-from app.schemas.user import LoginRequest, RegisterRequest, SendRegisterSmsCodeRequest, UserOut
+from app.schemas.user import (
+    LoginRequest,
+    RegisterRequest,
+    SendRegisterSmsCodeRequest,
+    UserOut,
+)
 from app.services.auth import login_user, register_user, send_register_code
 
 router = APIRouter(prefix="/auth")

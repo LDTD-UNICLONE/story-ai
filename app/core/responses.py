@@ -3,6 +3,7 @@ from typing import Any
 from fastapi.responses import JSONResponse
 from pydantic import ConfigDict
 
+from app.core.public_messages import sanitize_public_data
 from app.core.timezone import now_beijing
 from app.schemas.base import SchemaBaseModel, dump_beijing_json
 
@@ -17,7 +18,12 @@ class ApiResponse(SchemaBaseModel):
 
 
 def success(data: Any = None, message: str = "success", code: int = 0) -> ApiResponse:
-    return ApiResponse(code=code, message=message, data=dump_beijing_json(data), timestamp=now_beijing())
+    return ApiResponse(
+        code=code,
+        message=message,
+        data=sanitize_public_data(dump_beijing_json(data)),
+        timestamp=now_beijing(),
+    )
 
 
 def error(
@@ -26,5 +32,10 @@ def error(
     data: Any = None,
     http_status: int = 400,
 ) -> JSONResponse:
-    payload = ApiResponse(code=code, message=message, data=dump_beijing_json(data), timestamp=now_beijing())
+    payload = ApiResponse(
+        code=code,
+        message=message,
+        data=sanitize_public_data(dump_beijing_json(data)),
+        timestamp=now_beijing(),
+    )
     return JSONResponse(status_code=http_status, content=payload.model_dump(mode="json"))

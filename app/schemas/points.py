@@ -30,6 +30,33 @@ class PointsBalanceOut(SchemaBaseModel):
     points_balance: int
 
 
+class PointsRecordUserOut(SchemaBaseModel):
+    id: UUID
+    account: str
+    nickname: str
+    avatar: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+
+
+class AdminPointsRecordOut(SchemaBaseModel):
+    id: UUID
+    user_id: UUID
+    user: PointsRecordUserOut
+    amount: int
+    balance_after: int
+    transaction_type: str
+    remark: str
+    created_at: datetime
+
+
+class AdminPointsRecordListOut(SchemaBaseModel):
+    items: List[AdminPointsRecordOut]
+    total: int
+    page: int
+    page_size: int
+
+
 class AdminPointsAdjustRequest(SchemaBaseModel):
     amount: int = Field(..., description="正数增加积分，负数扣减积分")
     remark: Optional[str] = Field(default=None, max_length=500)
@@ -69,8 +96,19 @@ class RechargeOrderOut(SchemaBaseModel):
     updated_at: datetime
 
 
+class AdminRechargeOrderOut(RechargeOrderOut):
+    user: PointsRecordUserOut
+
+
 class RechargeOrderListOut(SchemaBaseModel):
     items: List[RechargeOrderOut]
+    total: int
+    page: int
+    page_size: int
+
+
+class AdminRechargeOrderListOut(SchemaBaseModel):
+    items: List[AdminRechargeOrderOut]
     total: int
     page: int
     page_size: int

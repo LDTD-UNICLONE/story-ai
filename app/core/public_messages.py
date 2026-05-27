@@ -96,5 +96,5 @@ def _generic_model_error(message: str) -> str:
     if any(token in lower_message for token in ("sensitive", "privacy", "real person", "敏感")):
         return "输入内容未通过模型安全校验，请更换内容后重试"
     if any(token in lower_message for token in ("not valid", "invalid", "参数")):
-        return "模型请求参数不正确，请调整后重试"
+        return "当前模型不支持所选参数组合，请调整参数后重试"
     return "模型响应失败，请稍后再试"

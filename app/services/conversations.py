@@ -295,9 +295,11 @@ async def _sync_assistant_message_from_task_record(
         "task_record_id": str(task_record.id),
     }
     if task_record.status == "failed":
+        failed_content = _terminal_assistant_content(task_record)
         assistant_message.extra = {
             **(assistant_message.extra or {}),
             "failed_reason": task_record.result,
+            "display_message": failed_content,
         }
     if expected_content:
         assistant_message.content = expected_content

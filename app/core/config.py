@@ -103,7 +103,7 @@ class Settings(BaseSettings):
     wechat_pay_platform_cert_path: str = ""
     wechat_pay_notify_url: str = ""
     wechat_pay_timeout_seconds: int = 30
-    wechat_pay_native_expire_minutes: int = 120
+    wechat_pay_native_expire_minutes: int = 30
     wechat_pay_mock_enabled: bool = False
 
     rate_limit_enabled: bool = True
@@ -112,7 +112,7 @@ class Settings(BaseSettings):
     rate_limit_auth_requests: int = 30
     rate_limit_upload_requests: int = 30
     rate_limit_generation_requests: int = 60
-    rate_limit_polling_requests: int = 60
+    rate_limit_polling_requests: int = 300
 
     @cached_property
     def database_url(self) -> str:

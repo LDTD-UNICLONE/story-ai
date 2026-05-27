@@ -16,6 +16,7 @@ from app.models.project_chapter import ProjectChapter
 from app.models.project_storyboard import ProjectStoryboard
 from app.models.task_record import UserTaskRecord
 from app.services.generated_media import persist_generated_media_to_oss
+from app.services.model_points import settle_video_task_points
 from app.services.model_runner import ModelRunResult, query_model_task
 from app.services.points import change_user_points
 
@@ -313,6 +314,15 @@ def _extract_provider_task_id(extra: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _video_request_extra(record: UserTaskRecord) -> Dict[str, Any]:
+    extra = record.extra or {}
+    for key in ("user_message_extra", "model_extra"):
+        value = extra.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
 async def _mark_next_reconcile(
     db: AsyncSession,
     record: UserTaskRecord,
@@ -581,6 +591,17 @@ async def _mark_reconciled_success(
         await _sync_asset_image_success(db, record, model_result)
     elif record.generation_type == "storyboard_video":
         await _sync_storyboard_video_success(db, record, model_result)
+
+    if provider_generation_type == "video" and record.ai_model_id:
+        ai_model = await db.get(AiModel, record.ai_model_id)
+        if ai_model is not None:
+            await settle_video_task_points(
+                db,
+                record,
+                ai_model,
+                _video_request_extra(record),
+                remark_prefix="视频生成",
+            )
 
     await db.commit()
     await db.refresh(record)

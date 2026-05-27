@@ -2,14 +2,19 @@ from typing import Optional
 from uuid import UUID
 
 from sqlalchemy import or_, select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.exceptions import AppException
 from app.core.security import create_access_token, hash_password, verify_password
 from app.models.user import User
-from app.schemas.user import LoginRequest, RegisterRequest, SendRegisterSmsCodeRequest, TokenOut, UserOut
+from app.schemas.user import (
+    LoginRequest,
+    RegisterRequest,
+    SendRegisterSmsCodeRequest,
+    TokenOut,
+    UserOut,
+)
 from app.services.points import change_user_points
 from app.services.phone_verification import (
     assert_register_sms_code,

@@ -1,6 +1,6 @@
 import json
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Optional, Tuple
 from uuid import UUID
@@ -71,6 +71,7 @@ async def list_my_recharge_orders(
     page: int,
     page_size: int,
 ) -> Tuple[List[UserRechargeOrder], int]:
+    await purge_expired_pending_recharge_orders(db, user_id=user_id, limit=100)
     await sync_user_pending_recharge_orders(db, user_id=user_id, limit=5)
 
     query = select(UserRechargeOrder).where(UserRechargeOrder.user_id == user_id)
@@ -95,6 +96,7 @@ async def list_all_recharge_orders(
     page: int,
     page_size: int,
 ) -> Tuple[List[UserRechargeOrder], int]:
+    await purge_expired_pending_recharge_orders(db, limit=200)
     await sync_pending_recharge_orders(db, limit=10)
 
     query = select(UserRechargeOrder)
@@ -128,6 +130,9 @@ async def get_user_recharge_order_or_404(
     order = result.scalar_one_or_none()
     if order is None:
         raise AppException("充值订单不存在", code=40440, status_code=404)
+    order = await resolve_expired_pending_recharge_order(db, order)
+    if order is None:
+        raise AppException("充值订单不存在", code=40440, status_code=404)
     if order.status == "pending":
         order = await sync_recharge_order_from_wechat(db, order)
     elif order.status == "refunding":
@@ -137,6 +142,9 @@ async def get_user_recharge_order_or_404(
 
 async def get_recharge_order_or_404(db: AsyncSession, order_id: UUID) -> UserRechargeOrder:
     order = await db.get(UserRechargeOrder, order_id)
+    if order is None:
+        raise AppException("充值订单不存在", code=40440, status_code=404)
+    order = await resolve_expired_pending_recharge_order(db, order)
     if order is None:
         raise AppException("充值订单不存在", code=40440, status_code=404)
     if order.status == "pending":
@@ -161,6 +169,7 @@ async def sync_user_pending_recharge_orders(
     user_id: UUID,
     limit: int = 5,
 ) -> None:
+    await purge_expired_pending_recharge_orders(db, user_id=user_id, limit=max(limit, 100))
     result = await db.execute(
         select(UserRechargeOrder)
         .where(UserRechargeOrder.user_id == user_id, UserRechargeOrder.status == "pending")
@@ -181,6 +190,7 @@ async def sync_user_pending_recharge_orders(
 
 
 async def sync_pending_recharge_orders(db: AsyncSession, *, limit: int = 10) -> None:
+    await purge_expired_pending_recharge_orders(db, limit=max(limit, 200))
     result = await db.execute(
         select(UserRechargeOrder)
         .where(UserRechargeOrder.status == "pending")
@@ -198,6 +208,60 @@ async def sync_pending_recharge_orders(db: AsyncSession, *, limit: int = 10) -> 
     )
     for order in refund_result.scalars().all():
         await sync_refund_order_from_wechat(db, order)
+
+
+async def purge_expired_pending_recharge_orders(
+    db: AsyncSession,
+    *,
+    user_id: Optional[UUID] = None,
+    limit: int = 100,
+) -> int:
+    query = (
+        select(UserRechargeOrder)
+        .where(
+            UserRechargeOrder.status == "pending",
+            UserRechargeOrder.created_at <= _pending_recharge_expires_before(),
+        )
+        .order_by(UserRechargeOrder.created_at.asc())
+        .limit(limit)
+    )
+    if user_id:
+        query = query.where(UserRechargeOrder.user_id == user_id)
+
+    result = await db.execute(query)
+    deleted_count = 0
+    for order in result.scalars().all():
+        resolved_order = await resolve_expired_pending_recharge_order(db, order)
+        if resolved_order is None:
+            deleted_count += 1
+    return deleted_count
+
+
+async def resolve_expired_pending_recharge_order(
+    db: AsyncSession,
+    order: UserRechargeOrder,
+) -> Optional[UserRechargeOrder]:
+    if order.status != "pending" or not _is_pending_recharge_expired(order):
+        return order
+
+    synced_order = await sync_recharge_order_from_wechat(db, order)
+    if synced_order.status != "pending":
+        return synced_order
+
+    result = await db.execute(
+        select(UserRechargeOrder).where(UserRechargeOrder.id == synced_order.id).with_for_update()
+    )
+    locked_order = result.scalar_one_or_none()
+    if locked_order is None:
+        return None
+    if locked_order.status != "pending":
+        await db.commit()
+        await db.refresh(locked_order)
+        return locked_order
+
+    await db.delete(locked_order)
+    await db.commit()
+    return None
 
 
 async def sync_recharge_order_from_wechat(
@@ -385,6 +449,14 @@ def _out_trade_no() -> str:
 
 def _out_refund_no() -> str:
     return f"RF{beijing_datetime().strftime('%Y%m%d%H%M%S')}{secrets.token_hex(6).upper()}"
+
+
+def _pending_recharge_expires_before() -> datetime:
+    return beijing_datetime() - timedelta(minutes=max(1, settings.wechat_pay_native_expire_minutes))
+
+
+def _is_pending_recharge_expired(order: UserRechargeOrder) -> bool:
+    return order.created_at <= _pending_recharge_expires_before()
 
 
 def _parse_wechat_time(value: Optional[str]) -> Optional[datetime]:

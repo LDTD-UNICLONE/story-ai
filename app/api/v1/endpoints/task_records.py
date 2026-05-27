@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.core.config import settings
 from app.core.responses import success
 from app.db.session import get_db
 from app.models.user import User
@@ -63,4 +64,16 @@ async def my_task_record_detail(
     current_user: User = Depends(get_current_user),
 ):
     record = await get_task_record_or_404(db, task_record_id, user_id=current_user.id)
-    return success(data=UserTaskRecordOut.model_validate(record).model_dump(mode="json"))
+    data = UserTaskRecordOut.model_validate(record).model_dump(mode="json")
+    data["stop_polling"] = record.status in {"success", "failed"}
+    data["next_poll_seconds"] = _task_record_next_poll_seconds(record.status, data.get("extra") or {})
+    return success(data=data)
+
+
+def _task_record_next_poll_seconds(status: str, extra: dict) -> Optional[int]:
+    if status not in {"pending", "running"}:
+        return None
+    next_poll_seconds = extra.get("next_poll_seconds")
+    if isinstance(next_poll_seconds, int) and next_poll_seconds > 0:
+        return next_poll_seconds
+    return max(3, settings.provider_task_poll_interval_seconds)

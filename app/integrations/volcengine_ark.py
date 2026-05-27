@@ -7,7 +7,7 @@ from app.core.config import settings
 from app.core.exceptions import AppException
 from app.integrations.comfly import _as_list, _extract_media_url
 from app.integrations.comfly_dimensions import normalize_ratio
-from app.integrations.volcengine_ark_video_specs import allowed_video_request_keys
+from app.integrations.volcengine_ark_video_specs import allowed_video_request_keys, normalize_video_resolution
 
 
 _client: Optional[Any] = None
@@ -33,10 +33,12 @@ VIDEO_HELPER_KEYS = {
     "video_urls",
     "videos",
     "video_mode",
+    "ratio",
+    "resolution",
 }
 
 DEFAULT_TEXT_VIDEO_RATIO = "16:9"
-DEFAULT_REFERENCE_VIDEO_RATIO = "adaptive"
+DEFAULT_REFERENCE_VIDEO_RATIO = "16:9"
 DEFAULT_VIDEO_DURATION = 5
 DEFAULT_GENERATE_AUDIO = True
 DEFAULT_WATERMARK = False
@@ -334,25 +336,42 @@ def _count_content_type(content: List[Dict[str, Any]], item_type: str) -> int:
 
 
 def _merge_video_extra(payload: Dict[str, Any], extra: Dict[str, Any]) -> None:
-    allowed_keys = allowed_video_request_keys(extra.get("_model_capabilities") or {})
+    capabilities = extra.get("_model_capabilities") or {}
+    allowed_keys = allowed_video_request_keys(capabilities)
     for key, value in extra.items():
         if key in VIDEO_HELPER_KEYS or key not in allowed_keys or value is None:
             continue
         payload[key] = value
 
+    allowed_ratios = set(capabilities.get("ratios") or [])
     ratio = normalize_ratio(extra.get("aspect_ratio") or extra.get("ratio"))
+    if ratio and allowed_ratios and ratio not in allowed_ratios:
+        ratio = None
     if ratio and "ratio" in allowed_keys and "ratio" not in payload:
         payload["ratio"] = ratio
-    _apply_video_defaults(payload, extra, allowed_keys)
+    if "resolution" in allowed_keys:
+        payload["resolution"] = normalize_video_resolution(extra.get("resolution"), capabilities)
+    _apply_video_defaults(payload, extra, allowed_keys, capabilities)
 
 
-def _apply_video_defaults(payload: Dict[str, Any], extra: Dict[str, Any], allowed_keys: Set[str]) -> None:
+def _apply_video_defaults(
+    payload: Dict[str, Any],
+    extra: Dict[str, Any],
+    allowed_keys: Set[str],
+    capabilities: Dict[str, Any],
+) -> None:
     has_reference_media = _has_reference_media(payload, extra)
+    defaults = capabilities.get("defaults") or {}
 
     if "ratio" in allowed_keys and "ratio" not in payload:
-        payload["ratio"] = DEFAULT_REFERENCE_VIDEO_RATIO if has_reference_media else DEFAULT_TEXT_VIDEO_RATIO
+        payload["ratio"] = defaults.get(
+            "reference_ratio" if has_reference_media else "text_ratio",
+            DEFAULT_REFERENCE_VIDEO_RATIO if has_reference_media else DEFAULT_TEXT_VIDEO_RATIO,
+        )
     if "duration" in allowed_keys and "duration" not in payload:
         payload["duration"] = DEFAULT_VIDEO_DURATION
+    if "resolution" in allowed_keys and "resolution" not in payload:
+        payload["resolution"] = normalize_video_resolution(None, capabilities)
     if "generate_audio" in allowed_keys and "generate_audio" not in payload:
         payload["generate_audio"] = DEFAULT_GENERATE_AUDIO
     if "watermark" not in payload:
@@ -416,6 +435,10 @@ def _raise_provider_error(prefix: str, exc: Exception) -> None:
         message = f"HTTP {status_code}: {message}"
     app_status_code = _provider_app_status_code(status_code, message)
     app_code = 40010 if app_status_code < 500 else 50220
+    if app_status_code == 400:
+        if _is_safety_provider_error(message):
+            raise AppException("输入内容未通过模型安全校验，请更换内容后重试", code=40017, status_code=400) from exc
+        raise AppException("当前模型不支持所选参数组合，请调整参数后重试", code=40016, status_code=400) from exc
     raise AppException(f"{prefix}：{message}", code=app_code, status_code=app_status_code) from exc
 
 
@@ -439,3 +462,11 @@ def _is_non_retryable_provider_error(status_code: Any, message: str) -> bool:
         "content policy",
     )
     return any(token in normalized for token in non_retryable_tokens)
+
+
+def _is_safety_provider_error(message: str) -> bool:
+    normalized = message.lower()
+    return any(
+        token in normalized
+        for token in ("sensitivecontentdetected", "privacyinformation", "real person", "content policy", "sensitive")
+    )

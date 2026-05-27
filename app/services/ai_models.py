@@ -22,7 +22,7 @@ from app.schemas.ai_model import (
 
 def resolve_ai_model_capabilities(ai_model: AiModel) -> dict:
     if _is_ark_video_model(ai_model.vendor, ai_model.model_type, ai_model.model_id):
-        return merge_ark_video_capabilities(ai_model.capabilities or {})
+        return merge_ark_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
     if ai_model.vendor == "comfly" and ai_model.model_type == "video":
         return merge_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
     return ai_model.capabilities or {}
@@ -115,7 +115,7 @@ async def get_ai_model_or_404(
 async def create_ai_model(db: AsyncSession, payload: AiModelCreateRequest) -> AiModel:
     data = payload.model_dump()
     if _is_ark_video_model(data["vendor"], data["model_type"], data["model_id"]) and not data.get("capabilities"):
-        data["capabilities"] = merge_ark_video_capabilities({})
+        data["capabilities"] = merge_ark_video_capabilities(data["model_id"], {})
     if data["vendor"] == "comfly" and data["model_type"] == "video" and not data.get("capabilities"):
         data["capabilities"] = merge_video_capabilities(data["model_id"], {})
     ai_model = AiModel(**data)
@@ -159,7 +159,7 @@ async def import_provider_models(
             capabilities=(
                 item.capabilities
                 or (
-                    merge_ark_video_capabilities({})
+                    merge_ark_video_capabilities(item.model_id, {})
                     if _is_ark_video_model(item.vendor or default_vendor, item.model_type, item.model_id)
                     else {}
                 )
@@ -204,7 +204,7 @@ async def update_ai_model(
         setattr(ai_model, field, value)
 
     if _is_ark_video_model(ai_model.vendor, ai_model.model_type, ai_model.model_id) and not ai_model.capabilities:
-        ai_model.capabilities = merge_ark_video_capabilities({})
+        ai_model.capabilities = merge_ark_video_capabilities(ai_model.model_id, {})
     if ai_model.vendor == "comfly" and ai_model.model_type == "video" and not ai_model.capabilities:
         ai_model.capabilities = merge_video_capabilities(ai_model.model_id, {})
 

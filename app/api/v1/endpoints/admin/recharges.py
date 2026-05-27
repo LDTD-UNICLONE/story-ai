@@ -2,13 +2,21 @@ from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_admin_user
 from app.core.responses import success
 from app.db.session import get_db
+from app.models.points import UserRechargeOrder
 from app.models.user import User
-from app.schemas.points import RechargeOrderListOut, RechargeOrderOut, RechargeRefundRequest
+from app.schemas.points import (
+    AdminRechargeOrderListOut,
+    AdminRechargeOrderOut,
+    PointsRecordUserOut,
+    RechargeOrderOut,
+    RechargeRefundRequest,
+)
 from app.services.recharges import (
     get_recharge_order_or_404,
     list_all_recharge_orders,
@@ -35,8 +43,9 @@ async def admin_recharge_orders(
         page=page,
         page_size=page_size,
     )
-    data = RechargeOrderListOut(
-        items=[RechargeOrderOut.model_validate(order) for order in orders],
+    users = await _load_order_users(db, orders)
+    data = AdminRechargeOrderListOut(
+        items=[_build_admin_recharge_order(order, users[order.user_id]) for order in orders],
         total=total,
         page=page,
         page_size=page_size,
@@ -51,7 +60,9 @@ async def admin_recharge_order_detail(
     current_admin: User = Depends(get_current_admin_user),
 ):
     order = await get_recharge_order_or_404(db, order_id)
-    return success(data=RechargeOrderOut.model_validate(order).model_dump(mode="json"))
+    users = await _load_order_users(db, [order])
+    data = _build_admin_recharge_order(order, users[order.user_id])
+    return success(data=data.model_dump(mode="json"))
 
 
 @router.post("/{order_id}/sync")
@@ -62,7 +73,9 @@ async def admin_sync_recharge_order(
 ):
     order = await get_recharge_order_or_404(db, order_id)
     order = await sync_recharge_order_from_wechat(db, order)
-    return success(data=RechargeOrderOut.model_validate(order).model_dump(mode="json"), message="同步成功")
+    users = await _load_order_users(db, [order])
+    data = _build_admin_recharge_order(order, users[order.user_id])
+    return success(data=data.model_dump(mode="json"), message="同步成功")
 
 
 @router.post("/{order_id}/refund")
@@ -73,7 +86,35 @@ async def admin_refund_recharge_order(
     current_admin: User = Depends(get_current_admin_user),
 ):
     order = await refund_recharge_order(db, order_id=order_id, reason=payload.reason)
+    users = await _load_order_users(db, [order])
+    data = _build_admin_recharge_order(order, users[order.user_id])
     return success(
-        data=RechargeOrderOut.model_validate(order).model_dump(mode="json"),
+        data=data.model_dump(mode="json"),
         message="退款已提交",
+    )
+
+
+async def _load_order_users(
+    db: AsyncSession,
+    orders: list[UserRechargeOrder],
+) -> dict[UUID, User]:
+    user_ids = {order.user_id for order in orders}
+    if not user_ids:
+        return {}
+    result = await db.execute(select(User).where(User.id.in_(user_ids)))
+    return {user.id: user for user in result.scalars().all()}
+
+
+def _build_admin_recharge_order(order: UserRechargeOrder, user: User) -> AdminRechargeOrderOut:
+    data = RechargeOrderOut.model_validate(order).model_dump(mode="python")
+    return AdminRechargeOrderOut(
+        **data,
+        user=PointsRecordUserOut(
+            id=user.id,
+            account=user.account,
+            nickname=user.nickname,
+            avatar=user.avatar,
+            phone=user.phone,
+            email=user.email,
+        ),
     )
