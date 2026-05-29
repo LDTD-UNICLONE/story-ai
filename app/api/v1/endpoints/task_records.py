@@ -1,11 +1,12 @@
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.core.config import settings
+from app.core.exceptions import AppException
 from app.core.responses import success
 from app.db.session import get_db
 from app.models.user import User
@@ -46,7 +47,9 @@ async def my_task_records(
         page=page,
         page_size=page_size,
     )
-    return success(data=data.model_dump(mode="json"))
+    dumped = data.model_dump(mode="json")
+    dumped["items"] = [_clean_terminal_retry_extra(item) for item in dumped["items"]]
+    return success(data=dumped)
 
 
 @router.get("/options")
@@ -59,14 +62,20 @@ async def my_task_record_options(
 
 @router.get("/{task_record_id}")
 async def my_task_record_detail(
-    task_record_id: UUID,
+    task_record_id: str,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    record = await get_task_record_or_404(db, task_record_id, user_id=current_user.id)
+    parsed_task_record_id = _parse_task_record_id(task_record_id)
+    record = await get_task_record_or_404(db, parsed_task_record_id, user_id=current_user.id)
     data = UserTaskRecordOut.model_validate(record).model_dump(mode="json")
+    data = _clean_terminal_retry_extra(data)
     data["stop_polling"] = record.status in {"success", "failed"}
     data["next_poll_seconds"] = _task_record_next_poll_seconds(record.status, data.get("extra") or {})
+    response.headers["Cache-Control"] = "no-store"
+    if data["next_poll_seconds"]:
+        response.headers["X-Next-Poll-Seconds"] = str(data["next_poll_seconds"])
     return success(data=data)
 
 
@@ -77,3 +86,22 @@ def _task_record_next_poll_seconds(status: str, extra: dict) -> Optional[int]:
     if isinstance(next_poll_seconds, int) and next_poll_seconds > 0:
         return next_poll_seconds
     return max(3, settings.provider_task_poll_interval_seconds)
+
+
+def _clean_terminal_retry_extra(data: dict) -> dict:
+    if data.get("status") in {"pending", "running"}:
+        return data
+    extra = data.get("extra")
+    if isinstance(extra, dict):
+        extra.pop("retry_reason", None)
+        extra.pop("next_poll_seconds", None)
+    return data
+
+
+def _parse_task_record_id(value: str) -> UUID:
+    if value in {"", "None", "none", "null", "undefined"}:
+        raise AppException("任务ID不能为空，请确认提交任务接口返回了 task_record_id", code=40018, status_code=400)
+    try:
+        return UUID(str(value))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise AppException("任务ID格式不正确", code=40018, status_code=400) from exc

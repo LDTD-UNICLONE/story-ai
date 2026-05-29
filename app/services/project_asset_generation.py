@@ -231,9 +231,9 @@ def build_asset_image_prompt(
     return "\n".join(
         item
         for item in (
+            f"整体风格：{style_prompt}",
             f"生成模式：{generation_mode}",
             f"模式提示词：{constant_prompt}",
-            f"项目风格：{style_prompt}",
             f"生成比例：{project.generation_ratio}",
             f"资产名称：{asset.name}",
             f"资产描述：{asset_prompt}",

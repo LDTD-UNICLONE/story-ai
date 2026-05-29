@@ -11,15 +11,13 @@ from app.models.conversation import Conversation, ConversationMessage
 from app.models.task_record import UserTaskRecord
 from app.models.user import User
 from app.schemas.conversation import ConversationCreateRequest, ConversationSendMessageRequest, ConversationUpdateRequest
-from app.services.model_runner import ModelRunResult, query_model_task
-from app.services.generated_media import persist_generated_media_to_oss
+from app.services.model_runner import ModelRunResult
 from app.services.model_points import calculate_submission_points_cost
 from app.services.points import change_user_points, consume_user_points
 from app.services.task_records import (
     create_user_task_record,
     expire_stale_task_record,
     expire_stale_task_records,
-    reconcile_provider_task_result,
 )
 from app.tasks.model_generation import run_conversation_generation
 
@@ -201,7 +199,6 @@ async def get_conversation_generation_task_status(
     if task_record is None:
         raise AppException("任务记录不存在", code=40406, status_code=404)
     await expire_stale_task_record(db, task_record)
-    await reconcile_provider_task_result(db, task_record)
     await db.refresh(task_record)
 
     assistant_message_id = (task_record.extra or {}).get("assistant_message_id")
@@ -268,7 +265,6 @@ async def _reconcile_visible_message_tasks(
         ):
             continue
         await expire_stale_task_record(db, task_record)
-        await reconcile_provider_task_result(db, task_record)
         await db.refresh(task_record)
         if task_record.status in {"success", "failed"}:
             await _sync_assistant_message_from_task_record(db, message, task_record)
@@ -656,10 +652,42 @@ async def query_conversation_generation_task(
     if conversation.conversation_type not in {"image", "video"}:
         raise AppException("该会话类型没有生成任务查询接口", code=40006, status_code=400)
 
-    ai_model = await get_enabled_conversation_model_or_404(
-        db,
-        conversation.ai_model_id,
-        conversation.conversation_type,
+    result = await db.execute(
+        select(UserTaskRecord)
+        .where(
+            UserTaskRecord.user_id == user.id,
+            UserTaskRecord.business_type == "conversation",
+            UserTaskRecord.business_id == conversation_id,
+            UserTaskRecord.generation_type == conversation.conversation_type,
+        )
+        .order_by(UserTaskRecord.created_at.desc())
+        .limit(100)
     )
-    result = await query_model_task(ai_model, conversation.conversation_type, task_id)
-    return await persist_generated_media_to_oss(conversation.conversation_type, result)
+    for record in result.scalars().all():
+        if _task_record_provider_task_id(record) == str(task_id):
+            return ModelRunResult(
+                content=record.result or "",
+                extra={
+                    "task_id": str(task_id),
+                    "task_status": record.status,
+                    "task_record_id": str(record.id),
+                    "record_extra": record.extra or {},
+                },
+            )
+    raise AppException("任务记录不存在", code=40406, status_code=404)
+
+
+def _task_record_provider_task_id(record: UserTaskRecord) -> Optional[str]:
+    extra = record.extra or {}
+    candidates = [
+        extra.get("task_id"),
+        extra.get("provider_task_id"),
+        (extra.get("model_result_extra") or {}).get("task_id"),
+        (extra.get("assistant_message_extra") or {}).get("task_id"),
+        (extra.get("last_provider_task_status") or {}).get("task_id"),
+        (extra.get("last_provider_task_status") or {}).get("taskId"),
+    ]
+    for value in candidates:
+        if value:
+            return str(value)
+    return None

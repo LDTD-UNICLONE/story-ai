@@ -71,7 +71,7 @@ async def list_ai_models(
     total = total_result.scalar_one()
 
     result = await db.execute(
-        query.order_by(AiModel.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
+        query.order_by(AiModel.created_at.asc()).offset((page - 1) * page_size).limit(page_size)
     )
     return list(result.scalars().all()), total
 

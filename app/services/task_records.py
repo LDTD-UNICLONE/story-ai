@@ -1,6 +1,7 @@
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.exceptions import AppException
 from app.core.public_messages import sanitize_public_message
-from app.core.timezone import beijing_datetime
+from app.core.timezone import beijing_datetime, to_beijing_datetime
 from app.models.ai_model import AiModel
 from app.models.conversation import ConversationMessage
 from app.models.project_asset import ProjectCharacter, ProjectProp, ProjectScene
@@ -33,7 +34,9 @@ TASK_RECORD_GENERATION_TYPES = [
     {"label": "人物资产分析", "value": "character_analysis", "business_type": "project"},
     {"label": "场景资产分析", "value": "scene_analysis", "business_type": "project"},
     {"label": "道具资产分析", "value": "prop_analysis", "business_type": "project"},
-    {"label": "分镜分析", "value": "storyboard_analysis", "business_type": "project"},
+    {"label": "分镜制作", "value": "storyboard_analysis", "business_type": "project"},
+    {"label": "分镜细化与视频提示词生成", "value": "storyboard_refinement", "business_type": "project"},
+    {"label": "故事板提示词生成", "value": "storyboard_image_prompt_generation", "business_type": "project"},
     {"label": "资产图像生成", "value": "asset_image_generate", "business_type": "project"},
     {"label": "分镜视频生成", "value": "storyboard_video", "business_type": "project"},
 ]
@@ -44,6 +47,15 @@ TASK_RECORD_STATUSES = [
     {"label": "成功", "value": "success"},
     {"label": "失败", "value": "failed"},
 ]
+
+
+@dataclass
+class ProviderReconcileClaim:
+    task_record_id: UUID
+    claim_id: str
+    provider_generation_type: str
+    provider_task_id: str
+    ai_model: AiModel
 
 
 def get_task_record_options() -> Dict[str, Any]:
@@ -196,7 +208,6 @@ async def get_task_record_or_404(
     if record is None:
         raise AppException("任务记录不存在", code=40406, status_code=404)
     await expire_stale_task_record(db, record)
-    await reconcile_provider_task_result(db, record)
     return record
 
 
@@ -243,50 +254,177 @@ async def interrupt_task_record(
     return record
 
 
+async def reconcile_provider_task_record(db: AsyncSession, task_record_id: UUID) -> Optional[UserTaskRecord]:
+    claim = await _claim_provider_reconcile(db, task_record_id)
+    if claim is None:
+        return None
+
+    try:
+        model_result = await query_model_task(
+            claim.ai_model,
+            claim.provider_generation_type,
+            claim.provider_task_id,
+        )
+    except Exception:
+        return await _finish_provider_reconcile_claim(
+            db,
+            claim,
+            model_result=None,
+            query_failed=True,
+        )
+
+    status = str(model_result.extra.get("task_status") or "").lower()
+    if _is_provider_success_result(model_result, status):
+        model_result.extra = {**model_result.extra, "platform_task_status": "success"}
+        try:
+            model_result = await persist_generated_media_to_oss(claim.provider_generation_type, model_result)
+        except Exception:
+            return await _finish_provider_reconcile_claim(
+                db,
+                claim,
+                model_result=None,
+                query_failed=True,
+            )
+
+    return await _finish_provider_reconcile_claim(
+        db,
+        claim,
+        model_result=model_result,
+        query_failed=False,
+    )
+
+
 async def reconcile_provider_task_result(db: AsyncSession, record: UserTaskRecord) -> None:
+    await reconcile_provider_task_record(db, record.id)
+
+
+async def _claim_provider_reconcile(db: AsyncSession, task_record_id: UUID) -> Optional[ProviderReconcileClaim]:
+    result = await db.execute(
+        select(UserTaskRecord)
+        .where(UserTaskRecord.id == task_record_id)
+        .with_for_update(skip_locked=True)
+    )
+    record = result.scalar_one_or_none()
+    if record is None:
+        await db.rollback()
+        return None
     if record.status not in {"pending", "running"}:
-        return
+        await db.rollback()
+        return None
     if await expire_stale_task_record(db, record):
-        return
+        return None
 
     provider_generation_type = _provider_generation_type(record)
     if provider_generation_type is None or record.ai_model_id is None:
-        return
+        await db.rollback()
+        return None
 
     task_id = _extract_provider_task_id(record.extra or {})
-    if not task_id:
-        return
-    if _should_skip_provider_reconcile(record.extra or {}):
-        return
+    if not task_id or _should_skip_provider_reconcile(record.extra or {}):
+        await db.rollback()
+        return None
+    if _has_active_provider_reconcile_claim(record.extra or {}):
+        await db.rollback()
+        return None
 
     ai_model = await db.get(AiModel, record.ai_model_id)
     if ai_model is None:
-        return
+        await db.rollback()
+        return None
 
-    try:
-        model_result = await query_model_task(ai_model, provider_generation_type, task_id)
-    except Exception:
+    claim_id = str(uuid4())
+    now = beijing_datetime()
+    record.extra = {
+        **(record.extra or {}),
+        "provider_reconcile_claim_id": claim_id,
+        "provider_reconcile_claimed_at": now.isoformat(),
+        "provider_reconcile_claim_until": (now + timedelta(seconds=_provider_reconcile_lease_seconds())).isoformat(),
+    }
+    await db.commit()
+    return ProviderReconcileClaim(
+        task_record_id=record.id,
+        claim_id=claim_id,
+        provider_generation_type=provider_generation_type,
+        provider_task_id=task_id,
+        ai_model=ai_model,
+    )
+
+
+async def _finish_provider_reconcile_claim(
+    db: AsyncSession,
+    claim: ProviderReconcileClaim,
+    *,
+    model_result: Optional[ModelRunResult],
+    query_failed: bool,
+) -> Optional[UserTaskRecord]:
+    result = await db.execute(
+        select(UserTaskRecord)
+        .where(UserTaskRecord.id == claim.task_record_id)
+        .with_for_update(skip_locked=True)
+    )
+    record = result.scalar_one_or_none()
+    if record is None:
+        await db.rollback()
+        return None
+    if record.status not in {"pending", "running"}:
+        await db.rollback()
+        return record
+    if (record.extra or {}).get("provider_reconcile_claim_id") != claim.claim_id:
+        await db.rollback()
+        return None
+
+    if query_failed or model_result is None:
         await _mark_next_reconcile(db, record, None)
-        return
+        await db.refresh(record)
+        return record
 
     status = str(model_result.extra.get("task_status") or "").lower()
     if _is_provider_failed_status(status):
         await _mark_reconciled_failed(db, record, f"模型任务执行失败：{status or 'failed'}", model_result.extra)
-        return
-
-    if not _is_provider_success_result(model_result, status):
-        record.extra = {
-            **(record.extra or {}),
-            "last_provider_task_status": model_result.extra,
-            "provider_reconciled_at": beijing_datetime().isoformat(),
-            "next_poll_seconds": _provider_reconcile_interval(),
-        }
+    elif not _is_provider_success_result(model_result, status):
+        record.extra = _clear_provider_reconcile_claim(
+            {
+                **(record.extra or {}),
+                "last_provider_task_status": model_result.extra,
+                "provider_reconciled_at": beijing_datetime().isoformat(),
+                "next_poll_seconds": _provider_reconcile_interval(),
+            }
+        )
         await db.commit()
-        return
+        await db.refresh(record)
+    else:
+        await _mark_reconciled_success(db, record, claim.provider_generation_type, model_result)
+    return record
 
-    model_result.extra = {**model_result.extra, "platform_task_status": "success"}
-    model_result = await persist_generated_media_to_oss(provider_generation_type, model_result)
-    await _mark_reconciled_success(db, record, provider_generation_type, model_result)
+
+def should_reconcile_provider_task(record: UserTaskRecord) -> bool:
+    return (
+        record.status in {"pending", "running"}
+        and _provider_generation_type(record) is not None
+        and bool(_extract_provider_task_id(record.extra or {}))
+        and not _has_active_provider_reconcile_claim(record.extra or {})
+    )
+
+
+def provider_reconcile_delay_seconds(record: Optional[UserTaskRecord] = None) -> int:
+    if record is not None:
+        next_poll_seconds = (record.extra or {}).get("next_poll_seconds")
+        if isinstance(next_poll_seconds, int) and next_poll_seconds > 0:
+            return next_poll_seconds
+    return _provider_reconcile_interval()
+
+
+async def list_provider_reconcile_candidates(db: AsyncSession, limit: int = 100) -> List[UserTaskRecord]:
+    result = await db.execute(
+        select(UserTaskRecord)
+        .where(
+            UserTaskRecord.status.in_(("pending", "running")),
+            UserTaskRecord.generation_type.in_(("image", "video", "asset_image_generate", "storyboard_video")),
+        )
+        .order_by(UserTaskRecord.updated_at.asc())
+        .limit(limit)
+    )
+    return [record for record in result.scalars().all() if should_reconcile_provider_task(record)]
 
 
 def _provider_generation_type(record: UserTaskRecord) -> Optional[str]:
@@ -328,11 +466,13 @@ async def _mark_next_reconcile(
     record: UserTaskRecord,
     provider_extra: Optional[Dict[str, Any]],
 ) -> None:
-    extra = {
-        **(record.extra or {}),
-        "provider_reconciled_at": beijing_datetime().isoformat(),
-        "next_poll_seconds": _provider_reconcile_interval(),
-    }
+    extra = _clear_provider_reconcile_claim(
+        {
+            **(record.extra or {}),
+            "provider_reconciled_at": beijing_datetime().isoformat(),
+            "next_poll_seconds": _provider_reconcile_interval(),
+        }
+    )
     if provider_extra is not None:
         extra["last_provider_task_status"] = provider_extra
     record.extra = extra
@@ -347,12 +487,41 @@ def _should_skip_provider_reconcile(extra: Dict[str, Any]) -> bool:
         last_time = datetime.fromisoformat(str(reconciled_at))
     except ValueError:
         return False
+    last_time = to_beijing_datetime(last_time)
     elapsed = (beijing_datetime() - last_time).total_seconds()
     return elapsed < _provider_reconcile_interval()
 
 
 def _provider_reconcile_interval() -> int:
     return max(5, settings.provider_task_poll_interval_seconds)
+
+
+def _provider_reconcile_lease_seconds() -> int:
+    return max(
+        60,
+        settings.comfly_timeout_seconds + settings.generated_media_read_timeout_seconds + 30,
+    )
+
+
+def _has_active_provider_reconcile_claim(extra: Dict[str, Any]) -> bool:
+    claim_id = extra.get("provider_reconcile_claim_id")
+    claim_until = extra.get("provider_reconcile_claim_until")
+    if not claim_id or not claim_until:
+        return False
+    try:
+        until = datetime.fromisoformat(str(claim_until))
+    except ValueError:
+        return False
+    until = to_beijing_datetime(until)
+    return until > beijing_datetime()
+
+
+def _clear_provider_reconcile_claim(extra: Dict[str, Any]) -> Dict[str, Any]:
+    cleaned = dict(extra)
+    cleaned.pop("provider_reconcile_claim_id", None)
+    cleaned.pop("provider_reconcile_claimed_at", None)
+    cleaned.pop("provider_reconcile_claim_until", None)
+    return cleaned
 
 
 async def expire_stale_task_records(
@@ -460,7 +629,15 @@ async def _sync_stale_failed_business_state(
     if record.generation_type == "chapter_text_process":
         await _sync_chapter_text_failed(db, record, reason)
         return
-    if record.generation_type in {"character_analysis", "scene_analysis", "prop_analysis", "storyboard_analysis"}:
+    if record.generation_type in {
+        "character_analysis",
+        "scene_analysis",
+        "prop_analysis",
+        "storyboard_analysis",
+        "storyboard_refinement",
+        "storyboard_image_prompt_generation",
+        "storyboard_prompt_generation",
+    }:
         await _sync_chapter_analysis_failed(db, record, reason)
         return
     if record.generation_type == "asset_image_generate":
@@ -516,19 +693,25 @@ async def _sync_chapter_analysis_failed(db: AsyncSession, record: UserTaskRecord
         "scene_analysis": "scene_analysis_status",
         "prop_analysis": "prop_analysis_status",
         "storyboard_analysis": "storyboard_analysis_status",
+        "storyboard_refinement": "storyboard_refinement_status",
+        "storyboard_image_prompt_generation": "storyboard_image_prompt_generation_status",
+        "storyboard_prompt_generation": "storyboard_prompt_generation_status",
     }.get(record.generation_type)
     task_key = {
         "character_analysis": "character_analysis_task_record_id",
         "scene_analysis": "scene_analysis_task_record_id",
         "prop_analysis": "prop_analysis_task_record_id",
         "storyboard_analysis": "storyboard_analysis_task_record_id",
+        "storyboard_refinement": "storyboard_refinement_task_record_id",
+        "storyboard_image_prompt_generation": "storyboard_image_prompt_generation_task_record_id",
+        "storyboard_prompt_generation": "storyboard_prompt_generation_task_record_id",
     }.get(record.generation_type)
     if not status_key:
         return
     chapter.extra = {
         **(chapter.extra or {}),
         status_key: "failed",
-        f"{status_key}_failed_reason": reason,
+        status_key.replace("_status", "_failed_reason"): reason,
         **({task_key: str(record.id)} if task_key else {}),
     }
 
@@ -579,11 +762,13 @@ async def _mark_reconciled_success(
 ) -> None:
     record.status = "success"
     record.result = model_result.content
-    record.extra = {
-        **(record.extra or {}),
-        "model_result_extra": model_result.extra,
-        "provider_reconciled_at": beijing_datetime().isoformat(),
-    }
+    record.extra = _clear_provider_reconcile_claim(
+        {
+            **(record.extra or {}),
+            "model_result_extra": model_result.extra,
+            "provider_reconciled_at": beijing_datetime().isoformat(),
+        }
+    )
 
     if record.business_type == "conversation":
         await _sync_conversation_message_success(db, record, model_result)
@@ -616,12 +801,15 @@ async def _mark_reconciled_failed(
     reason = sanitize_public_message(reason)
     record.status = "failed"
     record.result = reason
-    record.extra = {
-        **(record.extra or {}),
-        "failed_reason": reason,
-        "model_result_extra": provider_extra,
-        "provider_reconciled_at": beijing_datetime().isoformat(),
-    }
+    record.extra = _clear_provider_reconcile_claim(
+        {
+            **(record.extra or {}),
+            "failed_reason": reason,
+            "model_result_extra": provider_extra,
+            "provider_reconciled_at": beijing_datetime().isoformat(),
+        }
+    )
+    await _refund_failed_task_points(db, record)
     if record.business_type == "conversation":
         assistant_message_id = (record.extra or {}).get("assistant_message_id")
         parsed_assistant_message_id = _parse_uuid(assistant_message_id)
@@ -635,6 +823,8 @@ async def _mark_reconciled_failed(
                     "failed_reason": reason,
                     "task_record_id": str(record.id),
                 }
+    elif record.generation_type == "asset_image_generate":
+        await _sync_asset_image_failed(db, record, reason)
     elif record.generation_type == "storyboard_video":
         storyboard_id = (record.extra or {}).get("storyboard_id")
         parsed_storyboard_id = _parse_uuid(storyboard_id)
@@ -649,6 +839,23 @@ async def _mark_reconciled_failed(
                 }
     await db.commit()
     await db.refresh(record)
+
+
+async def _refund_failed_task_points(db: AsyncSession, record: UserTaskRecord) -> None:
+    if record.points_cost <= 0 or (record.extra or {}).get("refund_transaction_id"):
+        return
+    refund_transaction = await change_user_points(
+        db,
+        user_id=record.user_id,
+        amount=record.points_cost,
+        transaction_type="refund",
+        remark=f"任务失败退回积分：{record.title}",
+        auto_commit=False,
+    )
+    record.extra = {
+        **(record.extra or {}),
+        "refund_transaction_id": str(refund_transaction.id),
+    }
 
 
 async def _sync_conversation_message_success(

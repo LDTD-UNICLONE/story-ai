@@ -1,4 +1,3 @@
-import asyncio
 from typing import Any, Optional
 from uuid import UUID
 
@@ -138,17 +137,12 @@ async def my_conversation_generation_task(
     current_user: User = Depends(get_current_user),
 ):
     response.headers["Cache-Control"] = "no-store"
-    deadline = asyncio.get_running_loop().time() + wait_seconds
-    while True:
-        task_record, assistant_message = await get_conversation_generation_task_status(
-            db,
-            conversation_id=conversation_id,
-            user_id=current_user.id,
-            task_record_id=task_record_id,
-        )
-        if task_record.status not in {"pending", "running"} or asyncio.get_running_loop().time() >= deadline:
-            break
-        await asyncio.sleep(0.5)
+    task_record, assistant_message = await get_conversation_generation_task_status(
+        db,
+        conversation_id=conversation_id,
+        user_id=current_user.id,
+        task_record_id=task_record_id,
+    )
     assistant_message_id = (task_record.extra or {}).get("assistant_message_id")
     next_poll_seconds = (task_record.extra or {}).get("next_poll_seconds")
     if task_record.status in {"pending", "running"} and next_poll_seconds is None:
@@ -172,6 +166,8 @@ async def my_conversation_generation_task(
         created_at=task_record.created_at,
         updated_at=task_record.updated_at,
     )
+    if next_poll_seconds:
+        response.headers["X-Next-Poll-Seconds"] = str(next_poll_seconds)
     return success(data=data.model_dump(mode="json"))
 
 

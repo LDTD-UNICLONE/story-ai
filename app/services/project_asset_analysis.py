@@ -8,7 +8,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import AppException
+from app.core.timezone import beijing_datetime
 from app.models.ai_model import AiModel
+from app.models.project import Project
 from app.models.project_asset import ProjectCharacter, ProjectProp, ProjectScene
 from app.models.project_chapter import ProjectChapter
 from app.models.task_record import UserTaskRecord
@@ -179,9 +181,22 @@ async def run_asset_analysis_in_worker(
     )
 
     model = config["model"]
+    await _lock_project_assets_for_merge(db, task_record)
+    existing_assets = await _list_existing_assets_for_merge(db, model, task_record)
+    asset_index = _build_asset_merge_index(model, existing_assets)
+    created_count = 0
+    merged_count = 0
     for item in items:
         asset = _build_asset(model, item, task_record, chapter)
-        db.add(asset)
+        existing_asset = _find_merge_target(model, asset_index, asset)
+        if existing_asset is None:
+            db.add(asset)
+            _index_asset_for_merge(model, asset_index, asset)
+            created_count += 1
+        else:
+            _merge_asset(existing_asset, asset, task_record)
+            _index_asset_for_merge(model, asset_index, existing_asset)
+            merged_count += 1
 
     chapter.extra = {
         **(chapter.extra or {}),
@@ -194,6 +209,8 @@ async def run_asset_analysis_in_worker(
         **(task_record.extra or {}),
         "model_result_extra": model_result.extra,
         "asset_count": len(items),
+        "asset_created_count": created_count,
+        "asset_merged_count": merged_count,
     }
 
 
@@ -259,6 +276,162 @@ def _build_asset_extra(item: Dict[str, Any], task_record: UserTaskRecord) -> Dic
         "task_record_id": str(task_record.id),
         "raw_item": item,
     }
+
+
+async def _lock_project_assets_for_merge(db: AsyncSession, task_record: UserTaskRecord) -> None:
+    if task_record.business_id is None:
+        return
+    await db.execute(
+        select(Project.id)
+        .where(Project.id == task_record.business_id)
+        .with_for_update()
+    )
+
+
+async def _list_existing_assets_for_merge(
+    db: AsyncSession,
+    model: Type[Any],
+    task_record: UserTaskRecord,
+) -> List[Any]:
+    if task_record.business_id is None:
+        return []
+    result = await db.execute(
+        select(model)
+        .where(
+            model.project_id == task_record.business_id,
+            model.user_id == task_record.user_id,
+            model.is_enabled.is_(True),
+        )
+        .with_for_update()
+    )
+    return list(result.scalars().all())
+
+
+def _build_asset_merge_index(model: Type[Any], assets: List[Any]) -> Dict[str, Any]:
+    index: Dict[str, Any] = {}
+    for asset in assets:
+        _index_asset_for_merge(model, index, asset)
+    return index
+
+
+def _index_asset_for_merge(model: Type[Any], index: Dict[str, Any], asset: Any) -> None:
+    for key in _asset_merge_keys(model, asset):
+        index.setdefault(key, asset)
+
+
+def _find_merge_target(model: Type[Any], index: Dict[str, Any], asset: Any) -> Any:
+    for key in _asset_merge_keys(model, asset):
+        existing = index.get(key)
+        if existing is not None:
+            return existing
+    return None
+
+
+def _asset_merge_keys(model: Type[Any], asset: Any) -> List[str]:
+    values = [asset.name]
+    if model is ProjectCharacter:
+        values.extend(asset.aliases or [])
+    keys: List[str] = []
+    for value in values:
+        key = _normalize_asset_key(value)
+        if key:
+            keys.append(key)
+    return keys
+
+
+def _normalize_asset_key(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    text = re.sub(r"[\s　·・,，.。:：;；、_\\-—《》<>()（）\\[\\]【】\"'“”‘’]+", "", text)
+    return text
+
+
+def _merge_asset(target: Any, source: Any, task_record: UserTaskRecord) -> None:
+    if isinstance(target, ProjectCharacter):
+        target.aliases = _merge_string_list(target.aliases or [], [source.name, *(source.aliases or [])])
+        target_name_key = _normalize_asset_key(target.name)
+        target.aliases = [alias for alias in target.aliases if _normalize_asset_key(alias) != target_name_key]
+        _merge_scalar_fields(
+            target,
+            source,
+            ("identity", "gender", "age", "appearance", "personality", "relationship", "costume"),
+        )
+    elif isinstance(target, ProjectScene):
+        _merge_scalar_fields(target, source, ("location", "time_of_day", "environment", "atmosphere"))
+    elif isinstance(target, ProjectProp):
+        _merge_scalar_fields(target, source, ("category", "appearance", "function"))
+
+    _merge_scalar_fields(target, source, ("reference_image",))
+    target.description = _merge_text(target.description, source.description)
+    target.prompt = _merge_text(target.prompt, source.prompt)
+    target.source_content = _merge_text(target.source_content, source.source_content)
+    if target.source_chapter_id is None:
+        target.source_chapter_id = source.source_chapter_id
+    target.extra = _merge_asset_extra(target.extra or {}, source.extra or {}, task_record)
+    target.updated_at = beijing_datetime()
+
+
+def _merge_scalar_fields(target: Any, source: Any, fields: Tuple[str, ...]) -> None:
+    for field in fields:
+        target_value = getattr(target, field, None)
+        source_value = getattr(source, field, None)
+        if _is_empty_value(target_value) and not _is_empty_value(source_value):
+            setattr(target, field, source_value)
+
+
+def _merge_string_list(primary: List[Any], secondary: List[Any]) -> List[str]:
+    result: List[str] = []
+    seen = set()
+    for value in [*primary, *secondary]:
+        text = str(value or "").strip()
+        key = _normalize_asset_key(text)
+        if not text or not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
+def _merge_text(primary: Any, secondary: Any) -> Any:
+    if _is_empty_value(primary):
+        return secondary
+    if _is_empty_value(secondary):
+        return primary
+    primary_text = str(primary).strip()
+    secondary_text = str(secondary).strip()
+    if not secondary_text or secondary_text in primary_text:
+        return primary_text
+    if primary_text in secondary_text:
+        return secondary_text
+    return f"{primary_text}\n\n{secondary_text}"
+
+
+def _merge_asset_extra(
+    target_extra: Dict[str, Any],
+    source_extra: Dict[str, Any],
+    task_record: UserTaskRecord,
+) -> Dict[str, Any]:
+    merged_sources = target_extra.get("merged_sources")
+    if not isinstance(merged_sources, list):
+        merged_sources = []
+    raw_item = source_extra.get("raw_item")
+    merged_sources.append(
+        {
+            "task_record_id": str(task_record.id),
+            "raw_item": raw_item,
+        }
+    )
+    return {
+        **target_extra,
+        "merged": True,
+        "last_merge_task_record_id": str(task_record.id),
+        "merged_sources": merged_sources[-20:],
+    }
+
+
+def _is_empty_value(value: Any) -> bool:
+    return value is None or value == "" or value == []
 
 
 def _build_custom_prompt(analysis_prompt: str, processed_content: str) -> str:

@@ -49,6 +49,7 @@ class ProjectStoryboard(Base, TimestampMixin):
     source_content: Mapped[str] = mapped_column(Text, nullable=False)
     scene_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     scene_time: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    scene_state: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     shot_size: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     camera_angle: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     camera_movement: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -60,6 +61,7 @@ class ProjectStoryboard(Base, TimestampMixin):
     character_expression: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     dialogue: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     sound_effect: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    atmosphere: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     emotion: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     visual_description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     image_prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -67,9 +69,42 @@ class ProjectStoryboard(Base, TimestampMixin):
     duration_suggestion: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     production_focus: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     negative_prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    ending_frame: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     extra: Mapped[dict] = mapped_column(JSON, nullable=False, server_default=text("'{}'::json"))
     is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
 
     project: Mapped[Project] = relationship()
     chapter: Mapped[ProjectChapter] = relationship()
     ai_model: Mapped[Optional[AiModel]] = relationship()
+
+    @property
+    def core_action(self) -> Optional[str]:
+        return self.action
+
+    @property
+    def storyboard_image_prompt(self) -> Optional[str]:
+        return self.image_prompt
+
+    @property
+    def event_goal(self) -> Optional[str]:
+        extra = self.extra or {}
+        raw_item = extra.get("raw_item") if isinstance(extra.get("raw_item"), dict) else {}
+        return extra.get("event_goal") or raw_item.get("event_goal")
+
+    @property
+    def production_focus_base(self) -> Optional[str]:
+        extra = self.extra or {}
+        raw_item = extra.get("raw_item") if isinstance(extra.get("raw_item"), dict) else {}
+        return extra.get("production_focus_base") or raw_item.get("production_focus_base")
+
+    @property
+    def negative_prompt_base(self) -> Optional[str]:
+        extra = self.extra or {}
+        raw_item = extra.get("raw_item") if isinstance(extra.get("raw_item"), dict) else {}
+        return extra.get("negative_prompt_base") or raw_item.get("negative_prompt_base")
+
+    @property
+    def split_reason(self) -> Optional[str]:
+        extra = self.extra or {}
+        raw_item = extra.get("raw_item") if isinstance(extra.get("raw_item"), dict) else {}
+        return extra.get("split_reason") or raw_item.get("split_reason")

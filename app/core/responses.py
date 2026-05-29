@@ -5,6 +5,7 @@ from pydantic import ConfigDict
 
 from app.core.public_messages import sanitize_public_data
 from app.core.timezone import now_beijing
+from app.core.logging import get_request_id
 from app.schemas.base import SchemaBaseModel, dump_beijing_json
 
 
@@ -38,4 +39,8 @@ def error(
         data=sanitize_public_data(dump_beijing_json(data)),
         timestamp=now_beijing(),
     )
-    return JSONResponse(status_code=http_status, content=payload.model_dump(mode="json"))
+    response = JSONResponse(status_code=http_status, content=payload.model_dump(mode="json"))
+    request_id = get_request_id()
+    if request_id and request_id != "-":
+        response.headers["X-Request-ID"] = request_id
+    return response

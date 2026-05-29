@@ -135,6 +135,9 @@ async def settle_text_task_points(
     *,
     remark_prefix: str,
 ) -> None:
+    if (task_record.extra or {}).get("points_settled"):
+        return
+
     actual_points, detail = calculate_text_model_points_cost(ai_model, response_extra)
     if actual_points is None:
         return
@@ -175,7 +178,7 @@ async def settle_text_task_points(
             settlement_extra["points_settlement_delta"] = delta
 
     task_record.points_cost = actual_points
-    task_record.extra = {**(task_record.extra or {}), **settlement_extra}
+    task_record.extra = {**(task_record.extra or {}), **settlement_extra, "points_settled": True}
 
 
 async def settle_video_task_points(
@@ -186,6 +189,9 @@ async def settle_video_task_points(
     *,
     remark_prefix: str,
 ) -> None:
+    if (task_record.extra or {}).get("points_settled"):
+        return
+
     billing_extra = request_extra or _task_request_extra(task_record)
     actual_points = calculate_video_model_points_cost(ai_model, billing_extra)
     charged_points = task_record.points_cost
@@ -234,7 +240,7 @@ async def settle_video_task_points(
             settlement_extra["points_settlement_delta"] = delta
 
     task_record.points_cost = actual_points
-    task_record.extra = {**(task_record.extra or {}), **settlement_extra}
+    task_record.extra = {**(task_record.extra or {}), **settlement_extra, "points_settled": True}
 
 
 def _task_request_extra(task_record: UserTaskRecord) -> Dict[str, Any]:

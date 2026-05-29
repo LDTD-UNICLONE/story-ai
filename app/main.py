@@ -10,6 +10,7 @@ from app.core.config import settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import configure_logging
 from app.core.rate_limit import RedisRateLimitMiddleware
+from app.core.request_logging import RequestLoggingMiddleware
 from app.core.startup import validate_runtime_config
 from app.db.session import AsyncSessionLocal
 from app.integrations.comfly import close_comfly_client, init_comfly_client
@@ -65,6 +66,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.add_middleware(RedisRateLimitMiddleware)
+    app.add_middleware(RequestLoggingMiddleware)
 
     register_exception_handlers(app)
     app.include_router(api_router, prefix=settings.api_prefix)

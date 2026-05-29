@@ -149,14 +149,15 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
         if await refresh_task_record_interrupted(db, task_record):
             return
 
+        resolved_status = model_result.extra.get("platform_task_status") or "success"
         assistant_message.content = model_result.content
         assistant_message.extra = {
             **(assistant_message.extra or {}),
             **model_result.extra,
-            "task_status": "success",
+            "task_status": resolved_status,
             "task_record_id": str(task_record.id),
         }
-        task_record.status = model_result.extra.get("platform_task_status") or "success"
+        task_record.status = resolved_status
         task_record.result = model_result.content
         task_record.extra = {
             **(task_record.extra or {}),
@@ -175,6 +176,7 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
             await _settle_text_points_after_success(db, task_record.id, ai_model, model_result.extra)
         elif task_record.generation_type == "video":
             await _settle_video_points_after_success(db, task_record.id, ai_model)
+        _enqueue_provider_reconcile_if_needed(task_record)
 
 
 async def _mark_failed(
@@ -384,3 +386,14 @@ def _user_failed_reason(exc: Exception) -> str:
     if _is_retryable_provider_error(exc):
         return "模型服务繁忙，已自动重试多次仍未成功，请稍后再试"
     return sanitize_public_message(str(exc) or "任务执行失败")
+
+
+def _enqueue_provider_reconcile_if_needed(task_record: UserTaskRecord) -> None:
+    from app.services.task_records import provider_reconcile_delay_seconds, should_reconcile_provider_task
+    from app.tasks.provider_reconcile import enqueue_provider_reconcile
+
+    if should_reconcile_provider_task(task_record):
+        enqueue_provider_reconcile(
+            str(task_record.id),
+            countdown=provider_reconcile_delay_seconds(task_record),
+        )

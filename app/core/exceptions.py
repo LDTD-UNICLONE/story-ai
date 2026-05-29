@@ -7,6 +7,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.public_messages import sanitize_public_message
 from app.core.responses import error
+from app.core.logging import log_extra
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,21 @@ class AppException(Exception):
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppException)
     async def app_exception_handler(request: Request, exc: AppException) -> JSONResponse:
+        log_level = logging.WARNING if exc.status_code >= 500 else logging.INFO
+        logger.log(
+            log_level,
+            "Application exception: %s %s %s",
+            request.method,
+            request.url.path,
+            exc.message,
+            extra=log_extra(
+                event="app_exception",
+                method=request.method,
+                path=request.url.path,
+                status_code=exc.status_code,
+                code=exc.code,
+            ),
+        )
         return error(
             message=sanitize_public_message(exc.message),
             code=exc.code,
@@ -31,6 +47,18 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
         message = exc.detail if isinstance(exc.detail, str) else "请求失败"
+        logger.info(
+            "HTTP exception: %s %s %s",
+            request.method,
+            request.url.path,
+            message,
+            extra=log_extra(
+                event="http_exception",
+                method=request.method,
+                path=request.url.path,
+                status_code=exc.status_code,
+            ),
+        )
         return error(
             message=sanitize_public_message(message, fallback="请求失败"),
             code=exc.status_code,
@@ -41,6 +69,17 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def validation_exception_handler(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
+        logger.info(
+            "Validation error: %s %s",
+            request.method,
+            request.url.path,
+            extra=log_extra(
+                event="validation_error",
+                method=request.method,
+                path=request.url.path,
+                errors=exc.errors(),
+            ),
+        )
         return error(
             message="参数校验失败",
             code=42200,
@@ -50,5 +89,10 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-        logger.exception("Unhandled exception: %s %s", request.method, request.url.path)
+        logger.exception(
+            "Unhandled exception: %s %s",
+            request.method,
+            request.url.path,
+            extra=log_extra(event="unhandled_exception", method=request.method, path=request.url.path),
+        )
         return error(message="服务器内部错误", code=50000, http_status=500)

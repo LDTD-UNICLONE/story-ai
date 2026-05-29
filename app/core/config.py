@@ -24,9 +24,12 @@ class Settings(BaseSettings):
     enforce_production_config: bool = True
     log_dir: str = "logs"
     log_file: str = "story-ai.log"
+    log_access_file: str = "access.log"
+    log_error_file: str = "error.log"
     log_level: str = "INFO"
     log_max_bytes: int = 10 * 1024 * 1024
     log_backup_count: int = 5
+    log_sql_enabled: bool = False
 
     comfly_base_url: str = ""
     comfly_api_key: str = ""
@@ -113,6 +116,7 @@ class Settings(BaseSettings):
     rate_limit_upload_requests: int = 30
     rate_limit_generation_requests: int = 60
     rate_limit_polling_requests: int = 300
+    rate_limit_polling_window_seconds: int = 5
 
     @cached_property
     def database_url(self) -> str:

@@ -97,6 +97,7 @@ async def _execute_generation(task_record_id: UUID, storyboard_id: UUID) -> None
             )
             return
         await db.commit()
+        _enqueue_provider_reconcile_if_needed(task_record)
 
 
 async def _fail_generation(
@@ -203,3 +204,14 @@ def _user_failed_reason(exc: Exception) -> str:
     if _is_retryable_provider_error(exc):
         return "模型服务繁忙，已自动重试多次仍未成功，请稍后再试"
     return sanitize_public_message(str(exc) or "任务执行失败")
+
+
+def _enqueue_provider_reconcile_if_needed(task_record: UserTaskRecord) -> None:
+    from app.services.task_records import provider_reconcile_delay_seconds, should_reconcile_provider_task
+    from app.tasks.provider_reconcile import enqueue_provider_reconcile
+
+    if should_reconcile_provider_task(task_record):
+        enqueue_provider_reconcile(
+            str(task_record.id),
+            countdown=provider_reconcile_delay_seconds(task_record),
+        )

@@ -1,11 +1,12 @@
 from uuid import UUID
 
 import jwt
-from fastapi import Depends
+from fastapi import Depends, Request
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import AppException
+from app.core.logging import bind_request_context
 from app.core.security import decode_access_token
 from app.db.session import get_db
 from app.models.user import User
@@ -15,6 +16,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
 
 async def get_current_user(
+    request: Request,
     token: str = Depends(oauth2_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> User:
@@ -32,6 +34,8 @@ async def get_current_user(
         raise AppException("用户不存在或已被删除", code=40103, status_code=401)
     if not user.is_enabled:
         raise AppException("账号已被禁用", code=40302, status_code=403)
+    bind_request_context(user_id=str(user.id))
+    request.state.user_id = str(user.id)
     return user
 
 

@@ -1,11 +1,14 @@
 from celery import Celery
-from celery.signals import worker_process_shutdown
+import logging
+
+from celery.signals import task_postrun, task_prerun, worker_process_shutdown
 from kombu import Queue
 
 from app.core.config import settings
-from app.core.logging import configure_logging
+from app.core.logging import bind_request_context, clear_request_context, configure_logging, log_extra
 
 configure_logging()
+logger = logging.getLogger(__name__)
 
 celery_app = Celery(
     "story_ai",
@@ -19,6 +22,7 @@ celery_app = Celery(
         "app.tasks.project_asset_generation",
         "app.tasks.project_storyboard",
         "app.tasks.project_storyboard_video",
+        "app.tasks.provider_reconcile",
     ],
 )
 
@@ -36,8 +40,11 @@ celery_app.conf.update(
         "tasks.project_chapter.run_project_chapter_processing": {"queue": "story_ai_text"},
         "tasks.project_asset_analysis.run_project_asset_analysis": {"queue": "story_ai_text"},
         "tasks.project_storyboard.run_project_storyboard_analysis": {"queue": "story_ai_text"},
+        "tasks.project_storyboard.run_project_storyboard_stage": {"queue": "story_ai_text"},
         "tasks.project_asset_generation.run_project_asset_image_generation": {"queue": "story_ai_image"},
         "tasks.project_storyboard_video.run_project_storyboard_video_generation": {"queue": "story_ai_video"},
+        "tasks.provider_reconcile.reconcile_provider_task": {"queue": "story_ai_default"},
+        "tasks.provider_reconcile.enqueue_pending_provider_reconciliations": {"queue": "story_ai_default"},
     },
     task_serializer="json",
     accept_content=["json"],
@@ -46,10 +53,17 @@ celery_app.conf.update(
     task_acks_late=True,
     task_reject_on_worker_lost=True,
     task_time_limit=settings.celery_task_time_limit_seconds,
-      task_soft_time_limit=settings.celery_task_soft_time_limit_seconds,
+    task_soft_time_limit=settings.celery_task_soft_time_limit_seconds,
     worker_prefetch_multiplier=1,
     worker_max_tasks_per_child=settings.celery_worker_max_tasks_per_child,
     result_expires=settings.celery_result_expires_seconds,
+    beat_schedule={
+        "enqueue-pending-provider-reconciliations": {
+            "task": "tasks.provider_reconcile.enqueue_pending_provider_reconciliations",
+            "schedule": max(10, settings.provider_task_poll_interval_seconds),
+            "args": (100,),
+        },
+    },
     broker_transport_options={
         "visibility_timeout": max(settings.celery_task_time_limit_seconds * 2, 3600),
     },
@@ -69,5 +83,47 @@ def close_worker_process_resources(**kwargs):
     asyncio.run(dispose_worker_engine())
     asyncio.run(dispose_engine())
 
+
+@task_prerun.connect
+def bind_task_logging_context(task_id=None, task=None, args=None, kwargs=None, **_):
+    bind_request_context(request_id=str(task_id or "-"))
+    business_task_record_id = None
+    if args:
+        business_task_record_id = args[0]
+    elif isinstance(kwargs, dict):
+        business_task_record_id = kwargs.get("task_record_id")
+    logger.info(
+        "Celery task started: %s",
+        getattr(task, "name", ""),
+        extra=log_extra(
+            event="celery_task_started",
+            task_id=task_id,
+            task_name=getattr(task, "name", ""),
+            business_task_record_id=business_task_record_id,
+        ),
+    )
+
+
+@task_postrun.connect
+def clear_task_logging_context(task_id=None, task=None, state=None, retval=None, args=None, kwargs=None, **_):
+    business_task_record_id = None
+    if args:
+        business_task_record_id = args[0]
+    elif isinstance(kwargs, dict):
+        business_task_record_id = kwargs.get("task_record_id")
+    logger.info(
+        "Celery task finished: %s state=%s",
+        getattr(task, "name", ""),
+        state,
+        extra=log_extra(
+            event="celery_task_finished",
+            task_id=task_id,
+            task_name=getattr(task, "name", ""),
+            business_task_record_id=business_task_record_id,
+            state=state,
+        ),
+    )
+    clear_request_context()
+
 # Ensure tasks are registered when the Celery app is imported by scripts or tests.
-from app.tasks import example, model_generation, project_asset_analysis, project_asset_generation, project_chapter, project_storyboard, project_storyboard_video  # noqa: E402,F401
+from app.tasks import example, model_generation, project_asset_analysis, project_asset_generation, project_chapter, project_storyboard, project_storyboard_video, provider_reconcile  # noqa: E402,F401

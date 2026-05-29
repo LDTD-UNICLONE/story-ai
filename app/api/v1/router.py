@@ -22,6 +22,7 @@ from app.api.v1.endpoints.admin import announcements as admin_announcements
 from app.api.v1.endpoints.admin import models as admin_models
 from app.api.v1.endpoints.admin import point_records as admin_point_records
 from app.api.v1.endpoints.admin import recharges as admin_recharges
+from app.api.v1.endpoints.admin import statistics as admin_statistics
 from app.api.v1.endpoints.admin import styles as admin_styles
 from app.api.v1.endpoints.admin import system_logs as admin_system_logs
 from app.api.v1.endpoints.admin import task_records as admin_task_records
@@ -32,6 +33,7 @@ api_router.include_router(admin_announcements.router, tags=["Admin Announcements
 api_router.include_router(admin_models.router, tags=["Admin Models"])
 api_router.include_router(admin_point_records.router, tags=["Admin Point Records"])
 api_router.include_router(admin_recharges.router, tags=["Admin Recharges"])
+api_router.include_router(admin_statistics.router, tags=["Admin Statistics"])
 api_router.include_router(admin_styles.router, tags=["Admin Styles"])
 api_router.include_router(admin_system_logs.router, tags=["Admin System Logs"])
 api_router.include_router(admin_task_records.router, tags=["Admin Task Records"])

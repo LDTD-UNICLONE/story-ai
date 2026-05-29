@@ -1,3 +1,4 @@
+import logging
 from typing import Any, Dict, List, Optional, Set
 
 import httpx
@@ -7,6 +8,8 @@ from app.core.exceptions import AppException
 from app.integrations.comfly_dimensions import adapt_image_dimensions, adapt_video_dimensions
 from app.integrations.comfly_video_specs import allowed_video_request_keys
 
+
+logger = logging.getLogger(__name__)
 
 _client: Optional[httpx.AsyncClient] = None
 
@@ -41,6 +44,8 @@ CHAT_REQUEST_KEYS = {
     "tools",
     "tool_choice",
 }
+
+CHAT_MAX_TOKENS_UPPER_BOUND = 65536
 
 
 IMAGE_GENERATION_HELPER_KEYS = {
@@ -262,6 +267,8 @@ def _raise_model_service_http_error(exc: httpx.HTTPStatusError, fallback: str) -
         raise AppException("模型服务繁忙，请稍后再试", code=50204, status_code=502) from exc
     if status_code in {401, 403}:
         raise AppException("模型服务认证失败，请检查服务配置", code=50231, status_code=502) from exc
+    if status_code == 451:
+        raise AppException("输入内容未通过模型安全校验，请更换内容后重试", code=40017, status_code=400) from exc
     if status_code == 400:
         if any(token in response_text.lower() for token in ("sensitive", "privacy", "real person", "content policy", "敏感")):
             raise AppException("输入内容未通过模型安全校验，请更换内容后重试", code=40017, status_code=400) from exc
@@ -317,10 +324,20 @@ def _merge_chat_extra(payload: Dict[str, Any], extra: Dict[str, Any]) -> None:
     for key, value in extra.items():
         if key in CHAT_BUILDER_KEYS or key not in CHAT_REQUEST_KEYS or value is None:
             continue
+        if key == "max_tokens":
+            payload[key] = _normalize_chat_max_tokens(value)
+            continue
         if key == "stream":
             payload["stream"] = False
             continue
         payload[key] = value
+
+
+def _normalize_chat_max_tokens(value: Any) -> int:
+    try:
+        return min(max(1, int(value)), CHAT_MAX_TOKENS_UPPER_BOUND)
+    except (TypeError, ValueError):
+        return CHAT_MAX_TOKENS_UPPER_BOUND
 
 
 def _collect_chat_media_urls(extra: Dict[str, Any]) -> List[str]:

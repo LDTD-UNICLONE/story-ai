@@ -21,7 +21,7 @@ class RedisRateLimitMiddleware(BaseHTTPMiddleware):
 
         rule = _match_rule(request)
         identity = _identity(request, rule)
-        window = settings.rate_limit_window_seconds
+        window = _window_for_rule(rule)
         keys = _rate_limit_keys(rule)
 
         for rule_name, limit in keys:
@@ -56,7 +56,9 @@ def _match_rule(request: Request) -> str:
         return "upload"
     if "/conversations/" in path and path.endswith("/messages") and method == "POST":
         return "generation"
-    if path.endswith(("/processing", "/analysis", "/image-generation", "/video-generation")) and method == "POST":
+    if path.endswith(
+        ("/processing", "/analysis", "/image-generation", "/video-generation", "/refine", "/storyboard-prompt-generation")
+    ) and method == "POST":
         return "generation"
     return "global"
 
@@ -88,8 +90,21 @@ def _limit_for_rule(rule: str) -> int:
     if rule == "generation":
         return settings.rate_limit_generation_requests
     if rule == "polling":
-        return settings.rate_limit_polling_requests
+        return _polling_window_limit()
     return 0
+
+
+def _window_for_rule(rule: str) -> int:
+    if rule == "polling":
+        return max(1, settings.rate_limit_polling_window_seconds)
+    return max(1, settings.rate_limit_window_seconds)
+
+
+def _polling_window_limit() -> int:
+    base_window = max(1, settings.rate_limit_window_seconds)
+    polling_window = _window_for_rule("polling")
+    per_window = settings.rate_limit_polling_requests * polling_window // base_window
+    return max(5, per_window)
 
 
 def _identity(request: Request, rule: str = "global") -> str:
@@ -122,15 +137,17 @@ def _polling_identity_key(path: str) -> Optional[str]:
 def _rate_limited_response(rule_name: str, limit: int, retry_after_seconds: int) -> Response:
     retry_after_seconds = max(1, retry_after_seconds)
     message = "轮询过于频繁，请稍后再试" if rule_name == "polling" else "请求过于频繁，请稍后再试"
+    window_seconds = _window_for_rule(rule_name)
     response = error(
         message=message,
         code=42900,
         data={
             "rule": rule_name,
             "limit": limit,
-            "window_seconds": settings.rate_limit_window_seconds,
+            "window_seconds": window_seconds,
             "retry_after_seconds": retry_after_seconds,
             "next_poll_seconds": retry_after_seconds,
+            "hint": "请清理重复轮询定时器，并按 next_poll_seconds 或 Retry-After 后重试" if rule_name == "polling" else None,
         },
         http_status=429,
     )

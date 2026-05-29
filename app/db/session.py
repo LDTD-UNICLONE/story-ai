@@ -14,7 +14,7 @@ engine = create_async_engine(
     max_overflow=settings.postgres_max_overflow,
     pool_timeout=settings.postgres_pool_timeout,
     pool_recycle=settings.postgres_pool_recycle,
-    echo=settings.app_debug,
+    echo=settings.log_sql_enabled,
     connect_args={"server_settings": {"timezone": settings.timezone}},
 )
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
@@ -29,7 +29,7 @@ def create_worker_sessionmaker() -> async_sessionmaker[AsyncSession]:
         _worker_engine = create_async_engine(
             settings.database_url,
             poolclass=NullPool,
-            echo=settings.app_debug,
+            echo=settings.log_sql_enabled,
             connect_args={"server_settings": {"timezone": settings.timezone}},
         )
         _worker_sessionmaker = async_sessionmaker(_worker_engine, expire_on_commit=False, class_=AsyncSession)

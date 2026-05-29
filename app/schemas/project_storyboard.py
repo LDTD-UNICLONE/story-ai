@@ -21,6 +21,7 @@ class ProjectStoryboardOut(SchemaBaseModel):
     source_content: str
     scene_name: Optional[str] = None
     scene_time: Optional[str] = None
+    scene_state: Optional[str] = None
     shot_size: Optional[str] = None
     camera_angle: Optional[str] = None
     camera_movement: Optional[str] = None
@@ -28,10 +29,12 @@ class ProjectStoryboardOut(SchemaBaseModel):
     characters: List[str]
     props: List[str]
     action: Optional[str] = None
+    event_goal: Optional[str] = None
     character_action: Optional[str] = None
     character_expression: Optional[str] = None
     dialogue: Optional[str] = None
     sound_effect: Optional[str] = None
+    atmosphere: Optional[str] = None
     emotion: Optional[str] = None
     visual_description: Optional[str] = None
     image_prompt: Optional[str] = None
@@ -39,6 +42,8 @@ class ProjectStoryboardOut(SchemaBaseModel):
     duration_suggestion: Optional[str] = None
     production_focus: Optional[str] = None
     negative_prompt: Optional[str] = None
+    ending_frame: Optional[str] = None
+    split_reason: Optional[str] = None
     extra: Dict[str, Any]
     is_enabled: bool
     created_at: datetime
@@ -62,6 +67,7 @@ class ProjectStoryboardUpdateRequest(SchemaBaseModel):
     source_content: Optional[str] = Field(default=None, min_length=1)
     scene_name: Optional[str] = Field(default=None, max_length=128)
     scene_time: Optional[str] = Field(default=None, max_length=64)
+    scene_state: Optional[str] = Field(default=None, max_length=128)
     shot_size: Optional[str] = Field(default=None, max_length=64)
     camera_angle: Optional[str] = Field(default=None, max_length=128)
     camera_movement: Optional[str] = None
@@ -69,17 +75,25 @@ class ProjectStoryboardUpdateRequest(SchemaBaseModel):
     characters: Optional[List[str]] = None
     props: Optional[List[str]] = None
     action: Optional[str] = None
+    core_action: Optional[str] = None
+    event_goal: Optional[str] = None
     character_action: Optional[str] = None
     character_expression: Optional[str] = None
     dialogue: Optional[str] = None
     sound_effect: Optional[str] = None
+    atmosphere: Optional[str] = None
     emotion: Optional[str] = None
     visual_description: Optional[str] = None
     image_prompt: Optional[str] = None
+    storyboard_image_prompt: Optional[str] = None
     video_prompt: Optional[str] = None
     duration_suggestion: Optional[str] = Field(default=None, max_length=64)
     production_focus: Optional[str] = None
+    production_focus_base: Optional[str] = None
     negative_prompt: Optional[str] = None
+    negative_prompt_base: Optional[str] = None
+    ending_frame: Optional[str] = None
+    split_reason: Optional[str] = None
     extra: Optional[Dict[str, Any]] = None
 
 
@@ -89,10 +103,52 @@ class ProjectStoryboardAnalyzeRequest(SchemaBaseModel):
     extra: Optional[Dict[str, Any]] = None
 
 
+class ProjectStoryboardRefineRequest(SchemaBaseModel):
+    ai_model_id: UUID
+    extra: Optional[Dict[str, Any]] = None
+
+
+class ProjectStoryboardPromptRequest(SchemaBaseModel):
+    ai_model_id: UUID
+    extra: Optional[Dict[str, Any]] = None
+
+
 class ProjectStoryboardAnalyzeOut(SchemaBaseModel):
     task_record_id: UUID
     status: str
     points_cost: int
+
+
+class ProjectStoryboardUnitRequest(SchemaBaseModel):
+    title: str = Field(min_length=1, max_length=128)
+    source_content: str = Field(min_length=1)
+    event_goal: Optional[str] = None
+    scene_name: Optional[str] = Field(default=None, max_length=128)
+    characters: List[str] = Field(default_factory=list)
+    props: List[str] = Field(default_factory=list)
+    core_action: str = Field(min_length=1)
+    dialogue: str = ""
+    split_reason: Optional[str] = None
+    extra: Optional[Dict[str, Any]] = None
+
+
+class ProjectStoryboardMergeRequest(SchemaBaseModel):
+    storyboard_ids: List[UUID] = Field(min_length=2)
+    title: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    source_content: Optional[str] = Field(default=None, min_length=1)
+    event_goal: Optional[str] = None
+    scene_name: Optional[str] = Field(default=None, max_length=128)
+    characters: Optional[List[str]] = None
+    props: Optional[List[str]] = None
+    action: Optional[str] = None
+    core_action: Optional[str] = None
+    dialogue: Optional[str] = None
+    split_reason: Optional[str] = None
+    extra: Optional[Dict[str, Any]] = None
+
+
+class ProjectStoryboardSplitRequest(SchemaBaseModel):
+    units: List[ProjectStoryboardUnitRequest] = Field(min_length=2)
 
 
 class ProjectStoryboardVideoGenerateRequest(SchemaBaseModel):

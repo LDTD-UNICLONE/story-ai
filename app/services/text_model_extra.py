@@ -1,7 +1,8 @@
 from typing import Any, Dict, Optional
 
 
-TEXT_ANALYSIS_MAX_TOKENS = 100000
+# Comfly chat completions accepts maxOutputTokens in [1, 65537).
+TEXT_ANALYSIS_MAX_TOKENS = 65536
 
 
 def normalize_text_analysis_extra(extra: Optional[Dict[str, Any]]) -> Dict[str, Any]:
