@@ -5,6 +5,7 @@ from app.api.v1.endpoints import (
     auth,
     conversations,
     health,
+    materials,
     models,
     points,
     project_asset_analysis,
@@ -19,6 +20,7 @@ from app.api.v1.endpoints import (
     users,
 )
 from app.api.v1.endpoints.admin import announcements as admin_announcements
+from app.api.v1.endpoints.admin import materials as admin_materials
 from app.api.v1.endpoints.admin import models as admin_models
 from app.api.v1.endpoints.admin import point_records as admin_point_records
 from app.api.v1.endpoints.admin import recharges as admin_recharges
@@ -30,6 +32,7 @@ from app.api.v1.endpoints.admin import users as admin_users
 
 api_router = APIRouter()
 api_router.include_router(admin_announcements.router, tags=["Admin Announcements"])
+api_router.include_router(admin_materials.router, tags=["Admin Materials"])
 api_router.include_router(admin_models.router, tags=["Admin Models"])
 api_router.include_router(admin_point_records.router, tags=["Admin Point Records"])
 api_router.include_router(admin_recharges.router, tags=["Admin Recharges"])
@@ -41,6 +44,7 @@ api_router.include_router(admin_users.router, tags=["Admin Users"])
 api_router.include_router(announcements.router, tags=["Announcements"])
 api_router.include_router(auth.router, tags=["Auth"])
 api_router.include_router(conversations.router, tags=["Conversations"])
+api_router.include_router(materials.router, tags=["Materials"])
 api_router.include_router(models.router, tags=["Models"])
 api_router.include_router(points.router, tags=["Points"])
 api_router.include_router(project_asset_analysis.router, tags=["Project Asset Analysis"])

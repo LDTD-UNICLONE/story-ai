@@ -1,7 +1,9 @@
 import asyncio
 import base64
+import logging
 import mimetypes
 import re
+import time
 from io import BytesIO
 from pathlib import PurePosixPath
 from tempfile import SpooledTemporaryFile
@@ -13,9 +15,13 @@ from starlette.concurrency import run_in_threadpool
 
 from app.core.config import settings
 from app.core.exceptions import AppException
+from app.core.logging import log_extra
 from app.integrations.oss import OssClient
 from app.services.model_runner import ModelRunResult
 from app.services.uploads import build_story_directory, detect_content_type
+
+
+logger = logging.getLogger(__name__)
 
 
 async def persist_generated_media_to_oss(
@@ -27,6 +33,15 @@ async def persist_generated_media_to_oss(
 
     source_urls = _collect_result_media_urls(model_result)
     sidecar_image_urls = _collect_sidecar_image_urls(model_result, source_urls)
+    logger.info(
+        "Generated media persistence started",
+        extra=log_extra(
+            event="generated_media_persist_started",
+            generation_type=generation_type,
+            source_url_count=len(source_urls),
+            sidecar_image_url_count=len(sidecar_image_urls),
+        ),
+    )
     if not source_urls:
         oss_url = await _try_upload_base64_content_to_oss(model_result.content, generation_type)
         if not oss_url:
@@ -40,6 +55,14 @@ async def persist_generated_media_to_oss(
 
     uploaded_urls = await _upload_urls_to_oss(source_urls, generation_type)
     if not uploaded_urls:
+        logger.warning(
+            "Generated media persistence skipped: no uploaded URLs",
+            extra=log_extra(
+                event="generated_media_persist_skipped",
+                generation_type=generation_type,
+                source_url_count=len(source_urls),
+            ),
+        )
         return await _persist_sidecar_images(model_result, sidecar_image_urls)
 
     url_mapping = dict(zip(source_urls, uploaded_urls))
@@ -50,6 +73,15 @@ async def persist_generated_media_to_oss(
         "display_media_urls": uploaded_urls,
     }
     content = _replace_result_media_urls(model_result.content, source_urls, uploaded_urls)
+    logger.info(
+        "Generated media persistence completed",
+        extra=log_extra(
+            event="generated_media_persist_completed",
+            generation_type=generation_type,
+            source_url_count=len(source_urls),
+            uploaded_url_count=len(uploaded_urls),
+        ),
+    )
     return await _persist_sidecar_images(ModelRunResult(content=content, extra=extra), sidecar_image_urls)
 
 
@@ -254,9 +286,18 @@ async def _upload_url_to_oss(
     source_url: str,
     generation_type: str,
 ) -> str:
+    started_at = time.monotonic()
     content_type = ""
     fileobj = SpooledTemporaryFile(max_size=8 * 1024 * 1024)
     try:
+        logger.info(
+            "Generated media download started",
+            extra=log_extra(
+                event="generated_media_download_started",
+                generation_type=generation_type,
+                source_url=source_url,
+            ),
+        )
         async with client.stream("GET", source_url) as response:
             response.raise_for_status()
             content_type = response.headers.get("content-type", "")
@@ -281,23 +322,90 @@ async def _upload_url_to_oss(
                 fileobj.write(chunk)
     except httpx.HTTPError as exc:
         fileobj.close()
+        logger.warning(
+            "Generated media download failed",
+            extra=log_extra(
+                event="generated_media_download_failed",
+                generation_type=generation_type,
+                source_url=source_url,
+                reason=str(exc),
+            ),
+        )
         raise AppException("生成媒体下载失败，无法转存 OSS", code=50230, status_code=502) from exc
 
     fileobj.seek(0)
     content_type = detect_content_type(_filename_from_url(source_url), content_type)
     filename = _filename_from_url(source_url, content_type)
     category = "image" if generation_type == "image" else "video"
+    logger.info(
+        "Generated media download completed",
+        extra=log_extra(
+            event="generated_media_download_completed",
+            generation_type=generation_type,
+            source_url=source_url,
+            filename=filename,
+            content_type=content_type,
+            elapsed_ms=round((time.monotonic() - started_at) * 1000, 2),
+        ),
+    )
 
     oss_client = OssClient()
     try:
-        url, _ = await run_in_threadpool(
-            oss_client.upload_fileobj,
-            fileobj,
-            filename,
-            build_story_directory(category),
-            content_type,
+        logger.info(
+            "Generated media OSS upload started",
+            extra=log_extra(
+                event="generated_media_oss_upload_started",
+                generation_type=generation_type,
+                filename=filename,
+                directory=build_story_directory(category),
+                content_type=content_type,
+                timeout_seconds=settings.generated_media_upload_timeout_seconds,
+            ),
+        )
+        upload_started_at = time.monotonic()
+        url, _ = await asyncio.wait_for(
+            run_in_threadpool(
+                oss_client.upload_fileobj,
+                fileobj,
+                filename,
+                build_story_directory(category),
+                content_type,
+            ),
+            timeout=settings.generated_media_upload_timeout_seconds,
+        )
+        logger.info(
+            "Generated media OSS upload completed",
+            extra=log_extra(
+                event="generated_media_oss_upload_completed",
+                generation_type=generation_type,
+                filename=filename,
+                oss_url=url,
+                elapsed_ms=round((time.monotonic() - upload_started_at) * 1000, 2),
+            ),
         )
         return url
+    except asyncio.TimeoutError as exc:
+        logger.error(
+            "Generated media OSS upload timed out",
+            extra=log_extra(
+                event="generated_media_oss_upload_timeout",
+                generation_type=generation_type,
+                filename=filename,
+                timeout_seconds=settings.generated_media_upload_timeout_seconds,
+            ),
+        )
+        raise AppException("生成媒体转存 OSS 超时，请稍后重试", code=50232, status_code=502) from exc
+    except Exception as exc:
+        logger.error(
+            "Generated media OSS upload failed",
+            extra=log_extra(
+                event="generated_media_oss_upload_failed",
+                generation_type=generation_type,
+                filename=filename,
+                reason=str(exc),
+            ),
+        )
+        raise
     finally:
         fileobj.close()
 
@@ -330,13 +438,19 @@ async def _try_upload_base64_content_to_oss(content: str, generation_type: str) 
 
     filename = _filename_from_url("", content_type)
     oss_client = OssClient()
-    url, _ = await run_in_threadpool(
-        oss_client.upload_fileobj,
-        BytesIO(data),
-        filename,
-        build_story_directory("image"),
-        content_type,
-    )
+    try:
+        url, _ = await asyncio.wait_for(
+            run_in_threadpool(
+                oss_client.upload_fileobj,
+                BytesIO(data),
+                filename,
+                build_story_directory("image"),
+                content_type,
+            ),
+            timeout=settings.generated_media_upload_timeout_seconds,
+        )
+    except asyncio.TimeoutError as exc:
+        raise AppException("生成媒体转存 OSS 超时，请稍后重试", code=50232, status_code=502) from exc
     return url
 
 

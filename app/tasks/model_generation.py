@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from types import SimpleNamespace
 from typing import Optional
 from uuid import UUID
@@ -8,6 +9,7 @@ from sqlalchemy import select
 
 from app.core.config import settings
 from app.core.exceptions import AppException
+from app.core.logging import log_extra
 from app.core.public_messages import sanitize_public_message
 from app.core.timezone import beijing_datetime
 from app.db.session import create_worker_sessionmaker
@@ -25,6 +27,7 @@ from app.worker import celery_app
 
 
 WorkerSessionLocal = create_worker_sessionmaker()
+logger = logging.getLogger(__name__)
 
 
 @celery_app.task(
@@ -86,13 +89,42 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
         task_record = result.scalar_one_or_none()
         assistant_message = await db.get(ConversationMessage, assistant_message_id)
         if task_record is None or assistant_message is None:
+            logger.warning(
+                "Conversation generation skipped: task_record or assistant message missing",
+                extra=log_extra(
+                    event="conversation_generation_skipped",
+                    task_record_id=task_record_id,
+                    assistant_message_id=assistant_message_id,
+                    reason="missing_task_or_message",
+                ),
+            )
             return
         if task_record.status != "pending":
+            logger.info(
+                "Conversation generation skipped: task_record is not pending",
+                extra=log_extra(
+                    event="conversation_generation_skipped",
+                    task_record_id=task_record.id,
+                    assistant_message_id=assistant_message.id,
+                    status=task_record.status,
+                    reason="not_pending",
+                ),
+            )
             return
 
         task_record.status = "running"
         assistant_message.extra = {**(assistant_message.extra or {}), "task_status": "running"}
         await db.commit()
+        logger.info(
+            "Conversation generation business task running",
+            extra=log_extra(
+                event="conversation_generation_running",
+                task_record_id=task_record.id,
+                assistant_message_id=assistant_message.id,
+                generation_type=task_record.generation_type,
+                ai_model_id=task_record.ai_model_id,
+            ),
+        )
 
         result = await db.execute(
             select(AiModel).where(
@@ -171,6 +203,17 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
                 .values(updated_at=beijing_datetime())
             )
         await db.commit()
+        logger.info(
+            "Conversation generation business task committed",
+            extra=log_extra(
+                event="conversation_generation_committed",
+                task_record_id=task_record.id,
+                assistant_message_id=assistant_message.id,
+                generation_type=task_record.generation_type,
+                status=task_record.status,
+                result_preview=(task_record.result or "")[:200],
+            ),
+        )
 
         if task_record.generation_type == "text":
             await _settle_text_points_after_success(db, task_record.id, ai_model, model_result.extra)
@@ -219,6 +262,17 @@ async def _mark_failed(
         "task_record_id": str(task_record.id),
     }
     await db.commit()
+    logger.warning(
+        "Conversation generation business task failed",
+        extra=log_extra(
+            event="conversation_generation_failed",
+            task_record_id=task_record.id,
+            assistant_message_id=assistant_message.id,
+            generation_type=task_record.generation_type,
+            reason=reason,
+            raw_reason=raw_reason or reason,
+        ),
+    )
 
 
 async def _settle_text_points_after_success(

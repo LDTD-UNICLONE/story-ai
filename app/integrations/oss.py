@@ -21,7 +21,12 @@ class OssClient:
             raise AppException("OSS 配置不完整", code=50010, status_code=500)
 
         auth = oss2.Auth(settings.oss_access_key_id, settings.oss_access_key_secret)
-        self.bucket = oss2.Bucket(auth, settings.oss_endpoint, settings.oss_bucket_name)
+        self.bucket = oss2.Bucket(
+            auth,
+            settings.oss_endpoint,
+            settings.oss_bucket_name,
+            connect_timeout=settings.generated_media_connect_timeout_seconds,
+        )
 
     def upload_fileobj(
         self,
@@ -42,3 +47,9 @@ class OssClient:
         if settings.oss_public_base_url:
             return f"{settings.oss_public_base_url.rstrip('/')}/{object_key.lstrip('/')}"
         return f"https://{settings.oss_bucket_name}.{settings.oss_endpoint.removeprefix('https://')}/{object_key}"
+
+    def get_object(self, object_key: str):
+        try:
+            return self.bucket.get_object(object_key)
+        except Exception as exc:
+            raise AppException("OSS 文件读取失败", code=50012, status_code=500) from exc

@@ -79,6 +79,7 @@ class Settings(BaseSettings):
     generated_media_transfer_concurrency: int = 3
     generated_media_connect_timeout_seconds: int = 30
     generated_media_read_timeout_seconds: int = 300
+    generated_media_upload_timeout_seconds: int = 120
     oss_endpoint: str = "https://oss-cn-hangzhou.aliyuncs.com"
     oss_bucket_name: str = ""
     oss_access_key_id: str = ""

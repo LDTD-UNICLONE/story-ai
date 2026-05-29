@@ -23,7 +23,7 @@ from app.schemas.ai_model import (
 def resolve_ai_model_capabilities(ai_model: AiModel) -> dict:
     if _is_ark_video_model(ai_model.vendor, ai_model.model_type, ai_model.model_id):
         return merge_ark_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
-    if ai_model.vendor == "comfly" and ai_model.model_type == "video":
+    if _is_comfly_model(ai_model.vendor, ai_model.model_id) and ai_model.model_type == "video":
         return merge_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
     return ai_model.capabilities or {}
 
@@ -32,6 +32,10 @@ def _is_ark_video_model(vendor: str, model_type: str, model_id: str) -> bool:
     return model_type == "video" and (
         vendor == VOLCENGINE_ARK_VENDOR or is_volcengine_ark_video_model(model_id)
     )
+
+
+def _is_comfly_model(vendor: str, model_id: str) -> bool:
+    return vendor in {"comfly", "模型服务"} and not is_volcengine_ark_video_model(model_id)
 
 
 async def list_ai_models(
@@ -114,9 +118,10 @@ async def get_ai_model_or_404(
 
 async def create_ai_model(db: AsyncSession, payload: AiModelCreateRequest) -> AiModel:
     data = payload.model_dump()
+    data["vendor"] = _normalize_ai_model_vendor(data["vendor"], data["model_type"], data["model_id"])
     if _is_ark_video_model(data["vendor"], data["model_type"], data["model_id"]) and not data.get("capabilities"):
         data["capabilities"] = merge_ark_video_capabilities(data["model_id"], {})
-    if data["vendor"] == "comfly" and data["model_type"] == "video" and not data.get("capabilities"):
+    if _is_comfly_model(data["vendor"], data["model_id"]) and data["model_type"] == "video" and not data.get("capabilities"):
         data["capabilities"] = merge_video_capabilities(data["model_id"], {})
     ai_model = AiModel(**data)
     db.add(ai_model)
@@ -139,6 +144,7 @@ async def import_provider_models(
     skipped: List[str] = []
 
     for item in models:
+        vendor = _normalize_ai_model_vendor(item.vendor or default_vendor, item.model_type, item.model_id)
         exists = await db.execute(select(AiModel).where(AiModel.model_id == item.model_id))
         if exists.scalar_one_or_none() is not None:
             skipped.append(item.model_id)
@@ -147,7 +153,7 @@ async def import_provider_models(
         ai_model = AiModel(
             nickname=item.nickname or item.model_id,
             model_id=item.model_id,
-            vendor=item.vendor or default_vendor,
+            vendor=vendor,
             model_type=item.model_type,
             remark=item.remark,
             points_cost=item.points_cost,
@@ -160,12 +166,12 @@ async def import_provider_models(
                 item.capabilities
                 or (
                     merge_ark_video_capabilities(item.model_id, {})
-                    if _is_ark_video_model(item.vendor or default_vendor, item.model_type, item.model_id)
+                    if _is_ark_video_model(vendor, item.model_type, item.model_id)
                     else {}
                 )
                 or (
                     merge_video_capabilities(item.model_id, {})
-                    if (item.vendor or default_vendor) == "comfly" and item.model_type == "video"
+                    if _is_comfly_model(vendor, item.model_id) and item.model_type == "video"
                     else {}
                 )
             ),
@@ -200,12 +206,17 @@ async def update_ai_model(
         if exists.scalar_one_or_none() is not None:
             raise AppException("模型 ID 已存在", code=40902, status_code=409)
 
+    vendor = update_data.get("vendor", ai_model.vendor)
+    model_type = update_data.get("model_type", ai_model.model_type)
+    model_id = update_data.get("model_id", ai_model.model_id)
+    update_data["vendor"] = _normalize_ai_model_vendor(vendor, model_type, model_id)
+
     for field, value in update_data.items():
         setattr(ai_model, field, value)
 
     if _is_ark_video_model(ai_model.vendor, ai_model.model_type, ai_model.model_id) and not ai_model.capabilities:
         ai_model.capabilities = merge_ark_video_capabilities(ai_model.model_id, {})
-    if ai_model.vendor == "comfly" and ai_model.model_type == "video" and not ai_model.capabilities:
+    if _is_comfly_model(ai_model.vendor, ai_model.model_id) and ai_model.model_type == "video" and not ai_model.capabilities:
         ai_model.capabilities = merge_video_capabilities(ai_model.model_id, {})
 
     try:
@@ -224,3 +235,11 @@ async def delete_ai_model(db: AsyncSession, ai_model_id: UUID) -> AiModel:
     await db.commit()
     await db.refresh(ai_model)
     return ai_model
+
+
+def _normalize_ai_model_vendor(vendor: str, model_type: str, model_id: str) -> str:
+    if vendor != "模型服务":
+        return vendor
+    if model_type == "video" and is_volcengine_ark_video_model(model_id):
+        return VOLCENGINE_ARK_VENDOR
+    return "comfly"

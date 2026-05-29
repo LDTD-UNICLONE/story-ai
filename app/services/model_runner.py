@@ -27,7 +27,7 @@ async def run_model(
 ) -> ModelRunResult:
     if _should_use_volcengine_ark(ai_model, generation_type):
         return await _run_volcengine_ark(ai_model, generation_type, prompt, extra)
-    if ai_model.vendor == "comfly":
+    if _should_use_comfly(ai_model):
         return await _run_comfly(ai_model, generation_type, prompt, extra)
 
     raise AppException("暂不支持该模型", code=40005, status_code=400)
@@ -40,7 +40,7 @@ async def query_model_task(
 ) -> ModelRunResult:
     if _should_use_volcengine_ark(ai_model, generation_type):
         return await _query_volcengine_ark_task(generation_type, task_id)
-    if ai_model.vendor == "comfly":
+    if _should_use_comfly(ai_model):
         return await _query_comfly_task(generation_type, task_id)
 
     raise AppException("暂不支持该模型", code=40005, status_code=400)
@@ -169,6 +169,10 @@ def _should_use_volcengine_ark(ai_model: AiModel, generation_type: str) -> bool:
     return generation_type == "video" and (
         ai_model.vendor == VOLCENGINE_ARK_VENDOR or is_volcengine_ark_video_model(ai_model.model_id)
     )
+
+
+def _should_use_comfly(ai_model: AiModel) -> bool:
+    return ai_model.vendor in {"comfly", "模型服务"} and not is_volcengine_ark_video_model(ai_model.model_id)
 
 
 def _extract_chat_content(payload: Dict[str, Any]) -> str:

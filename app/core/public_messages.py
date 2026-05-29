@@ -9,6 +9,24 @@ INTERNAL_EXTRA_KEYS = {
     "provider_response",
 }
 
+PUBLIC_LITERAL_KEYS = {
+    "ai_model_id",
+    "business_id",
+    "business_type",
+    "capability",
+    "generation_type",
+    "id",
+    "model",
+    "model_id",
+    "model_type",
+    "provider",
+    "provider_task_id",
+    "task_id",
+    "user_id",
+    "vendor",
+    "video_mode",
+}
+
 _VENDOR_REPLACEMENTS = (
     (re.compile(r"comfly", re.IGNORECASE), "模型服务"),
     (re.compile(r"volcengine[_-]?ark", re.IGNORECASE), "模型服务"),
@@ -45,6 +63,9 @@ def sanitize_public_data(value: Any) -> Any:
         sanitized = {}
         for key, item in value.items():
             if key in INTERNAL_EXTRA_KEYS:
+                continue
+            if key in PUBLIC_LITERAL_KEYS:
+                sanitized[key] = item
                 continue
             sanitized[key] = sanitize_public_data(item)
         return sanitized

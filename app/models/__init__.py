@@ -1,6 +1,7 @@
 from app.models.ai_model import AiModel
 from app.models.announcement import Announcement
 from app.models.conversation import Conversation, ConversationMessage
+from app.models.material import Material
 from app.models.points import UserPointsTransaction, UserRechargeOrder
 from app.models.project import Project
 from app.models.project_asset import ProjectCharacter, ProjectProp, ProjectScene
@@ -15,6 +16,7 @@ __all__ = [
     "Announcement",
     "Conversation",
     "ConversationMessage",
+    "Material",
     "Project",
     "ProjectCharacter",
     "ProjectChapter",

@@ -98,6 +98,7 @@ GENERATED_MEDIA_DOWNLOAD_MAX_SIZE_MB=500
 GENERATED_MEDIA_TRANSFER_CONCURRENCY=3
 GENERATED_MEDIA_CONNECT_TIMEOUT_SECONDS=30
 GENERATED_MEDIA_READ_TIMEOUT_SECONDS=300
+GENERATED_MEDIA_UPLOAD_TIMEOUT_SECONDS=120
 ALIYUN_SMS_ACCESS_KEY_ID=
 ALIYUN_SMS_ACCESS_KEY_SECRET=
 ALIYUN_SMS_REGION_ID=cn-hangzhou
@@ -398,6 +399,89 @@ Authorization: Bearer <admin_access_token>
 ```http
 GET /api/v1/styles
 GET /api/v1/styles/{style_id}
+```
+
+## 素材库管理
+
+素材库用于维护预设图像资源。图片文件上传到 OSS 的 `{OSS_ROOT_DIRECTORY}/material` 目录，接口不会向用户端暴露 OSS 原始地址；用户端拿到的 `image_url` 是需要登录鉴权的后端代理取图地址。
+
+用户端素材接口：
+
+```http
+GET /api/v1/materials?keyword=&category=&page=1&page_size=20
+GET /api/v1/materials/categories
+GET /api/v1/materials/{material_id}
+GET /api/v1/materials/{material_id}/image
+```
+
+用户端列表和详情只返回已启用素材。`/image` 接口返回图像二进制流，需要携带 Bearer token；前端应使用授权 `fetch` 获取 Blob 后再生成临时预览地址。
+
+用户端素材返回字段：
+
+```json
+{
+  "id": "素材 UUID",
+  "name": "图像名",
+  "category": "分类",
+  "description": "图像描述",
+  "tags": ["标签1", "标签2"],
+  "image_url": "/api/v1/materials/{material_id}/image",
+  "filename": "example.png",
+  "content_type": "image/png",
+  "size": 102400,
+  "sort_order": 0
+}
+```
+
+管理端素材接口：
+
+```http
+GET    /api/v1/admin/materials?keyword=&category=&is_enabled=&page=1&page_size=20
+POST   /api/v1/admin/materials
+GET    /api/v1/admin/materials/{material_id}
+PATCH  /api/v1/admin/materials/{material_id}
+DELETE /api/v1/admin/materials/{material_id}
+GET    /api/v1/admin/materials/{material_id}/image
+Authorization: Bearer <admin_access_token>
+```
+
+创建素材使用 `multipart/form-data`：
+
+```text
+file        图像文件，必填，仅支持 image/*
+name        图像名，必填，最长 128
+category    分类，必填，最长 64
+description 图像描述，选填
+tags        标签，选填，支持英文逗号分隔或 JSON 数组字符串
+sort_order  排序值，选填，默认 0
+is_enabled  是否启用，选填，默认 true
+```
+
+示例：
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/v1/admin/materials" \
+  -H "Authorization: Bearer <admin_access_token>" \
+  -F "file=@/path/to/example.png" \
+  -F "name=森林背景" \
+  -F "category=scene" \
+  -F "description=适合作为童话森林场景" \
+  -F "tags=森林,背景,自然" \
+  -F "sort_order=10" \
+  -F "is_enabled=true"
+```
+
+更新素材也使用 `multipart/form-data`，所有字段均可选；传 `file` 时会替换素材图像，不传则只更新元数据。删除素材为软删除，会把 `is_enabled` 置为 `false`。
+
+管理端返回比用户端多以下字段：
+
+```json
+{
+  "image_object_key": "story/material/xxxx.png",
+  "is_enabled": true,
+  "created_at": "2026-05-29T18:30:00+08:00",
+  "updated_at": "2026-05-29T18:30:00+08:00"
+}
 ```
 
 ## 对话型业务
