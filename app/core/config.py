@@ -62,15 +62,18 @@ class Settings(BaseSettings):
     celery_result_db: int = 2
     celery_task_time_limit_seconds: int = 300
     celery_task_soft_time_limit_seconds: int = 240
+    celery_task_timeout_grace_seconds: int = 60
     celery_task_max_retries: int = 5
     celery_task_retry_countdown_seconds: int = 30
     celery_task_retry_backoff_max_seconds: int = 300
     celery_result_expires_seconds: int = 60 * 60 * 24
     celery_worker_max_tasks_per_child: int = 50
-    provider_task_poll_interval_seconds: int = 10
+    provider_task_poll_interval_seconds: int = 30
+    provider_task_image_poll_interval_seconds: int = 30
+    provider_task_video_poll_interval_seconds: int = 60
     provider_task_poll_max_attempts: int = 60
     provider_task_worker_poll_interval_seconds: int = 5
-    provider_task_worker_poll_max_attempts: int = 3
+    provider_task_worker_poll_max_attempts: int = 0
     user_pending_task_limit: int = 20
     user_pending_media_task_limit: int = 5
     user_pending_task_window_hours: int = 24
@@ -147,6 +150,26 @@ class Settings(BaseSettings):
     @cached_property
     def celery_result_backend(self) -> str:
         return self.redis_url(self.celery_result_db)
+
+    @cached_property
+    def provider_request_timeout_ceiling_seconds(self) -> int:
+        return max(self.comfly_timeout_seconds, self.volcengine_ark_timeout_seconds)
+
+    @cached_property
+    def effective_celery_task_soft_time_limit_seconds(self) -> int:
+        provider_timeout_with_grace = (
+            self.provider_request_timeout_ceiling_seconds
+            + self.celery_task_timeout_grace_seconds
+        )
+        return max(self.celery_task_soft_time_limit_seconds, provider_timeout_with_grace)
+
+    @cached_property
+    def effective_celery_task_time_limit_seconds(self) -> int:
+        soft_limit_with_grace = (
+            self.effective_celery_task_soft_time_limit_seconds
+            + self.celery_task_timeout_grace_seconds
+        )
+        return max(self.celery_task_time_limit_seconds, soft_limit_with_grace)
 
 
 settings = Settings()

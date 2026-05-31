@@ -48,6 +48,7 @@ class ProjectChapterCreateRequest(SchemaBaseModel):
 class ProjectChapterUpdateRequest(SchemaBaseModel):
     title: Optional[str] = Field(default=None, min_length=1, max_length=128)
     content: Optional[str] = Field(default=None, min_length=1)
+    processed_content: Optional[str] = None
     sort_order: Optional[int] = Field(default=None, ge=0)
     processing_prompt: Optional[str] = Field(default=None, min_length=1)
 

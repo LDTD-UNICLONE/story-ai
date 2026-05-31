@@ -126,7 +126,10 @@ async def submit_asset_analysis(
     try:
         from app.tasks.project_asset_analysis import run_project_asset_analysis
 
-        run_project_asset_analysis.delay(str(task_record.id), str(chapter_id), asset_type)
+        run_project_asset_analysis.apply_async(
+            args=(str(task_record.id), str(chapter_id), asset_type),
+            queue="story_ai_text",
+        )
     except Exception:
         await _mark_enqueue_failed(db, task_record, chapter, config)
     return task_record, points_cost

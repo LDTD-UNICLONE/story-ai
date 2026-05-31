@@ -20,6 +20,16 @@ from app.schemas.project_storyboard import (
     ProjectStoryboardVideoGenerateOut,
     ProjectStoryboardVideoGenerateRequest,
 )
+from app.schemas.project_generated_asset import (
+    ProjectGeneratedAssetListOut,
+    ProjectGeneratedAssetOut,
+    ProjectGeneratedAssetSelectOut,
+    ProjectGeneratedAssetSelectRequest,
+)
+from app.services.project_generated_assets import (
+    list_project_generated_asset_history,
+    select_project_generated_asset_history,
+)
 from app.services.project_storyboards import (
     delete_project_storyboard,
     get_project_storyboard_or_404,
@@ -177,6 +187,77 @@ async def my_project_storyboard_detail(
     return success(data=ProjectStoryboardOut.model_validate(storyboard).model_dump(mode="json"))
 
 
+@router.get("/{storyboard_id}/generation-history")
+async def my_project_storyboard_generation_history(
+    project_id: UUID,
+    chapter_id: UUID,
+    storyboard_id: UUID,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await get_project_storyboard_or_404(
+        db,
+        project_id=project_id,
+        chapter_id=chapter_id,
+        storyboard_id=storyboard_id,
+        user_id=current_user.id,
+    )
+    items, total = await list_project_generated_asset_history(
+        db,
+        project_id=project_id,
+        user_id=current_user.id,
+        target_type="storyboard",
+        target_id=storyboard_id,
+        media_type="video",
+        page=page,
+        page_size=page_size,
+    )
+    data = ProjectGeneratedAssetListOut(
+        items=[ProjectGeneratedAssetOut.model_validate(item) for item in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+    return success(data=data.model_dump(mode="json"))
+
+
+@router.post("/{storyboard_id}/generation-history/{history_id:uuid}/select")
+async def select_my_project_storyboard_generation_history(
+    project_id: UUID,
+    chapter_id: UUID,
+    storyboard_id: UUID,
+    history_id: UUID,
+    payload: ProjectGeneratedAssetSelectRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    await get_project_storyboard_or_404(
+        db,
+        project_id=project_id,
+        chapter_id=chapter_id,
+        storyboard_id=storyboard_id,
+        user_id=current_user.id,
+    )
+    history, selected_url, last_frame_url = await select_project_generated_asset_history(
+        db,
+        project_id=project_id,
+        user_id=current_user.id,
+        history_id=history_id,
+        target_type="storyboard",
+        target_id=storyboard_id,
+        media_type="video",
+        result_url=payload.result_url,
+    )
+    data = ProjectGeneratedAssetSelectOut(
+        history=ProjectGeneratedAssetOut.model_validate(history),
+        selected_url=selected_url,
+        last_frame_url=last_frame_url,
+    )
+    return success(data=data.model_dump(mode="json"), message="选择成功")
+
+
 @router.post("/{storyboard_id}/split")
 async def split_my_project_storyboard(
     project_id: UUID,
@@ -224,6 +305,9 @@ async def generate_my_project_storyboard_video(
         task_record_id=task_record.id,
         storyboard_id=storyboard_id,
         generation_mode=payload.generation_mode,
+        resolution=(task_record.extra or {}).get("resolution") or payload.resolution,
+        return_last_frame=payload.return_last_frame,
+        reference_start_frame_url=(task_record.extra or {}).get("reference_start_frame_url"),
         status=task_record.status,
         points_cost=points_cost,
     )

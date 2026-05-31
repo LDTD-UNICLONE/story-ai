@@ -6,6 +6,7 @@ from app.models.points import UserPointsTransaction, UserRechargeOrder
 from app.models.project import Project
 from app.models.project_asset import ProjectCharacter, ProjectProp, ProjectScene
 from app.models.project_chapter import ProjectChapter
+from app.models.project_generated_asset import ProjectGeneratedAsset
 from app.models.project_storyboard import ProjectStoryboard
 from app.models.style import Style
 from app.models.task_record import UserTaskRecord
@@ -20,6 +21,7 @@ __all__ = [
     "Project",
     "ProjectCharacter",
     "ProjectChapter",
+    "ProjectGeneratedAsset",
     "ProjectProp",
     "ProjectScene",
     "ProjectStoryboard",

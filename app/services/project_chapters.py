@@ -99,9 +99,12 @@ async def update_project_chapter(
     update_data = payload.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(chapter, field, value)
-    if {"content", "processing_prompt"} & set(update_data.keys()):
+    changed_fields = set(update_data.keys())
+    if {"content", "processing_prompt"} & changed_fields and "processed_content" not in changed_fields:
         chapter.process_status = "draft"
         chapter.processed_content = None
+    elif "processed_content" in changed_fields:
+        chapter.process_status = "success" if (chapter.processed_content or "").strip() else "draft"
     chapter.updated_at = beijing_datetime()
     await db.commit()
     await db.refresh(chapter)

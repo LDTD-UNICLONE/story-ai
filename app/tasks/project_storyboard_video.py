@@ -25,8 +25,8 @@ WorkerSessionLocal = create_worker_sessionmaker()
     bind=True,
     name="tasks.project_storyboard_video.run_project_storyboard_video_generation",
     max_retries=settings.celery_task_max_retries,
-    soft_time_limit=settings.celery_task_soft_time_limit_seconds,
-    time_limit=settings.celery_task_time_limit_seconds,
+    soft_time_limit=settings.effective_celery_task_soft_time_limit_seconds,
+    time_limit=settings.effective_celery_task_time_limit_seconds,
 )
 def run_project_storyboard_video_generation(self, task_record_id: str, storyboard_id: str) -> None:
     try:

@@ -22,6 +22,7 @@ from app.services.generated_media import persist_generated_media_to_oss
 from app.services.model_points import settle_text_task_points, settle_video_task_points
 from app.services.model_runner import ModelRunResult, query_model_task, run_model
 from app.services.points import change_user_points
+from app.services.provider_polling import provider_poll_interval_seconds
 from app.services.task_records import refresh_task_record_interrupted
 from app.worker import celery_app
 
@@ -34,8 +35,8 @@ logger = logging.getLogger(__name__)
     bind=True,
     name="tasks.model_generation.run_conversation_generation",
     max_retries=settings.celery_task_max_retries,
-    soft_time_limit=settings.celery_task_soft_time_limit_seconds,
-    time_limit=settings.celery_task_time_limit_seconds,
+    soft_time_limit=settings.effective_celery_task_soft_time_limit_seconds,
+    time_limit=settings.effective_celery_task_time_limit_seconds,
 )
 def run_conversation_generation(self, task_record_id: str, assistant_message_id: str) -> None:
     try:
@@ -366,6 +367,16 @@ async def _resolve_provider_task_result(
     if generation_type not in {"image", "video"} or not task_id:
         return model_result
 
+    if settings.provider_task_worker_poll_max_attempts <= 0:
+        model_result.extra = {
+            **model_result.extra,
+            "platform_task_status": "running",
+            "provider_polling_deferred": True,
+            "next_poll_seconds": provider_poll_interval_seconds(generation_type),
+        }
+        model_result.content = f"模型任务仍在生成中：{task_id}"
+        return model_result
+
     latest_result = model_result
     for _ in range(settings.provider_task_worker_poll_max_attempts):
         await asyncio.sleep(settings.provider_task_worker_poll_interval_seconds)
@@ -386,7 +397,7 @@ async def _resolve_provider_task_result(
         **latest_result.extra,
         "platform_task_status": "running",
         "provider_polling_timeout": True,
-        "next_poll_seconds": settings.provider_task_poll_interval_seconds,
+        "next_poll_seconds": provider_poll_interval_seconds(generation_type),
     }
     latest_result.content = f"模型任务仍在生成中：{task_id}"
     return latest_result

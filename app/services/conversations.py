@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.timezone import beijing_datetime
 from app.core.exceptions import AppException
+from app.integrations import comfly
 from app.models.ai_model import AiModel
 from app.models.conversation import Conversation, ConversationMessage
 from app.models.task_record import UserTaskRecord
@@ -332,6 +333,7 @@ async def send_conversation_message(
         content=payload.content,
         extra=payload.extra or {},
     )
+    _validate_comfly_conversation_request(ai_model, conversation_type, payload.content, message_extra)
     ai_model_points_cost = calculate_submission_points_cost(ai_model, conversation_type, message_extra)
 
     points_transaction = None
@@ -432,6 +434,25 @@ def _conversation_generation_queue(conversation_type: str) -> str:
     if conversation_type == "text":
         return "story_ai_text"
     return "story_ai_default"
+
+
+def _validate_comfly_conversation_request(
+    ai_model: AiModel,
+    conversation_type: str,
+    content: str,
+    extra: Dict[str, Any],
+) -> None:
+    if not _is_comfly_model(ai_model):
+        return
+    if conversation_type == "text":
+        comfly.validate_chat_completion_request(ai_model.model_id, content, extra)
+        return
+    if conversation_type == "image":
+        comfly.validate_image_request(ai_model.model_id, content, extra)
+
+
+def _is_comfly_model(ai_model: AiModel) -> bool:
+    return ai_model.vendor in {"comfly", "模型服务"}
 
 
 async def _build_message_extra_with_context(

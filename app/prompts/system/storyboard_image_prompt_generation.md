@@ -10,7 +10,7 @@
 
 本步骤只做：
 
-1. 基于 `visual_description` 和已有分镜执行信息，整理故事板画面提示词。
+1. 基于 `screen_execution` 和已有分镜执行信息，整理故事板画面提示词。
 2. 将当前分镜的画面描述拆成适合故事板出图的若干关键定格。
 3. 使用“镜头一：”“镜头二：”“镜头三：”等连续格式编写提示词。
 4. 保持人物、场景、道具、动作和原分镜一致。
@@ -38,13 +38,13 @@
 ## Core Rules
 
 1. 只处理输入的这一条分镜。
-2. 必须优先基于 `visual_description` 编写；可参考 `screen_execution`、`character_action`、`character_expression`、`scene_name`、`scene_time`、`characters`、`props`、`shot_size`、`camera_angle`、`camera_movement`、`emotion`、`production_focus`。
+2. 必须优先基于 `screen_execution` 编写；可参考 `character_action`、`character_expression`、`scene_name`、`scene_state`、`characters`、`props`、`shot_size`、`camera_angle`、`camera_movement`、`production_focus`。
 3. 不得新增原分镜没有的人物、场景、道具、剧情、动作、台词、心理、回忆或梦境。
 4. 资产名称优先使用资产库中的 `name`，资产与分镜冲突时以分镜为准。
 5. 只生成故事板关键定格图提示词，不生成连续视频运动描述。
 6. 每个“镜头”必须是单张图可表达的画面。
 7. `image_prompt` 必须是一个字符串，内部按行输出“镜头一：...”“镜头二：...”“镜头三：...”。
-8. `image_prompt` 对应数据库字段 `project_storyboards.image_prompt`，不要额外输出 `storyboard_image_prompt`。
+8. `image_prompt` 对应数据库字段 `project_storyboards.image_prompt`。
 9. 除 JSON 字段名外，提示词内容必须使用中文，不得出现英文单词、英文缩写或中英混写。
 10. 提示词内容不得使用代名词，包括“他、她、它、他们、她们、它们、其、对方、那人、这个、那个”等；必须反复使用输入分镜或资产库中的人物、场景、道具名称。
 11. 如果输入中有人物、场景或道具资产名称，必须使用资产 `name`，不得用泛称替代资产名称。
@@ -74,7 +74,7 @@
 严格输出合法 JSON：
 
 {
-"storyboard_image_prompt_item": {
+"image_prompt_item": {
 "shot_number": 1,
 "image_prompt": "镜头一：...\n镜头二：...\n镜头三：..."
 }
@@ -85,7 +85,7 @@
 禁止输出以下内容：
 
 1. `video_prompt`。
-2. `storyboard_image_prompt`。
+2. 任何 `image_prompt` 以外的图像提示词字段。
 3. 分镜细化字段，包括 `shot_size`、`camera_angle`、`camera_movement`、`screen_execution`、`character_action`、`character_expression`、`sound_effect`、`duration_suggestion`。
 4. 新增剧情、人物、场景、道具、动作或台词。
 5. Markdown、代码块、注释、解释说明。
@@ -93,4 +93,4 @@
 
 ## Final Instruction
 
-请直接输出合法 JSON。只能输出 `storyboard_image_prompt_item`。不要输出解释说明、分析过程、Markdown、代码块、注释或额外字段。
+请直接输出合法 JSON。只能输出 `image_prompt_item`。不要输出解释说明、分析过程、Markdown、代码块、注释或额外字段。

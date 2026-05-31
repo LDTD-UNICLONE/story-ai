@@ -5,7 +5,6 @@ from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
-from app.core.config import settings
 from app.core.exceptions import AppException
 from app.core.responses import success
 from app.db.session import get_db
@@ -20,6 +19,7 @@ from app.services.task_records import (
     get_task_record_or_404,
     list_user_task_records,
 )
+from app.services.provider_polling import provider_next_poll_seconds
 
 router = APIRouter(prefix="/task-records")
 
@@ -72,20 +72,19 @@ async def my_task_record_detail(
     data = UserTaskRecordOut.model_validate(record).model_dump(mode="json")
     data = _clean_terminal_retry_extra(data)
     data["stop_polling"] = record.status in {"success", "failed"}
-    data["next_poll_seconds"] = _task_record_next_poll_seconds(record.status, data.get("extra") or {})
+    data["next_poll_seconds"] = _task_record_next_poll_seconds(
+        record.generation_type,
+        record.status,
+        data.get("extra") or {},
+    )
     response.headers["Cache-Control"] = "no-store"
     if data["next_poll_seconds"]:
         response.headers["X-Next-Poll-Seconds"] = str(data["next_poll_seconds"])
     return success(data=data)
 
 
-def _task_record_next_poll_seconds(status: str, extra: dict) -> Optional[int]:
-    if status not in {"pending", "running"}:
-        return None
-    next_poll_seconds = extra.get("next_poll_seconds")
-    if isinstance(next_poll_seconds, int) and next_poll_seconds > 0:
-        return next_poll_seconds
-    return max(3, settings.provider_task_poll_interval_seconds)
+def _task_record_next_poll_seconds(generation_type: str, status: str, extra: dict) -> Optional[int]:
+    return provider_next_poll_seconds(generation_type, status, extra)
 
 
 def _clean_terminal_retry_extra(data: dict) -> dict:

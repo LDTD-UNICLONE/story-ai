@@ -1,7 +1,7 @@
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Path, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
@@ -25,6 +25,16 @@ from app.schemas.project_asset import (
     ProjectSceneListOut,
     ProjectSceneOut,
     ProjectSceneUpdateRequest,
+)
+from app.schemas.project_generated_asset import (
+    ProjectGeneratedAssetListOut,
+    ProjectGeneratedAssetSelectOut,
+    ProjectGeneratedAssetSelectRequest,
+    ProjectGeneratedAssetOut,
+)
+from app.services.project_generated_assets import (
+    list_project_generated_asset_history,
+    select_project_generated_asset_history,
 )
 from app.services.project_assets import (
     create_project_asset,
@@ -77,6 +87,63 @@ async def my_project_asset_options(
     )
     data = ProjectAssetOptionsOut(items=items, total=total)
     return success(data=data.model_dump(mode="json", exclude_none=True))
+
+
+@router.get("/assets/{asset_type}/{asset_id:uuid}/generation-history")
+async def my_project_asset_generation_history(
+    project_id: UUID,
+    asset_id: UUID,
+    asset_type: str = Path(..., pattern="^(character|scene|prop)$"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    items, total = await list_project_generated_asset_history(
+        db,
+        project_id=project_id,
+        user_id=current_user.id,
+        target_type=asset_type,
+        target_id=asset_id,
+        media_type="image",
+        page=page,
+        page_size=page_size,
+    )
+    data = ProjectGeneratedAssetListOut(
+        items=[ProjectGeneratedAssetOut.model_validate(item) for item in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+    return success(data=data.model_dump(mode="json"))
+
+
+@router.post("/assets/{asset_type}/{asset_id:uuid}/generation-history/{history_id:uuid}/select")
+async def select_my_project_asset_generation_history(
+    project_id: UUID,
+    asset_id: UUID,
+    history_id: UUID,
+    payload: ProjectGeneratedAssetSelectRequest,
+    asset_type: str = Path(..., pattern="^(character|scene|prop)$"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    history, selected_url, last_frame_url = await select_project_generated_asset_history(
+        db,
+        project_id=project_id,
+        user_id=current_user.id,
+        history_id=history_id,
+        target_type=asset_type,
+        target_id=asset_id,
+        media_type="image",
+        result_url=payload.result_url,
+    )
+    data = ProjectGeneratedAssetSelectOut(
+        history=ProjectGeneratedAssetOut.model_validate(history),
+        selected_url=selected_url,
+        last_frame_url=last_frame_url,
+    )
+    return success(data=data.model_dump(mode="json"), message="选择成功")
 
 
 @router.get("/characters/options")

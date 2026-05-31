@@ -28,6 +28,9 @@ VIDEO_HELPER_KEYS = {
     "image_url",
     "image_urls",
     "images",
+    "reference_first_frame_url",
+    "reference_start_frame_url",
+    "start_frame_reference_url",
     "video",
     "video_url",
     "video_urls",
@@ -190,8 +193,10 @@ def _build_content(prompt: str, extra: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _build_media_content(extra: Dict[str, Any]) -> List[Dict[str, Any]]:
     content: List[Dict[str, Any]] = []
+    reference_start_frame_url = _reference_start_frame_url(extra)
     for url in _collect_image_urls(extra):
-        content.append({"type": "image_url", "image_url": {"url": url}, "role": "reference_image"})
+        role = "first_frame" if reference_start_frame_url and url == reference_start_frame_url else "reference_image"
+        content.append({"type": "image_url", "image_url": {"url": url}, "role": role})
     for url in _collect_video_urls(extra):
         content.append({"type": "video_url", "video_url": {"url": url}, "role": "reference_video"})
     for url in _collect_audio_urls(extra):
@@ -224,6 +229,14 @@ def _collect_image_urls(extra: Dict[str, Any]) -> List[str]:
         if key in extra:
             values.extend(_as_list(extra[key]))
     return _collect_urls(values)
+
+
+def _reference_start_frame_url(extra: Dict[str, Any]) -> str:
+    for key in ("reference_start_frame_url", "reference_first_frame_url", "start_frame_reference_url"):
+        url = _extract_ark_media_url(extra.get(key))
+        if url:
+            return url
+    return ""
 
 
 def _collect_video_urls(extra: Dict[str, Any]) -> List[str]:

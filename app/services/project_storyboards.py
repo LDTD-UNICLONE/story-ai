@@ -125,20 +125,8 @@ async def update_project_storyboard(
 ) -> ProjectStoryboard:
     storyboard = await get_project_storyboard_or_404(db, project_id, chapter_id, storyboard_id, user_id)
     update_data = payload.model_dump(exclude_unset=True)
-    core_action = update_data.pop("core_action", None)
-    storyboard_image_prompt = update_data.pop("storyboard_image_prompt", None)
     event_goal = update_data.pop("event_goal", None)
-    production_focus_base = update_data.pop("production_focus_base", None)
-    negative_prompt_base = update_data.pop("negative_prompt_base", None)
     split_reason = update_data.pop("split_reason", None)
-    if core_action is not None:
-        update_data["action"] = core_action
-    if storyboard_image_prompt is not None:
-        update_data["image_prompt"] = storyboard_image_prompt
-    if production_focus_base is not None and "production_focus" not in update_data:
-        update_data["production_focus"] = production_focus_base
-    if negative_prompt_base is not None and "negative_prompt" not in update_data:
-        update_data["negative_prompt"] = negative_prompt_base
     for field, value in update_data.items():
         setattr(storyboard, field, value)
     if event_goal is not None or split_reason is not None:
@@ -285,10 +273,15 @@ async def submit_storyboard_refinement(
         storyboard_id=storyboard_id,
         user_id=user.id,
     )
+    storyboards = await _list_enabled_storyboards(db, project_id, chapter_id, user.id)
 
     prompt = render_system_prompt(
         "storyboard_refinement.md",
         storyboard_unit=json.dumps(_storyboard_unit_payload(storyboard), ensure_ascii=False),
+        continuity_context=json.dumps(
+            _storyboard_continuity_context(storyboards, storyboard),
+            ensure_ascii=False,
+        ),
         characters=await _dump_storyboard_assets(db, ProjectCharacter, project_id, user.id),
         scenes=await _dump_storyboard_assets(db, ProjectScene, project_id, user.id),
         props=await _dump_storyboard_assets(db, ProjectProp, project_id, user.id),
@@ -325,8 +318,8 @@ async def submit_storyboard_image_prompt_generation(
         storyboard_id=storyboard_id,
         user_id=user.id,
     )
-    if not storyboard.visual_description:
-        raise AppException("请先完成分镜细化或填写画面描述，再生成故事板提示词", code=40032, status_code=400)
+    if not storyboard.screen_execution:
+        raise AppException("请先完成分镜细化或填写画面执行，再生成故事板提示词", code=40032, status_code=400)
 
     prompt = render_system_prompt(
         "storyboard_image_prompt_generation.md",
@@ -376,13 +369,28 @@ async def submit_storyboard_analysis(
         )
 
     model_extra = normalize_text_analysis_extra(payload.extra)
-    prompt = payload.analysis_prompt or render_system_prompt(
-        "storyboard_analysis.md",
-        input_text=chapter.processed_content,
-        characters=await _dump_storyboard_assets(db, ProjectCharacter, project_id, user.id),
-        scenes=await _dump_storyboard_assets(db, ProjectScene, project_id, user.id),
-        props=await _dump_storyboard_assets(db, ProjectProp, project_id, user.id),
-    )
+    characters = await _dump_storyboard_assets(db, ProjectCharacter, project_id, user.id)
+    scenes = await _dump_storyboard_assets(db, ProjectScene, project_id, user.id)
+    props = await _dump_storyboard_assets(db, ProjectProp, project_id, user.id)
+    custom_system_prompt = (payload.analysis_prompt or "").strip()
+    if custom_system_prompt:
+        model_extra["system_prompt"] = custom_system_prompt
+        prompt = _build_storyboard_analysis_input_prompt(
+            input_text=chapter.processed_content,
+            characters=characters,
+            scenes=scenes,
+            props=props,
+        )
+        prompt_source = "custom"
+    else:
+        prompt = render_system_prompt(
+            "storyboard_analysis.md",
+            input_text=chapter.processed_content,
+            characters=characters,
+            scenes=scenes,
+            props=props,
+        )
+        prompt_source = "system"
     task_record = await create_user_task_record(
         db,
         user_id=user.id,
@@ -400,7 +408,9 @@ async def submit_storyboard_analysis(
             "project_id": str(project_id),
             "chapter_id": str(chapter_id),
             "chapter_title": chapter.title,
+            "prompt_source": prompt_source,
             "model_extra": model_extra,
+            **({"analysis_prompt": custom_system_prompt} if custom_system_prompt else {}),
         },
     )
     chapter.extra = {
@@ -413,7 +423,10 @@ async def submit_storyboard_analysis(
     try:
         from app.tasks.project_storyboard import run_project_storyboard_analysis
 
-        run_project_storyboard_analysis.delay(str(task_record.id), str(chapter_id))
+        run_project_storyboard_analysis.apply_async(
+            args=(str(task_record.id), str(chapter_id)),
+            queue="story_ai_text",
+        )
     except Exception:
         await _mark_storyboard_enqueue_failed(db, task_record, chapter)
     return task_record, points_cost
@@ -485,10 +498,38 @@ async def _submit_storyboard_text_stage(
     try:
         from app.tasks.project_storyboard import run_project_storyboard_stage
 
-        run_project_storyboard_stage.delay(str(task_record.id), str(chapter.id))
+        run_project_storyboard_stage.apply_async(
+            args=(str(task_record.id), str(chapter.id)),
+            queue="story_ai_text",
+        )
     except Exception:
         await _mark_storyboard_stage_enqueue_failed(db, task_record, chapter, status_key, storyboard)
     return task_record, points_cost
+
+
+def _build_storyboard_analysis_input_prompt(
+    *,
+    input_text: str,
+    characters: str,
+    scenes: str,
+    props: str,
+) -> str:
+    return "\n\n".join(
+        [
+            "请根据系统规则完成分镜分析。以下是本次分析必须使用的输入内容，不得脱离这些输入扩写或编造剧情。",
+            f"## 预处理文本\n{(input_text or '').strip()}",
+            f"## 人物资产\n{(characters or '').strip()}",
+            f"## 场景资产\n{(scenes or '').strip()}",
+            f"## 道具资产\n{(props or '').strip()}",
+            (
+                "## 输出要求\n"
+                "严格输出合法 JSON，不要输出 Markdown、代码块、注释或解释说明。"
+                "JSON 顶层必须是对象，且必须包含 storyboard_units 数组；"
+                "每个数组项必须包含 shot_number、title、source_content、event_goal、scene_name、"
+                "characters、props、action、dialogue、split_reason。"
+            ),
+        ]
+    )
 
 
 async def run_storyboard_analysis_in_worker(
@@ -820,7 +861,6 @@ def _apply_storyboard_refinement_item(
     storyboard.title = str(item.get("title") or storyboard.title)[:128]
     storyboard.source_content = str(item.get("source_content") or storyboard.source_content)
     storyboard.scene_name = _optional_str(item.get("scene_name"), 128)
-    storyboard.scene_time = _optional_str(item.get("scene_time"), 64)
     storyboard.scene_state = _optional_str(_first_value(item, "scene_state", "场景状态"), 128)
     storyboard.characters = _as_string_list(item.get("characters"))
     storyboard.props = _as_string_list(item.get("props"))
@@ -834,12 +874,10 @@ def _apply_storyboard_refinement_item(
     storyboard.dialogue = _optional_str(item.get("dialogue"))
     storyboard.sound_effect = _optional_str(item.get("sound_effect"))
     storyboard.atmosphere = _optional_str(_first_value(item, "atmosphere", "氛围参考", "画面氛围"))
-    storyboard.emotion = _optional_str(item.get("emotion"))
-    storyboard.visual_description = _optional_str(item.get("visual_description"))
     storyboard.video_prompt = _optional_str(item.get("video_prompt"))
     storyboard.duration_suggestion = _optional_str(item.get("duration_suggestion"), 64)
-    storyboard.production_focus = _optional_str(_first_value(item, "production_focus", "production_focus_base"))
-    storyboard.negative_prompt = _optional_str(_first_value(item, "negative_prompt", "negative_prompt_base"))
+    storyboard.production_focus = _optional_str(item.get("production_focus"))
+    storyboard.negative_prompt = _optional_str(item.get("negative_prompt"))
     storyboard.ending_frame = _optional_str(_first_value(item, "ending_frame", "结尾画面", "收束画面"))
     storyboard.extra = {
         **_clear_status_retry_state(storyboard.extra or {}, "storyboard_refinement_status"),
@@ -857,9 +895,7 @@ def _apply_storyboard_image_prompt_item(
     item: Dict[str, Any],
     now,
 ) -> None:
-    storyboard.image_prompt = _optional_str(
-        _first_value(item, "storyboard_image_prompt", "image_prompt", "故事板提示词", "故事板图像提示词", "图像提示词")
-    )
+    storyboard.image_prompt = _optional_str(item.get("image_prompt"))
     storyboard.extra = {
         **_clear_status_retry_state(storyboard.extra or {}, "storyboard_image_prompt_generation_status"),
         "storyboard_image_prompt_generation_status": "success",
@@ -875,9 +911,7 @@ def _apply_storyboard_prompt_item(
     item: Dict[str, Any],
     now,
 ) -> None:
-    storyboard.image_prompt = _optional_str(
-        _first_value(item, "storyboard_image_prompt", "image_prompt", "故事板图像提示词", "图像提示词")
-    )
+    storyboard.image_prompt = _optional_str(item.get("image_prompt"))
     storyboard.video_prompt = _optional_str(_first_value(item, "video_prompt", "视频提示词"))
     storyboard.extra = {
         **_clear_status_retry_state(storyboard.extra or {}, "storyboard_prompt_generation_status"),
@@ -905,13 +939,10 @@ def parse_storyboard_stage_items(content: str, generation_type: str) -> List[Dic
         items = _extract_items_by_keys(
             payload,
             (
-                "storyboard_image_prompt_item",
-                "storyboard_image_prompt_items",
-                "storyboard_prompt_item",
+                "image_prompt_item",
+                "image_prompt_items",
                 "item",
                 "items",
-                "故事板提示词",
-                "故事板提示词列表",
             ),
         )
         return [
@@ -953,11 +984,10 @@ def _normalize_storyboard_refinement_item(item: Dict[str, Any], index: int) -> D
         "title": _first_value(item, "title", "标题") or f"分镜{index}",
         "source_content": _first_value(item, "source_content", "原文") or "",
         "scene_name": _first_value(item, "scene_name", "场景名称") or "",
-        "scene_time": _first_value(item, "scene_time", "场景时间", "时间") or "",
         "scene_state": _first_value(item, "scene_state", "场景状态") or "",
         "characters": _first_value(item, "characters", "人物") or [],
         "props": _first_value(item, "props", "道具") or [],
-        "action": _first_value(item, "action", "core_action", "核心动作", "动作") or "",
+        "action": _first_value(item, "action", "动作") or "",
         "shot_size": _first_value(item, "shot_size", "景别") or "",
         "camera_angle": _first_value(item, "camera_angle", "拍摄角度") or "",
         "camera_movement": _first_value(item, "camera_movement", "运镜") or "",
@@ -967,12 +997,10 @@ def _normalize_storyboard_refinement_item(item: Dict[str, Any], index: int) -> D
         "dialogue": _first_value(item, "dialogue", "台词") or "",
         "sound_effect": _first_value(item, "sound_effect", "音效") or "",
         "atmosphere": _first_value(item, "atmosphere", "氛围参考", "画面氛围") or "",
-        "emotion": _first_value(item, "emotion", "情绪") or "",
-        "visual_description": _first_value(item, "visual_description", "画面内容") or "",
         "video_prompt": _first_value(item, "video_prompt", "视频提示词") or "",
         "duration_suggestion": _first_value(item, "duration_suggestion", "时长建议") or "",
-        "production_focus": _first_value(item, "production_focus", "production_focus_base", "制作重点", "制作重点提示词", "制作重点基础") or "",
-        "negative_prompt": _first_value(item, "negative_prompt", "negative_prompt_base", "负面规避词", "负面规避", "负面规避基础") or "",
+        "production_focus": _first_value(item, "production_focus", "制作重点", "制作重点提示词") or "",
+        "negative_prompt": _first_value(item, "negative_prompt", "负面规避词", "负面规避") or "",
         "ending_frame": _first_value(item, "ending_frame", "结尾画面", "收束画面") or "",
     }
 
@@ -981,14 +1009,7 @@ def _normalize_storyboard_prompt_item(item: Dict[str, Any], index: int) -> Dict[
     return {
         **item,
         "shot_number": _first_value(item, "shot_number", "分镜序号") or index,
-        "storyboard_image_prompt": _first_value(
-            item,
-            "storyboard_image_prompt",
-            "image_prompt",
-            "故事板图像提示词",
-            "图像提示词",
-        )
-        or "",
+        "image_prompt": _first_value(item, "image_prompt", "图像提示词") or "",
         "video_prompt": _first_value(item, "video_prompt", "视频提示词") or "",
     }
 
@@ -997,15 +1018,7 @@ def _normalize_storyboard_image_prompt_item(item: Dict[str, Any], index: int) ->
     return {
         **item,
         "shot_number": _first_value(item, "shot_number", "分镜序号") or index,
-        "storyboard_image_prompt": _first_value(
-            item,
-            "storyboard_image_prompt",
-            "image_prompt",
-            "故事板提示词",
-            "故事板图像提示词",
-            "图像提示词",
-        )
-        or "",
+        "image_prompt": _first_value(item, "image_prompt", "图像提示词") or "",
     }
 
 
@@ -1031,7 +1044,6 @@ def _make_storyboard_from_item(
         title=str(item.get("title") or f"分镜{index}")[:128],
         source_content=str(item.get("source_content") or ""),
         scene_name=_optional_str(item.get("scene_name"), 128),
-        scene_time=_optional_str(item.get("scene_time"), 64),
         scene_state=_optional_str(item.get("scene_state"), 128),
         shot_size=_optional_str(item.get("shot_size"), 64),
         camera_angle=_optional_str(item.get("camera_angle"), 128),
@@ -1039,14 +1051,12 @@ def _make_storyboard_from_item(
         screen_execution=_optional_str(item.get("screen_execution")),
         characters=_as_string_list(item.get("characters")),
         props=_as_string_list(item.get("props")),
-        action=_optional_str(_first_value(item, "core_action", "action")),
+        action=_optional_str(item.get("action")),
         character_action=_optional_str(item.get("character_action")),
         character_expression=_optional_str(item.get("character_expression")),
         dialogue=_optional_str(item.get("dialogue")),
         sound_effect=_optional_str(item.get("sound_effect")),
         atmosphere=_optional_str(item.get("atmosphere")),
-        emotion=_optional_str(item.get("emotion")),
-        visual_description=_optional_str(item.get("visual_description")),
         image_prompt=_optional_str(item.get("image_prompt")),
         video_prompt=_optional_str(item.get("video_prompt")),
         duration_suggestion=_optional_str(item.get("duration_suggestion"), 64),
@@ -1147,7 +1157,7 @@ def _storyboard_unit_payload(storyboard: ProjectStoryboard) -> Dict[str, Any]:
         "scene_name": storyboard.scene_name or "",
         "characters": storyboard.characters or [],
         "props": storyboard.props or [],
-        "core_action": storyboard.action or "",
+        "action": storyboard.action or "",
         "dialogue": storyboard.dialogue or "",
         "split_reason": storyboard.split_reason or "",
     }
@@ -1172,11 +1182,45 @@ def _storyboard_execution_payload(storyboard: ProjectStoryboard) -> Dict[str, An
         "dialogue": storyboard.dialogue or "",
         "sound_effect": storyboard.sound_effect or "",
         "atmosphere": storyboard.atmosphere or "",
-        "emotion": storyboard.emotion or "",
-        "visual_description": storyboard.visual_description or "",
         "duration_suggestion": storyboard.duration_suggestion or "",
-        "production_focus": storyboard.production_focus or storyboard.production_focus_base or "",
-        "negative_prompt": storyboard.negative_prompt or storyboard.negative_prompt_base or "",
+        "production_focus": storyboard.production_focus or "",
+        "negative_prompt": storyboard.negative_prompt or "",
+        "ending_frame": storyboard.ending_frame or "",
+    }
+
+
+def _storyboard_continuity_context(
+    storyboards: List[ProjectStoryboard],
+    current: ProjectStoryboard,
+) -> Dict[str, Any]:
+    current_index = next((index for index, item in enumerate(storyboards) if item.id == current.id), -1)
+    previous_storyboard = storyboards[current_index - 1] if current_index > 0 else None
+    next_storyboard = storyboards[current_index + 1] if 0 <= current_index < len(storyboards) - 1 else None
+    return {
+        "position": {
+            "current_index": current_index + 1 if current_index >= 0 else current.shot_number,
+            "total": len(storyboards),
+            "is_first": current_index == 0,
+            "is_last": current_index == len(storyboards) - 1,
+        },
+        "previous": _storyboard_continuity_payload(previous_storyboard),
+        "next": _storyboard_continuity_payload(next_storyboard),
+    }
+
+
+def _storyboard_continuity_payload(storyboard: Optional[ProjectStoryboard]) -> Optional[Dict[str, Any]]:
+    if storyboard is None:
+        return None
+    return {
+        "shot_number": storyboard.shot_number,
+        "title": storyboard.title,
+        "scene_name": storyboard.scene_name or "",
+        "scene_state": storyboard.scene_state or "",
+        "characters": storyboard.characters or [],
+        "props": storyboard.props or [],
+        "action": storyboard.action or "",
+        "screen_execution": storyboard.screen_execution or "",
+        "camera_movement": storyboard.camera_movement or "",
         "ending_frame": storyboard.ending_frame or "",
     }
 
@@ -1188,8 +1232,6 @@ def _storyboard_has_refinement(storyboard: ProjectStoryboard) -> bool:
             storyboard.camera_angle,
             storyboard.camera_movement,
             storyboard.screen_execution,
-            storyboard.visual_description,
-            storyboard.production_focus_base,
             storyboard.production_focus,
         )
     )
@@ -1274,7 +1316,7 @@ def _build_merged_storyboard_item(
 ) -> Dict[str, Any]:
     first = storyboards[0]
     source_content = payload.source_content or _join_texts(storyboard.source_content for storyboard in storyboards)
-    core_action = payload.core_action or payload.action or _join_texts(storyboard.action for storyboard in storyboards)
+    action = payload.action or _join_texts(storyboard.action for storyboard in storyboards)
     split_reason = payload.split_reason or "用户判断所选分镜属于同一连续事件，合并为一个分镜。"
     return {
         "shot_number": first.shot_number,
@@ -1284,7 +1326,7 @@ def _build_merged_storyboard_item(
         "scene_name": payload.scene_name or _first_nonempty(storyboard.scene_name for storyboard in storyboards),
         "characters": payload.characters if payload.characters is not None else _merge_string_lists(storyboard.characters for storyboard in storyboards),
         "props": payload.props if payload.props is not None else _merge_string_lists(storyboard.props for storyboard in storyboards),
-        "core_action": core_action,
+        "action": action,
         "dialogue": payload.dialogue if payload.dialogue is not None else _join_texts(storyboard.dialogue for storyboard in storyboards),
         "split_reason": split_reason,
         "extra": payload.extra or {},
@@ -1355,7 +1397,6 @@ def _normalize_storyboard_item(item: Dict[str, Any], index: int) -> Dict[str, An
         "source_content": _first_value(item, "source_content", "original_text", "原文", "原始文本") or "",
         "event_goal": _first_value(item, "event_goal", "叙事目标", "事件目标") or "",
         "scene_name": _first_value(item, "scene_name", "scene", "场景名称") or (scenes[0] if scenes else ""),
-        "scene_time": "",
         "scene_state": "",
         "shot_size": "",
         "camera_angle": "",
@@ -1363,15 +1404,12 @@ def _normalize_storyboard_item(item: Dict[str, Any], index: int) -> Dict[str, An
         "screen_execution": "",
         "characters": _first_value(item, "characters", "角色", "人物") or [],
         "props": _first_value(item, "props", "道具") or [],
-        "core_action": _first_value(item, "core_action", "核心动作") or _first_value(item, "action", "动作") or description_prompt,
-        "action": _first_value(item, "action", "动作") or _first_value(item, "core_action", "核心动作") or description_prompt,
+        "action": _first_value(item, "action", "动作") or description_prompt,
         "character_action": "",
         "character_expression": "",
         "dialogue": _first_value(item, "dialogue", "台词") or "",
         "sound_effect": "",
         "atmosphere": "",
-        "emotion": "",
-        "visual_description": "",
         "image_prompt": "",
         "video_prompt": "",
         "duration_suggestion": "",
@@ -1422,9 +1460,8 @@ def _looks_like_storyboard_item(value: Dict[str, Any]) -> bool:
         "original_text",
         "event_goal",
         "scene_name",
-        "core_action",
+        "action",
         "split_reason",
-        "scene_time",
         "scene_state",
         "shot_size",
         "camera_angle",
@@ -1433,8 +1470,6 @@ def _looks_like_storyboard_item(value: Dict[str, Any]) -> bool:
         "character_action",
         "character_expression",
         "atmosphere",
-        "visual_description",
-        "storyboard_image_prompt",
         "image_prompt",
         "video_prompt",
         "duration_suggestion",
@@ -1445,9 +1480,8 @@ def _looks_like_storyboard_item(value: Dict[str, Any]) -> bool:
         "镜头编号",
         "标题",
         "叙事目标",
-        "核心动作",
+        "动作",
         "拆分理由",
-        "场景时间",
         "场景状态",
         "景别",
         "拍摄角度",
@@ -1459,8 +1493,6 @@ def _looks_like_storyboard_item(value: Dict[str, Any]) -> bool:
         "画面氛围",
         "结尾画面",
         "收束画面",
-        "故事板提示词",
-        "故事板图像提示词",
         "图像提示词",
         "视频提示词",
     }

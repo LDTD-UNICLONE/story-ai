@@ -25,8 +25,8 @@ WorkerSessionLocal = create_worker_sessionmaker()
     bind=True,
     name="tasks.project_asset_analysis.run_project_asset_analysis",
     max_retries=settings.celery_task_max_retries,
-    soft_time_limit=settings.celery_task_soft_time_limit_seconds,
-    time_limit=settings.celery_task_time_limit_seconds,
+    soft_time_limit=settings.effective_celery_task_soft_time_limit_seconds,
+    time_limit=settings.effective_celery_task_time_limit_seconds,
 )
 def run_project_asset_analysis(self, task_record_id: str, chapter_id: str, asset_type: str) -> None:
     try:

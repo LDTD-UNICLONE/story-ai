@@ -10,6 +10,12 @@ from app.core.logging import bind_request_context, clear_request_context, config
 configure_logging()
 logger = logging.getLogger(__name__)
 
+
+def _provider_reconcile_sweep_interval_seconds() -> int:
+    # Running provider tasks schedule their own reconcile jobs. The beat job is
+    # only a safety sweep, so keep it slower to avoid noisy default-queue stats.
+    return max(180, settings.provider_task_video_poll_interval_seconds * 3)
+
 celery_app = Celery(
     "story_ai",
     broker=settings.celery_broker_url,
@@ -52,20 +58,20 @@ celery_app.conf.update(
     task_track_started=True,
     task_acks_late=True,
     task_reject_on_worker_lost=True,
-    task_time_limit=settings.celery_task_time_limit_seconds,
-    task_soft_time_limit=settings.celery_task_soft_time_limit_seconds,
+    task_time_limit=settings.effective_celery_task_time_limit_seconds,
+    task_soft_time_limit=settings.effective_celery_task_soft_time_limit_seconds,
     worker_prefetch_multiplier=1,
     worker_max_tasks_per_child=settings.celery_worker_max_tasks_per_child,
     result_expires=settings.celery_result_expires_seconds,
     beat_schedule={
         "enqueue-pending-provider-reconciliations": {
             "task": "tasks.provider_reconcile.enqueue_pending_provider_reconciliations",
-            "schedule": max(10, settings.provider_task_poll_interval_seconds),
+            "schedule": _provider_reconcile_sweep_interval_seconds(),
             "args": (100,),
         },
     },
     broker_transport_options={
-        "visibility_timeout": max(settings.celery_task_time_limit_seconds * 2, 3600),
+        "visibility_timeout": max(settings.effective_celery_task_time_limit_seconds * 2, 3600),
     },
 )
 

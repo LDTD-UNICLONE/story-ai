@@ -1,12 +1,15 @@
 import re
 from typing import Optional
+from uuid import UUID
 
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
 from app.core.config import settings
+from app.core.logging import bind_request_context
 from app.core.responses import error
+from app.core.security import decode_access_token
 from app.integrations.redis import get_redis
 
 
@@ -20,6 +23,7 @@ class RedisRateLimitMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         rule = _match_rule(request)
+        _bind_user_id_from_bearer_token(request)
         identity = _identity(request, rule)
         window = _window_for_rule(rule)
         keys = _rate_limit_keys(rule)
@@ -119,6 +123,24 @@ def _identity(request: Request, rule: str = "global") -> str:
     host = request.client.host if request.client else "unknown"
     identity = f"ip:{host}"
     return f"{identity}:{polling_key}" if polling_key else identity
+
+
+def _bind_user_id_from_bearer_token(request: Request) -> None:
+    if getattr(request.state, "user_id", None):
+        return
+    authorization = request.headers.get("authorization") or ""
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return
+    try:
+        subject = decode_access_token(token.strip()).get("sub")
+        if subject is None:
+            return
+        user_id = str(UUID(str(subject)))
+    except Exception:
+        return
+    request.state.user_id = user_id
+    bind_request_context(user_id=user_id)
 
 
 def _polling_identity_key(path: str) -> Optional[str]:

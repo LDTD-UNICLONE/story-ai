@@ -53,7 +53,7 @@ def calculate_submission_points_cost(
     if generation_type == "image":
         return calculate_image_model_points_cost(ai_model)
     if generation_type == "video":
-        return calculate_video_submission_points_cost(ai_model)
+        return calculate_video_submission_points_cost(ai_model, extra or {})
     return calculate_model_points_cost(ai_model)
 
 
@@ -65,8 +65,11 @@ def calculate_image_model_points_cost(ai_model: AiModel) -> int:
     return max(0, int(ai_model.points_cost or 0))
 
 
-def calculate_video_submission_points_cost(ai_model: AiModel) -> int:
-    return max(0, int(ai_model.points_cost or 0))
+def calculate_video_submission_points_cost(
+    ai_model: AiModel,
+    extra: Optional[Dict[str, Any]] = None,
+) -> int:
+    return calculate_video_model_points_cost(ai_model, extra or {})
 
 
 def calculate_video_model_points_cost(ai_model: AiModel, extra: Dict[str, Any]) -> int:

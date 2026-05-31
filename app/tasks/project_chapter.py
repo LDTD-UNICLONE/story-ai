@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from types import SimpleNamespace
 from typing import Optional
 from uuid import UUID
@@ -8,6 +9,7 @@ from sqlalchemy import select
 
 from app.core.config import settings
 from app.core.exceptions import AppException
+from app.core.logging import log_extra
 from app.core.public_messages import sanitize_public_message
 from app.core.timezone import beijing_datetime
 from app.db.session import create_worker_sessionmaker
@@ -25,20 +27,21 @@ from app.worker import celery_app
 
 
 WorkerSessionLocal = create_worker_sessionmaker()
+logger = logging.getLogger(__name__)
 
 
 @celery_app.task(
     bind=True,
     name="tasks.project_chapter.run_project_chapter_processing",
     max_retries=settings.celery_task_max_retries,
-    soft_time_limit=settings.celery_task_soft_time_limit_seconds,
-    time_limit=settings.celery_task_time_limit_seconds,
+    soft_time_limit=settings.effective_celery_task_soft_time_limit_seconds,
+    time_limit=settings.effective_celery_task_time_limit_seconds,
 )
 def run_project_chapter_processing(self, task_record_id: str, chapter_id: str) -> None:
     try:
         asyncio.run(_run_project_chapter_processing(UUID(task_record_id), UUID(chapter_id)))
-    except SoftTimeLimitExceeded:
-        asyncio.run(_fail_processing(UUID(task_record_id), UUID(chapter_id), "任务执行超时"))
+    except (SoftTimeLimitExceeded, asyncio.TimeoutError):
+        asyncio.run(_fail_processing(UUID(task_record_id), UUID(chapter_id), "任务执行超时", raw_reason="任务执行超时"))
     except Exception as exc:
         if self.request.retries < settings.celery_task_max_retries and _is_retryable_provider_error(exc):
             raise self.retry(exc=exc, countdown=_retry_countdown(self.request.retries)) from exc
@@ -54,10 +57,21 @@ def run_project_chapter_processing(self, task_record_id: str, chapter_id: str) -
 
 async def _run_project_chapter_processing(task_record_id: UUID, chapter_id: UUID) -> None:
     try:
-        await _execute_processing(task_record_id, chapter_id)
+        await asyncio.wait_for(
+            _execute_processing(task_record_id, chapter_id),
+            timeout=_chapter_processing_timeout_seconds(),
+        )
     finally:
         await close_comfly_client()
         await close_volcengine_ark_client()
+
+
+def _chapter_processing_timeout_seconds() -> int:
+    return max(
+        1,
+        settings.effective_celery_task_soft_time_limit_seconds
+        - min(10, max(1, settings.celery_task_timeout_grace_seconds)),
+    )
 
 
 async def _execute_processing(task_record_id: UUID, chapter_id: UUID) -> None:
@@ -100,12 +114,35 @@ async def _execute_processing(task_record_id: UUID, chapter_id: UUID) -> None:
         )
         try:
             model_prompt = _resolve_model_prompt(task_record, chapter)
+            task_record.extra = {
+                **(task_record.extra or {}),
+                "provider_call_status": "started",
+                "provider_call_started_at": beijing_datetime().isoformat(),
+                "provider_vendor": ai_model.vendor,
+                "provider_model_id": ai_model.model_id,
+            }
+            await db.commit()
+            logger.info(
+                "Project chapter provider call started",
+                extra=log_extra(
+                    event="project_chapter_provider_call_started",
+                    task_record_id=task_record.id,
+                    chapter_id=chapter.id,
+                    model_id=ai_model.model_id,
+                    vendor=ai_model.vendor,
+                ),
+            )
             model_result = await run_model(
                 model_snapshot,
                 "text",
                 model_prompt,
                 (task_record.extra or {}).get("model_extra") or {},
             )
+            task_record.extra = {
+                **(task_record.extra or {}),
+                "provider_call_status": "finished",
+                "provider_call_finished_at": beijing_datetime().isoformat(),
+            }
         except Exception as exc:
             if _is_retryable_provider_error(exc):
                 await _mark_retrying(
@@ -245,8 +282,13 @@ def _is_retryable_provider_error(exc: Exception) -> bool:
 
 
 def _resolve_model_prompt(task_record: UserTaskRecord, chapter: ProjectChapter) -> str:
+    if not (chapter.content or "").strip():
+        raise AppException("章节原文内容不能为空", code=40036, status_code=400)
     if (task_record.extra or {}).get("prompt_source") == "system":
-        return render_system_prompt("chapter_text_cleaning.md", input_text=chapter.content)
+        prompt = render_system_prompt("chapter_text_cleaning.md", input_text=chapter.content)
+        if "{{input_text}}" in prompt:
+            raise AppException("章节原文未正确写入模型提示词", code=50042, status_code=500)
+        return prompt
     return task_record.prompt
 
 
@@ -272,5 +314,5 @@ def _retry_countdown(retries: int) -> int:
 
 def _user_failed_reason(exc: Exception) -> str:
     if _is_retryable_provider_error(exc):
-        return "模型服务繁忙，已自动重试多次仍未成功，请稍后再试"
+        return "模型服务繁忙，请稍后再试"
     return sanitize_public_message(str(exc) or "任务执行失败")

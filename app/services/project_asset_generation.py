@@ -9,6 +9,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import AppException
 from app.core.timezone import beijing_datetime
+from app.integrations import comfly
 from app.models.ai_model import AiModel
 from app.models.project import Project
 from app.models.project_asset import ProjectCharacter, ProjectProp, ProjectScene
@@ -21,7 +22,9 @@ from app.services.model_points import calculate_submission_points_cost
 from app.services.model_runner import ModelRunResult, query_model_task, run_model
 from app.services.points import change_user_points, consume_user_points
 from app.services.prompts import load_constant_prompt
+from app.services.project_generated_assets import create_project_generated_asset_history, extract_result_urls
 from app.services.project_assets import get_project_asset_or_404
+from app.services.provider_polling import provider_poll_interval_seconds
 from app.services.projects import get_project_or_404
 from app.services.task_records import create_user_task_record, refresh_task_record_interrupted
 
@@ -46,7 +49,15 @@ async def submit_asset_image_generation(
     asset = await get_project_asset_or_404(db, config["model"], project_id, asset_id, user.id)
     ai_model = await get_enabled_image_model_or_404(db, payload.ai_model_id)
     generation_mode = normalize_generation_mode(payload.generation_mode)
-    points_cost = calculate_submission_points_cost(ai_model, "image", payload.extra or {})
+
+    prompt = build_asset_image_prompt(project, asset, asset_type, generation_mode, payload.prompt)
+    extra = {
+        **(payload.extra or {}),
+        "aspect_ratio": project.generation_ratio,
+        "generation_mode": generation_mode,
+    }
+    _validate_comfly_asset_image_request(ai_model, prompt, extra)
+    points_cost = calculate_submission_points_cost(ai_model, "image", extra)
 
     points_transaction = None
     if points_cost > 0:
@@ -58,12 +69,6 @@ async def submit_asset_image_generation(
             auto_commit=False,
         )
 
-    prompt = build_asset_image_prompt(project, asset, asset_type, generation_mode, payload.prompt)
-    extra = {
-        **(payload.extra or {}),
-        "aspect_ratio": project.generation_ratio,
-        "generation_mode": generation_mode,
-    }
     task_record = await create_user_task_record(
         db,
         user_id=user.id,
@@ -105,6 +110,12 @@ async def submit_asset_image_generation(
         await _mark_asset_image_enqueue_failed(db, task_record, asset)
         await db.refresh(asset)
     return asset, task_record, points_cost
+
+
+def _validate_comfly_asset_image_request(ai_model: AiModel, prompt: str, extra: Dict[str, Any]) -> None:
+    if ai_model.vendor not in {"comfly", "模型服务"}:
+        return
+    comfly.validate_image_request(ai_model.model_id, prompt, extra)
 
 
 async def run_asset_image_generation_in_worker(
@@ -168,11 +179,27 @@ async def run_asset_image_generation_in_worker(
     if not image_url:
         raise AppException("图像生成未返回有效结果", code=50231, status_code=502)
 
+    history = await create_project_generated_asset_history(
+        db,
+        task_record=task_record,
+        target_type=asset_type,
+        target_id=asset_id,
+        media_type="image",
+        result_urls=extract_result_urls(model_result.content) or [image_url],
+        result_url=image_url,
+        generation_mode=(task_record.extra or {}).get("generation_mode"),
+        extra={
+            "asset_name": asset.name,
+            "generation_ratio": (task_record.extra or {}).get("generation_ratio"),
+            "model_result_extra": model_result.extra,
+        },
+    )
     asset.reference_image = image_url
     asset.updated_at = beijing_datetime()
     asset.extra = {
         **(asset.extra or {}),
         "image_generation_status": "success",
+        "image_generation_history_id": str(history.id),
         "image_generation_task_record_id": str(task_record.id),
         "image_generation_extra": model_result.extra,
     }
@@ -182,6 +209,7 @@ async def run_asset_image_generation_in_worker(
         **(task_record.extra or {}),
         "model_result_extra": model_result.extra,
         "oss_image_url": image_url,
+        "generated_asset_history_id": str(history.id),
     }
 
 
@@ -288,6 +316,16 @@ async def _resolve_image_provider_task(model_snapshot: SimpleNamespace, model_re
     if not task_id:
         return model_result
 
+    if settings.provider_task_worker_poll_max_attempts <= 0:
+        model_result.extra = {
+            **model_result.extra,
+            "platform_task_status": "running",
+            "provider_polling_deferred": True,
+            "next_poll_seconds": provider_poll_interval_seconds("image"),
+        }
+        model_result.content = f"模型任务仍在生成中：{task_id}"
+        return model_result
+
     latest_result = model_result
     for _ in range(settings.provider_task_worker_poll_max_attempts):
         await asyncio.sleep(settings.provider_task_worker_poll_interval_seconds)
@@ -306,7 +344,7 @@ async def _resolve_image_provider_task(model_snapshot: SimpleNamespace, model_re
         **latest_result.extra,
         "platform_task_status": "running",
         "provider_polling_timeout": True,
-        "next_poll_seconds": settings.provider_task_poll_interval_seconds,
+        "next_poll_seconds": provider_poll_interval_seconds("image"),
     }
     latest_result.content = f"模型任务仍在生成中：{task_id}"
     return latest_result

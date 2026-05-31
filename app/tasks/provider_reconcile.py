@@ -22,8 +22,8 @@ WorkerSessionLocal = create_worker_sessionmaker()
     bind=True,
     name="tasks.provider_reconcile.reconcile_provider_task",
     max_retries=settings.celery_task_max_retries,
-    soft_time_limit=settings.celery_task_soft_time_limit_seconds,
-    time_limit=settings.celery_task_time_limit_seconds,
+    soft_time_limit=settings.effective_celery_task_soft_time_limit_seconds,
+    time_limit=settings.effective_celery_task_time_limit_seconds,
 )
 def reconcile_provider_task(self, task_record_id: str) -> None:
     try:
@@ -44,8 +44,8 @@ def enqueue_provider_reconcile(task_record_id: str, countdown: Optional[int] = N
 
 @celery_app.task(
     name="tasks.provider_reconcile.enqueue_pending_provider_reconciliations",
-    soft_time_limit=settings.celery_task_soft_time_limit_seconds,
-    time_limit=settings.celery_task_time_limit_seconds,
+    soft_time_limit=settings.effective_celery_task_soft_time_limit_seconds,
+    time_limit=settings.effective_celery_task_time_limit_seconds,
 )
 def enqueue_pending_provider_reconciliations(limit: int = 100) -> int:
     return asyncio.run(_enqueue_pending_provider_reconciliations(limit))
