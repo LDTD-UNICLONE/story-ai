@@ -7,6 +7,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.timezone import beijing_datetime
 from app.core.exceptions import AppException
 from app.integrations import comfly
+from app.integrations.volcengine_ark_video_specs import (
+    is_volcengine_ark_video_model,
+    merge_video_capabilities as merge_ark_video_capabilities,
+    normalize_video_resolution,
+)
 from app.models.ai_model import AiModel
 from app.models.conversation import Conversation, ConversationMessage
 from app.models.task_record import UserTaskRecord
@@ -382,6 +387,7 @@ async def send_conversation_message(
         conversation_type=conversation_type,
         content=payload.content,
         extra=payload.extra or {},
+        ai_model=ai_model,
     )
     _validate_comfly_conversation_request(ai_model, conversation_type, payload.content, message_extra)
     ai_model_points_cost = calculate_submission_points_cost(ai_model, conversation_type, message_extra)
@@ -513,9 +519,10 @@ async def _build_message_extra_with_context(
     conversation_type: str,
     content: str,
     extra: Dict[str, Any],
+    ai_model: Optional[AiModel] = None,
 ) -> Dict[str, Any]:
     if conversation_type == "video":
-        return _build_video_message_extra(extra)
+        return _build_video_message_extra(extra, ai_model)
     if conversation_type != "text":
         return extra
     if extra.get("messages"):
@@ -529,10 +536,11 @@ async def _build_message_extra_with_context(
     return {**extra, "messages": messages}
 
 
-def _build_video_message_extra(extra: Dict[str, Any]) -> Dict[str, Any]:
+def _build_video_message_extra(extra: Dict[str, Any], ai_model: Optional[AiModel] = None) -> Dict[str, Any]:
     generation_mode = _normalize_conversation_video_generation_mode(extra.get("generation_mode"))
     payload = dict(extra)
     payload["generation_mode"] = generation_mode
+    payload["resolution"] = _normalize_conversation_video_resolution(ai_model, payload.get("resolution"))
     payload["video_mode"] = CONVERSATION_VIDEO_MODE_TO_PROVIDER_MODE[generation_mode]
     payload["capability"] = CONVERSATION_VIDEO_MODE_TO_PROVIDER_MODE[generation_mode]
 
@@ -565,6 +573,25 @@ def _build_video_message_extra(extra: Dict[str, Any]) -> Dict[str, Any]:
     payload.pop("uploaded_images", None)
     payload.pop("reference_images", None)
     return payload
+
+
+def _normalize_conversation_video_resolution(ai_model: Optional[AiModel], value: Any) -> str:
+    if ai_model is not None and (
+        ai_model.vendor == "volcengine_ark" or is_volcengine_ark_video_model(ai_model.model_id)
+    ):
+        capabilities = merge_ark_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
+        return normalize_video_resolution(value or "720p", capabilities)
+
+    normalized = str(value or "720p").strip().lower()
+    aliases = {
+        "480": "480p",
+        "720": "720p",
+        "1080": "1080p",
+        "hd": "720p",
+        "fhd": "1080p",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in {"480p", "720p", "1080p"} else "720p"
 
 
 def _normalize_conversation_video_generation_mode(value: Any) -> str:
