@@ -24,6 +24,7 @@ from app.services.conversations import (
     conversation_task_content,
     create_conversation,
     delete_conversation,
+    delete_conversation_message,
     get_conversation_generation_task_status,
     get_conversation_or_404,
     list_conversation_messages,
@@ -125,6 +126,22 @@ async def my_conversation_messages(
         page_size=page_size,
     )
     return success(data=data.model_dump(mode="json"))
+
+
+@router.delete("/{conversation_id}/messages/{message_id}")
+async def delete_my_conversation_message(
+    conversation_id: UUID,
+    message_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    message = await delete_conversation_message(
+        db,
+        conversation_id=conversation_id,
+        message_id=message_id,
+        user_id=current_user.id,
+    )
+    return success(data=ConversationMessageOut.model_validate(message).model_dump(mode="json"), message="删除成功")
 
 
 @router.get("/{conversation_id}/generation-tasks/{task_record_id}")

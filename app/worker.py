@@ -2,7 +2,7 @@ from celery import Celery
 import logging
 
 from celery.signals import task_postrun, task_prerun, worker_process_shutdown
-from kombu import Queue
+from kombu import Exchange, Queue
 
 from app.core.config import settings
 from app.core.logging import bind_request_context, clear_request_context, configure_logging, log_extra
@@ -10,11 +10,29 @@ from app.core.logging import bind_request_context, clear_request_context, config
 configure_logging()
 logger = logging.getLogger(__name__)
 
+QUEUE_NAMES = {
+    "legacy": "celery",
+    "default": "story_ai_default",
+    "text": "story_ai_text",
+    "image": "story_ai_image",
+    "video": "story_ai_video",
+}
+
 
 def _provider_reconcile_sweep_interval_seconds() -> int:
     # Running provider tasks schedule their own reconcile jobs. The beat job is
     # only a safety sweep, so keep it slower to avoid noisy default-queue stats.
     return max(180, settings.provider_task_video_poll_interval_seconds * 3)
+
+
+def _queue(name: str) -> Queue:
+    return Queue(name, Exchange(name, type="direct"), routing_key=name)
+
+
+def _route(queue_key: str) -> dict:
+    queue_name = QUEUE_NAMES[queue_key]
+    return {"queue": queue_name, "routing_key": queue_name}
+
 
 celery_app = Celery(
     "story_ai",
@@ -35,22 +53,26 @@ celery_app = Celery(
 celery_app.conf.update(
     timezone=settings.timezone,
     enable_utc=False,
-    task_default_queue="story_ai_default",
+    task_default_queue=QUEUE_NAMES["default"],
+    task_default_exchange=QUEUE_NAMES["default"],
+    task_default_exchange_type="direct",
+    task_default_routing_key=QUEUE_NAMES["default"],
     task_queues=(
-        Queue("story_ai_default"),
-        Queue("story_ai_text"),
-        Queue("story_ai_image"),
-        Queue("story_ai_video"),
+        _queue(QUEUE_NAMES["legacy"]),
+        _queue(QUEUE_NAMES["default"]),
+        _queue(QUEUE_NAMES["text"]),
+        _queue(QUEUE_NAMES["image"]),
+        _queue(QUEUE_NAMES["video"]),
     ),
     task_routes={
-        "tasks.project_chapter.run_project_chapter_processing": {"queue": "story_ai_text"},
-        "tasks.project_asset_analysis.run_project_asset_analysis": {"queue": "story_ai_text"},
-        "tasks.project_storyboard.run_project_storyboard_analysis": {"queue": "story_ai_text"},
-        "tasks.project_storyboard.run_project_storyboard_stage": {"queue": "story_ai_text"},
-        "tasks.project_asset_generation.run_project_asset_image_generation": {"queue": "story_ai_image"},
-        "tasks.project_storyboard_video.run_project_storyboard_video_generation": {"queue": "story_ai_video"},
-        "tasks.provider_reconcile.reconcile_provider_task": {"queue": "story_ai_default"},
-        "tasks.provider_reconcile.enqueue_pending_provider_reconciliations": {"queue": "story_ai_default"},
+        "tasks.project_chapter.run_project_chapter_processing": _route("text"),
+        "tasks.project_asset_analysis.run_project_asset_analysis": _route("text"),
+        "tasks.project_storyboard.run_project_storyboard_analysis": _route("text"),
+        "tasks.project_storyboard.run_project_storyboard_stage": _route("text"),
+        "tasks.project_asset_generation.run_project_asset_image_generation": _route("image"),
+        "tasks.project_storyboard_video.run_project_storyboard_video_generation": _route("video"),
+        "tasks.provider_reconcile.reconcile_provider_task": _route("default"),
+        "tasks.provider_reconcile.enqueue_pending_provider_reconciliations": _route("default"),
     },
     task_serializer="json",
     accept_content=["json"],

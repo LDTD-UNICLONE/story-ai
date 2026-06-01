@@ -19,6 +19,7 @@ from app.models.task_record import UserTaskRecord
 from app.models.user import User
 from app.schemas.project_storyboard import (
     ProjectStoryboardAnalyzeRequest,
+    ProjectStoryboardCreateRequest,
     ProjectStoryboardMergeRequest,
     ProjectStoryboardPromptRequest,
     ProjectStoryboardRefineRequest,
@@ -113,6 +114,39 @@ def _parse_uuid(value: Any) -> Optional[UUID]:
         return UUID(str(value))
     except (TypeError, ValueError, AttributeError):
         return None
+
+
+async def create_project_storyboard(
+    db: AsyncSession,
+    project_id: UUID,
+    chapter_id: UUID,
+    user_id: UUID,
+    payload: ProjectStoryboardCreateRequest,
+) -> ProjectStoryboard:
+    await get_project_chapter_or_404(db, project_id, chapter_id, user_id)
+    storyboards = await _list_enabled_storyboards(db, project_id, chapter_id, user_id)
+    insert_index = _resolve_storyboard_insert_index(storyboards, payload)
+
+    item = payload.model_dump(exclude_none=True)
+    item.pop("insert_after_storyboard_id", None)
+    item["shot_number"] = insert_index + 1
+    storyboard = _make_storyboard_from_item(
+        project_id=project_id,
+        chapter_id=chapter_id,
+        user_id=user_id,
+        ai_model_id=None,
+        item=item,
+        index=insert_index + 1,
+        extra={"operation": "manual_create"},
+    )
+    db.add(storyboard)
+    await db.flush()
+
+    final_order = storyboards[:insert_index] + [storyboard] + storyboards[insert_index:]
+    _assign_shot_numbers(final_order)
+    await db.commit()
+    await db.refresh(storyboard)
+    return storyboard
 
 
 async def update_project_storyboard(
@@ -426,6 +460,7 @@ async def submit_storyboard_analysis(
         run_project_storyboard_analysis.apply_async(
             args=(str(task_record.id), str(chapter_id)),
             queue="story_ai_text",
+            routing_key="story_ai_text",
         )
     except Exception:
         await _mark_storyboard_enqueue_failed(db, task_record, chapter)
@@ -501,6 +536,7 @@ async def _submit_storyboard_text_stage(
         run_project_storyboard_stage.apply_async(
             args=(str(task_record.id), str(chapter.id)),
             queue="story_ai_text",
+            routing_key="story_ai_text",
         )
     except Exception:
         await _mark_storyboard_stage_enqueue_failed(db, task_record, chapter, status_key, storyboard)
@@ -1344,6 +1380,20 @@ def _assign_shot_numbers(storyboards: List[ProjectStoryboard]) -> None:
     for index, storyboard in enumerate(storyboards, start=1):
         storyboard.shot_number = index
         storyboard.updated_at = now
+
+
+def _resolve_storyboard_insert_index(
+    storyboards: List[ProjectStoryboard],
+    payload: ProjectStoryboardCreateRequest,
+) -> int:
+    if payload.insert_after_storyboard_id is not None:
+        for index, storyboard in enumerate(storyboards):
+            if storyboard.id == payload.insert_after_storyboard_id:
+                return index + 1
+        raise AppException("插入位置分镜不存在或已不可用", code=40410, status_code=404)
+    if payload.shot_number is None:
+        return len(storyboards)
+    return min(max(payload.shot_number - 1, 0), len(storyboards))
 
 
 def _unique_uuids(values: List[UUID]) -> List[UUID]:

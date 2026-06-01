@@ -27,6 +27,12 @@ python -m uvicorn app.main:app --reload
 
 ```bash
 source .venv/bin/activate
+./scripts/celery_workers.sh
+```
+
+也可以按队列分别启动 worker：
+
+```bash
 python -m celery -A app.worker.celery_app worker -l info -E --concurrency=2 --queues=celery,story_ai_default
 python -m celery -A app.worker.celery_app worker -l info -E --concurrency=16 --queues=story_ai_text --hostname=story-ai-text@%h
 python -m celery -A app.worker.celery_app worker -l info -E --concurrency=16 --queues=story_ai_image --hostname=story-ai-image@%h
@@ -526,6 +532,12 @@ Authorization: Bearer <access_token>
 发送消息可传 `ai_model_id` 切换本次使用的模型；不传则沿用会话当前模型。接口会校验模型是否启用、模型类型是否和会话类型一致，并按模型 `points_cost` 扣减用户积分。接口会立即创建用户消息、处理中助手消息和任务记录，然后把真实 Comfly 调用交给 Celery worker 执行。执行成功后 worker 会更新助手消息和任务记录，执行失败会记录失败原因并自动退回本次积分。
 
 ## Celery
+
+```bash
+./scripts/celery_workers.sh
+```
+
+或按队列分别启动：
 
 ```bash
 python -m celery -A app.worker.celery_app worker -l info -E --concurrency=2 --queues=celery,story_ai_default

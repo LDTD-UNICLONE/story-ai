@@ -70,9 +70,10 @@ def register_exception_handlers(app: FastAPI) -> None:
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
         logger.info(
-            "Validation error: %s %s",
+            "Validation error: %s %s errors=%s",
             request.method,
             request.url.path,
+            exc.errors(),
             extra=log_extra(
                 event="validation_error",
                 method=request.method,

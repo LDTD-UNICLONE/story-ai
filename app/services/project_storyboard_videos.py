@@ -3,6 +3,7 @@ import math
 import re
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from sqlalchemy import select
@@ -12,6 +13,7 @@ from sqlalchemy.orm import selectinload
 from app.core.config import settings
 from app.core.exceptions import AppException
 from app.core.timezone import beijing_datetime
+from app.integrations.comfly_video_specs import merge_video_capabilities as merge_comfly_video_capabilities
 from app.integrations.volcengine_ark_video_specs import (
     VOLCENGINE_ARK_VENDOR,
     is_volcengine_ark_video_model,
@@ -21,6 +23,7 @@ from app.integrations.volcengine_ark_video_specs import (
 from app.models.ai_model import AiModel
 from app.models.project import Project
 from app.models.project_asset import ProjectCharacter, ProjectProp, ProjectScene
+from app.models.material import Material
 from app.models.project_storyboard import ProjectStoryboard
 from app.models.task_record import UserTaskRecord
 from app.models.user import User
@@ -59,6 +62,7 @@ async def submit_storyboard_video_generation(
 
     reference_images = await _collect_reference_images(db, project_id, user.id, payload)
     reference_start_frame_url = _reference_start_frame_url(payload)
+    reference_start_frame_url = await _resolve_reference_image_url(db, reference_start_frame_url)
     if reference_start_frame_url:
         reference_images = _dedupe([reference_start_frame_url, *reference_images])
     reference_images, dropped_reference_images = _limit_reference_images_for_model(ai_model, payload, reference_images)
@@ -136,7 +140,11 @@ async def submit_storyboard_video_generation(
     try:
         from app.tasks.project_storyboard_video import run_project_storyboard_video_generation
 
-        run_project_storyboard_video_generation.delay(str(task_record.id), str(storyboard_id))
+        run_project_storyboard_video_generation.apply_async(
+            args=(str(task_record.id), str(storyboard_id)),
+            queue="story_ai_video",
+            routing_key="story_ai_video",
+        )
     except Exception:
         await _mark_storyboard_video_enqueue_failed(db, task_record, storyboard)
     return task_record, points_cost
@@ -294,7 +302,7 @@ async def _collect_reference_images(
     urls.extend(await _asset_reference_images(db, ProjectCharacter, project_id, user_id, payload.character_ids))
     urls.extend(await _asset_reference_images(db, ProjectScene, project_id, user_id, payload.scene_ids))
     urls.extend(await _asset_reference_images(db, ProjectProp, project_id, user_id, payload.prop_ids))
-    return _dedupe(urls)
+    return await _resolve_reference_image_urls(db, _dedupe(urls))
 
 
 def _reference_start_frame_url(payload: ProjectStoryboardVideoGenerateRequest) -> str:
@@ -307,6 +315,55 @@ def _reference_start_frame_url(payload: ProjectStoryboardVideoGenerateRequest) -
     if uploaded_url:
         return uploaded_url
     return ""
+
+
+async def _resolve_reference_image_urls(db: AsyncSession, urls: List[str]) -> List[str]:
+    material_ids = [_material_id_from_image_url(url) for url in urls]
+    material_ids = [material_id for material_id in material_ids if material_id is not None]
+    material_url_map: Dict[UUID, str] = {}
+    if material_ids:
+        result = await db.execute(
+            select(Material.id, Material.image_url).where(
+                Material.id.in_(material_ids),
+                Material.is_enabled.is_(True),
+                Material.image_url.is_not(None),
+            )
+        )
+        material_url_map = {row[0]: row[1] for row in result.all() if row[1]}
+
+    resolved: List[str] = []
+    for url in urls:
+        material_id = _material_id_from_image_url(url)
+        resolved.append(material_url_map.get(material_id, url) if material_id else url)
+    return _dedupe(resolved)
+
+
+async def _resolve_reference_image_url(db: AsyncSession, url: str) -> str:
+    if not url:
+        return ""
+    resolved = await _resolve_reference_image_urls(db, [url])
+    return resolved[0] if resolved else url
+
+
+def _material_id_from_image_url(value: Any) -> Optional[UUID]:
+    url = _clean_url(value)
+    if not url:
+        return None
+    try:
+        path = urlsplit(url).path or url
+    except Exception:
+        path = url
+    parts = [part for part in path.split("/") if part]
+    for index, part in enumerate(parts):
+        if part != "materials" or index + 2 >= len(parts):
+            continue
+        if parts[index + 2] != "image":
+            continue
+        try:
+            return UUID(parts[index + 1])
+        except ValueError:
+            return None
+    return None
 
 
 def _explicit_reference_start_frame_url(payload: ProjectStoryboardVideoGenerateRequest) -> str:
@@ -344,8 +401,10 @@ def _limit_reference_images_for_model(
     reference_images: List[str],
 ) -> Tuple[List[str], List[str]]:
     max_images = _model_image_limit(ai_model)
-    if max_images <= 0:
+    if max_images is None:
         return reference_images, []
+    if max_images <= 0:
+        return [], reference_images
 
     reserved_count = 0
     if payload.generation_mode == "first_last_frame":
@@ -358,14 +417,18 @@ def _limit_reference_images_for_model(
     return reference_images[:allowed_reference_count], reference_images[allowed_reference_count:]
 
 
-def _model_image_limit(ai_model: AiModel) -> int:
-    media_limits = (ai_model.capabilities or {}).get("media_limits") or {}
+def _model_image_limit(ai_model: AiModel) -> Optional[int]:
+    if ai_model.vendor == VOLCENGINE_ARK_VENDOR or is_volcengine_ark_video_model(ai_model.model_id):
+        capabilities = merge_ark_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
+    else:
+        capabilities = merge_comfly_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
+    media_limits = (capabilities or {}).get("media_limits") or {}
     raw_limit = media_limits.get("images")
-    if isinstance(raw_limit, int) and raw_limit > 0:
+    if isinstance(raw_limit, int) and raw_limit >= 0:
         return raw_limit
     if ai_model.vendor == VOLCENGINE_ARK_VENDOR or is_volcengine_ark_video_model(ai_model.model_id):
         return 9
-    return 0
+    return None
 
 
 def _normalize_storyboard_video_resolution(ai_model: AiModel, resolution: str) -> str:

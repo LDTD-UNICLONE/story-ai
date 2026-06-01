@@ -84,7 +84,7 @@ async def create_user_task_record(
     extra: Optional[Dict[str, Any]] = None,
 ) -> UserTaskRecord:
     await expire_stale_task_records(db, user_id=user_id)
-    await _ensure_user_task_capacity(db, user_id, generation_type)
+    queue_snapshot = await _build_user_task_queue_snapshot(db, user_id, generation_type)
     record = UserTaskRecord(
         user_id=user_id,
         ai_model_id=ai_model_id,
@@ -97,28 +97,69 @@ async def create_user_task_record(
         prompt=prompt,
         result=result,
         points_cost=points_cost,
-        extra=extra or {},
+        extra={
+            **(extra or {}),
+            "queue_snapshot": queue_snapshot,
+        },
     )
     db.add(record)
     return record
 
 
-async def _ensure_user_task_capacity(db: AsyncSession, user_id: UUID, generation_type: str) -> None:
+async def _build_user_task_queue_snapshot(
+    db: AsyncSession,
+    user_id: UUID,
+    generation_type: str,
+) -> Dict[str, Any]:
     active_since = beijing_datetime() - timedelta(hours=max(1, settings.user_pending_task_window_hours))
-    if settings.user_pending_task_limit > 0:
-        total_result = await db.execute(
-            select(func.count())
-            .select_from(UserTaskRecord)
-            .where(
-                UserTaskRecord.user_id == user_id,
-                UserTaskRecord.status.in_(("pending", "running")),
-                UserTaskRecord.updated_at >= active_since,
-            )
-        )
-        if total_result.scalar_one() >= settings.user_pending_task_limit:
-            raise AppException("当前待处理任务较多，请等待部分任务完成后再提交", code=42901, status_code=429)
+    snapshot: Dict[str, Any] = {
+        "queued_at": beijing_datetime().isoformat(),
+        "generation_type": generation_type,
+        "window_hours": max(1, settings.user_pending_task_window_hours),
+        "active_tasks_before": 0,
+        "same_type_active_tasks_before": 0,
+        "active_media_tasks_before": 0,
+        "task_queue_position": 1,
+        "same_type_queue_position": 1,
+        "media_queue_position": 1,
+        "configured_task_limit": max(0, settings.user_pending_task_limit),
+        "configured_media_task_limit": max(0, settings.user_pending_media_task_limit),
+        "exceeds_configured_task_limit": False,
+        "exceeds_configured_media_task_limit": False,
+        "limits_block_submission": False,
+    }
 
-    if settings.user_pending_media_task_limit > 0 and generation_type in _media_generation_types():
+    total_result = await db.execute(
+        select(func.count())
+        .select_from(UserTaskRecord)
+        .where(
+            UserTaskRecord.user_id == user_id,
+            UserTaskRecord.status.in_(("pending", "running")),
+            UserTaskRecord.updated_at >= active_since,
+        )
+    )
+    active_tasks_before = int(total_result.scalar_one() or 0)
+    snapshot["active_tasks_before"] = active_tasks_before
+    snapshot["task_queue_position"] = active_tasks_before + 1
+
+    same_type_result = await db.execute(
+        select(func.count())
+        .select_from(UserTaskRecord)
+        .where(
+            UserTaskRecord.user_id == user_id,
+            UserTaskRecord.status.in_(("pending", "running")),
+            UserTaskRecord.generation_type == generation_type,
+            UserTaskRecord.updated_at >= active_since,
+        )
+    )
+    same_type_tasks_before = int(same_type_result.scalar_one() or 0)
+    snapshot["same_type_active_tasks_before"] = same_type_tasks_before
+    snapshot["same_type_queue_position"] = same_type_tasks_before + 1
+
+    if settings.user_pending_task_limit > 0:
+        snapshot["exceeds_configured_task_limit"] = active_tasks_before >= settings.user_pending_task_limit
+
+    if generation_type in _media_generation_types():
         media_result = await db.execute(
             select(func.count())
             .select_from(UserTaskRecord)
@@ -129,8 +170,14 @@ async def _ensure_user_task_capacity(db: AsyncSession, user_id: UUID, generation
                 UserTaskRecord.updated_at >= active_since,
             )
         )
-        if media_result.scalar_one() >= settings.user_pending_media_task_limit:
-            raise AppException("当前图像或视频生成任务较多，请等待部分任务完成后再提交", code=42902, status_code=429)
+        active_media_tasks_before = int(media_result.scalar_one() or 0)
+        snapshot["active_media_tasks_before"] = active_media_tasks_before
+        snapshot["media_queue_position"] = active_media_tasks_before + 1
+        if settings.user_pending_media_task_limit > 0:
+            snapshot["exceeds_configured_media_task_limit"] = (
+                active_media_tasks_before >= settings.user_pending_media_task_limit
+            )
+    return snapshot
 
 
 def _media_generation_types() -> Tuple[str, ...]:
@@ -195,6 +242,28 @@ async def list_user_task_records(
         page=page,
         page_size=page_size,
     )
+
+
+async def list_user_task_records_by_ids(
+    db: AsyncSession,
+    user_id: UUID,
+    task_record_ids: List[UUID],
+) -> List[UserTaskRecord]:
+    unique_ids = list(dict.fromkeys(task_record_ids))
+    if not unique_ids:
+        return []
+
+    result = await db.execute(
+        select(UserTaskRecord).where(
+            UserTaskRecord.id.in_(unique_ids),
+            UserTaskRecord.user_id == user_id,
+        )
+    )
+    records_by_id = {record.id: record for record in result.scalars().all()}
+    records = [records_by_id[task_record_id] for task_record_id in unique_ids if task_record_id in records_by_id]
+    for record in records:
+        await expire_stale_task_record(db, record)
+    return records
 
 
 async def get_task_record_or_404(

@@ -42,6 +42,10 @@ class UserTaskRecordListOut(SchemaBaseModel):
     page_size: int
 
 
+class UserTaskRecordBatchRequest(SchemaBaseModel):
+    ids: List[UUID] = Field(..., min_length=1, max_length=50)
+
+
 class TaskRecordGenerationTypeOption(SchemaBaseModel):
     label: str
     value: str

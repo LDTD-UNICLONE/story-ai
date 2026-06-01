@@ -19,6 +19,7 @@ from app.services.task_records import (
     create_user_task_record,
     expire_stale_task_record,
     expire_stale_task_records,
+    interrupt_task_record,
 )
 from app.tasks.model_generation import run_conversation_generation
 
@@ -137,6 +138,35 @@ async def delete_conversation(
     return conversation
 
 
+async def delete_conversation_message(
+    db: AsyncSession,
+    conversation_id: UUID,
+    message_id: UUID,
+    user_id: UUID,
+) -> ConversationMessage:
+    await get_conversation_or_404(db, conversation_id, user_id)
+    result = await db.execute(
+        select(ConversationMessage).where(
+            ConversationMessage.id == message_id,
+            ConversationMessage.conversation_id == conversation_id,
+            ConversationMessage.user_id == user_id,
+        )
+    )
+    message = result.scalar_one_or_none()
+    if message is None:
+        raise AppException("消息记录不存在", code=40407, status_code=404)
+
+    await _interrupt_message_task_if_active(db, message, user_id)
+    await db.delete(message)
+    await db.execute(
+        Conversation.__table__.update()
+        .where(Conversation.id == conversation_id)
+        .values(updated_at=beijing_datetime())
+    )
+    await db.commit()
+    return message
+
+
 async def update_conversation(
     db: AsyncSession,
     conversation_id: UUID,
@@ -149,6 +179,26 @@ async def update_conversation(
     await db.commit()
     await db.refresh(conversation)
     return conversation
+
+
+async def _interrupt_message_task_if_active(
+    db: AsyncSession,
+    message: ConversationMessage,
+    user_id: UUID,
+) -> None:
+    task_record_id = _parse_uuid((message.extra or {}).get("task_record_id"))
+    if task_record_id is None:
+        return
+    record = await db.get(UserTaskRecord, task_record_id)
+    if (
+        record is None
+        or record.user_id != user_id
+        or record.business_type != "conversation"
+        or record.business_id != message.conversation_id
+        or record.status not in {"pending", "running"}
+    ):
+        return
+    await interrupt_task_record(db, task_record_id, user_id, reason="用户删除对话历史，任务已取消")
 
 
 async def list_conversation_messages(
@@ -409,9 +459,11 @@ async def send_conversation_message(
     await db.refresh(user_message)
     await db.refresh(assistant_message)
     try:
+        queue_name = _conversation_generation_queue(conversation_type)
         run_conversation_generation.apply_async(
             args=(str(task_record.id), str(assistant_message.id)),
-            queue=_conversation_generation_queue(conversation_type),
+            queue=queue_name,
+            routing_key=queue_name,
         )
     except Exception:
         await _mark_conversation_generation_enqueue_failed(

@@ -97,6 +97,7 @@ async def submit_project_chapter_processing(
         run_project_chapter_processing.apply_async(
             args=(str(task_record.id), str(chapter.id)),
             queue="story_ai_text",
+            routing_key="story_ai_text",
         )
     except Exception as exc:
         logger.exception("Project chapter task enqueue failed: task_record_id=%s", task_record.id)

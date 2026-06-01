@@ -10,6 +10,7 @@ from app.core.responses import success
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.task_record import (
+    UserTaskRecordBatchRequest,
     TaskRecordOptionsOut,
     UserTaskRecordListOut,
     UserTaskRecordOut,
@@ -17,6 +18,7 @@ from app.schemas.task_record import (
 from app.services.task_records import (
     get_task_record_options,
     get_task_record_or_404,
+    list_user_task_records_by_ids,
     list_user_task_records,
 )
 from app.services.provider_polling import provider_next_poll_seconds
@@ -60,6 +62,36 @@ async def my_task_record_options(
     return success(data=data.model_dump(mode="json"))
 
 
+@router.post("/batch")
+async def my_task_record_batch(
+    payload: UserTaskRecordBatchRequest,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    records = await list_user_task_records_by_ids(db, current_user.id, payload.ids)
+    items = []
+    next_poll_candidates = []
+    for record in records:
+        item = _dump_task_record(record)
+        if item["next_poll_seconds"]:
+            next_poll_candidates.append(item["next_poll_seconds"])
+        items.append(item)
+
+    aggregate_next_poll_seconds = min(next_poll_candidates) if next_poll_candidates else None
+    response.headers["Cache-Control"] = "no-store"
+    if aggregate_next_poll_seconds:
+        response.headers["X-Next-Poll-Seconds"] = str(aggregate_next_poll_seconds)
+    return success(
+        data={
+            "items": items,
+            "total": len(items),
+            "stop_polling": all(item["stop_polling"] for item in items) if items else True,
+            "next_poll_seconds": aggregate_next_poll_seconds,
+        }
+    )
+
+
 @router.get("/{task_record_id}")
 async def my_task_record_detail(
     task_record_id: str,
@@ -69,6 +101,14 @@ async def my_task_record_detail(
 ):
     parsed_task_record_id = _parse_task_record_id(task_record_id)
     record = await get_task_record_or_404(db, parsed_task_record_id, user_id=current_user.id)
+    data = _dump_task_record(record)
+    response.headers["Cache-Control"] = "no-store"
+    if data["next_poll_seconds"]:
+        response.headers["X-Next-Poll-Seconds"] = str(data["next_poll_seconds"])
+    return success(data=data)
+
+
+def _dump_task_record(record) -> dict:
     data = UserTaskRecordOut.model_validate(record).model_dump(mode="json")
     data = _clean_terminal_retry_extra(data)
     data["stop_polling"] = record.status in {"success", "failed"}
@@ -77,10 +117,7 @@ async def my_task_record_detail(
         record.status,
         data.get("extra") or {},
     )
-    response.headers["Cache-Control"] = "no-store"
-    if data["next_poll_seconds"]:
-        response.headers["X-Next-Poll-Seconds"] = str(data["next_poll_seconds"])
-    return success(data=data)
+    return data
 
 
 def _task_record_next_poll_seconds(generation_type: str, status: str, extra: dict) -> Optional[int]:

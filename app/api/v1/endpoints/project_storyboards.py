@@ -10,6 +10,7 @@ from app.models.user import User
 from app.schemas.project_storyboard import (
     ProjectStoryboardAnalyzeOut,
     ProjectStoryboardAnalyzeRequest,
+    ProjectStoryboardCreateRequest,
     ProjectStoryboardListOut,
     ProjectStoryboardMergeRequest,
     ProjectStoryboardOut,
@@ -31,6 +32,7 @@ from app.services.project_generated_assets import (
     select_project_generated_asset_history,
 )
 from app.services.project_storyboards import (
+    create_project_storyboard,
     delete_project_storyboard,
     get_project_storyboard_or_404,
     list_project_storyboards,
@@ -70,6 +72,24 @@ async def my_project_storyboards(
         page_size=page_size,
     )
     return success(data=data.model_dump(mode="json"))
+
+
+@router.post("")
+async def create_my_project_storyboard(
+    project_id: UUID,
+    chapter_id: UUID,
+    payload: ProjectStoryboardCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    storyboard = await create_project_storyboard(
+        db,
+        project_id=project_id,
+        chapter_id=chapter_id,
+        user_id=current_user.id,
+        payload=payload,
+    )
+    return success(data=ProjectStoryboardOut.model_validate(storyboard).model_dump(mode="json"), message="创建成功")
 
 
 @router.post("/analyze")

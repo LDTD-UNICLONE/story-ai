@@ -39,6 +39,7 @@ def enqueue_provider_reconcile(task_record_id: str, countdown: Optional[int] = N
         args=(task_record_id,),
         countdown=provider_reconcile_delay_seconds() if countdown is None else max(0, countdown),
         queue="story_ai_default",
+        routing_key="story_ai_default",
     )
 
 

@@ -69,8 +69,8 @@ class Settings(BaseSettings):
     celery_result_expires_seconds: int = 60 * 60 * 24
     celery_worker_max_tasks_per_child: int = 50
     provider_task_poll_interval_seconds: int = 30
-    provider_task_image_poll_interval_seconds: int = 30
-    provider_task_video_poll_interval_seconds: int = 60
+    provider_task_image_poll_interval_seconds: int = 60
+    provider_task_video_poll_interval_seconds: int = 120
     provider_task_poll_max_attempts: int = 60
     provider_task_worker_poll_interval_seconds: int = 5
     provider_task_worker_poll_max_attempts: int = 0

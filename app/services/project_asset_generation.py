@@ -105,7 +105,11 @@ async def submit_asset_image_generation(
     try:
         from app.tasks.project_asset_generation import run_project_asset_image_generation
 
-        run_project_asset_image_generation.delay(str(task_record.id), asset_type, str(asset_id))
+        run_project_asset_image_generation.apply_async(
+            args=(str(task_record.id), asset_type, str(asset_id)),
+            queue="story_ai_image",
+            routing_key="story_ai_image",
+        )
     except Exception:
         await _mark_asset_image_enqueue_failed(db, task_record, asset)
         await db.refresh(asset)
