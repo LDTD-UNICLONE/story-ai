@@ -327,7 +327,6 @@ async def generate_my_project_storyboard_video(
         generation_mode=payload.generation_mode,
         resolution=(task_record.extra or {}).get("resolution") or payload.resolution,
         return_last_frame=payload.return_last_frame,
-        reference_start_frame_url=(task_record.extra or {}).get("reference_start_frame_url"),
         status=task_record.status,
         points_cost=points_cost,
     )

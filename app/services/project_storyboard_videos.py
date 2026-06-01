@@ -61,13 +61,7 @@ async def submit_storyboard_video_generation(
     resolution = _normalize_storyboard_video_resolution(ai_model, payload.resolution)
 
     reference_images = await _collect_reference_images(db, project_id, user.id, payload)
-    reference_start_frame_url = _reference_start_frame_url(payload)
-    reference_start_frame_url = await _resolve_reference_image_url(db, reference_start_frame_url)
-    if reference_start_frame_url:
-        reference_images = _dedupe([reference_start_frame_url, *reference_images])
     reference_images, dropped_reference_images = _limit_reference_images_for_model(ai_model, payload, reference_images)
-    if reference_start_frame_url and reference_start_frame_url not in reference_images:
-        reference_start_frame_url = ""
     model_extra = _build_storyboard_video_extra(
         project,
         ai_model,
@@ -75,7 +69,6 @@ async def submit_storyboard_video_generation(
         storyboard,
         reference_images,
         resolution,
-        reference_start_frame_url,
     )
     prompt = _build_storyboard_video_prompt(
         project,
@@ -84,7 +77,6 @@ async def submit_storyboard_video_generation(
         payload.generation_mode,
         payload.first_frame_url,
         payload.last_frame_url,
-        reference_start_frame_url,
     )
     points_cost = calculate_submission_points_cost(ai_model, "video", model_extra)
 
@@ -118,7 +110,6 @@ async def submit_storyboard_video_generation(
             "generation_mode": payload.generation_mode,
             "resolution": resolution,
             "return_last_frame": payload.return_last_frame,
-            "reference_start_frame_url": reference_start_frame_url,
             "reference_images": reference_images,
             "dropped_reference_images": dropped_reference_images,
             "first_frame_url": payload.first_frame_url,
@@ -133,7 +124,6 @@ async def submit_storyboard_video_generation(
         "video_generation_mode": payload.generation_mode,
         "video_generation_resolution": resolution,
         "video_generation_return_last_frame": payload.return_last_frame,
-        **({"video_generation_reference_start_frame_url": reference_start_frame_url} if reference_start_frame_url else {}),
     }
     await db.commit()
 
@@ -295,26 +285,11 @@ async def _collect_reference_images(
     payload: ProjectStoryboardVideoGenerateRequest,
 ) -> List[str]:
     urls: List[str] = []
-    explicit_start_frame = _explicit_reference_start_frame_url(payload) if payload.generation_mode == "reference" else ""
-    if explicit_start_frame:
-        urls.append(explicit_start_frame)
     urls.extend(payload.uploaded_images or [])
     urls.extend(await _asset_reference_images(db, ProjectCharacter, project_id, user_id, payload.character_ids))
     urls.extend(await _asset_reference_images(db, ProjectScene, project_id, user_id, payload.scene_ids))
     urls.extend(await _asset_reference_images(db, ProjectProp, project_id, user_id, payload.prop_ids))
     return await _resolve_reference_image_urls(db, _dedupe(urls))
-
-
-def _reference_start_frame_url(payload: ProjectStoryboardVideoGenerateRequest) -> str:
-    if payload.generation_mode != "reference":
-        return ""
-    explicit_url = _explicit_reference_start_frame_url(payload)
-    if explicit_url:
-        return explicit_url
-    uploaded_url = _first_url(payload.uploaded_images)
-    if uploaded_url:
-        return uploaded_url
-    return ""
 
 
 async def _resolve_reference_image_urls(db: AsyncSession, urls: List[str]) -> List[str]:
@@ -338,13 +313,6 @@ async def _resolve_reference_image_urls(db: AsyncSession, urls: List[str]) -> Li
     return _dedupe(resolved)
 
 
-async def _resolve_reference_image_url(db: AsyncSession, url: str) -> str:
-    if not url:
-        return ""
-    resolved = await _resolve_reference_image_urls(db, [url])
-    return resolved[0] if resolved else url
-
-
 def _material_id_from_image_url(value: Any) -> Optional[UUID]:
     url = _clean_url(value)
     if not url:
@@ -364,29 +332,6 @@ def _material_id_from_image_url(value: Any) -> Optional[UUID]:
         except ValueError:
             return None
     return None
-
-
-def _explicit_reference_start_frame_url(payload: ProjectStoryboardVideoGenerateRequest) -> str:
-    extra = payload.extra or {}
-    for value in (
-        payload.reference_start_frame_url,
-        extra.get("reference_start_frame_url"),
-        extra.get("reference_first_frame_url"),
-        extra.get("start_frame_reference_url"),
-        payload.first_frame_url if payload.generation_mode == "reference" else None,
-    ):
-        cleaned = _clean_url(value)
-        if cleaned:
-            return cleaned
-    return ""
-
-
-def _first_url(values: List[str]) -> str:
-    for value in values or []:
-        cleaned = _clean_url(value)
-        if cleaned:
-            return cleaned
-    return ""
 
 
 def _clean_url(value: Any) -> str:
@@ -466,13 +411,10 @@ def _build_storyboard_video_extra(
     storyboard: ProjectStoryboard,
     reference_images: List[str],
     resolution: str,
-    reference_start_frame_url: str = "",
 ) -> Dict[str, Any]:
     extra = dict(payload.extra or {})
     extra["resolution"] = resolution
     extra["return_last_frame"] = payload.return_last_frame
-    if reference_start_frame_url:
-        extra["reference_start_frame_url"] = reference_start_frame_url
     extra.setdefault("aspect_ratio", project.generation_ratio)
     extra.setdefault("ratio", project.generation_ratio)
     explicit_duration_seconds = _explicit_duration_seconds(extra)
@@ -608,7 +550,6 @@ def _build_storyboard_video_prompt(
     generation_mode: str = "reference",
     first_frame_url: Optional[str] = None,
     last_frame_url: Optional[str] = None,
-    reference_start_frame_url: str = "",
 ) -> str:
     style_prompt = _clean_prompt_part(project.style.prompt if project.style else "")
     main_visual = _first_prompt_part(
@@ -628,16 +569,8 @@ def _build_storyboard_video_prompt(
             generation_mode,
             bool(first_frame_url),
             bool(last_frame_url),
-            bool(reference_start_frame_url),
         )
     ]
-
-    if generation_mode == "reference" and reference_start_frame_url:
-        parts.append(
-            "第一张上传参考图是上一分镜尾帧图，必须作为本分镜视频的起始画面参考；"
-            "视频开场应从这张图的构图、主体位置、人物姿态、场景状态和关键道具位置继续，"
-            "其余人物参考图、场景参考图、道具参考图只用于保持身份、外观和环境一致。"
-        )
 
     if style_prompt:
         parts.append(f"整体画面风格为：{style_prompt}")
@@ -698,7 +631,6 @@ def _video_generation_constraint(
     generation_mode: str,
     has_first_frame: bool = False,
     has_last_frame: bool = False,
-    has_reference_start_frame: bool = False,
 ) -> str:
     if generation_mode == "first_last_frame":
         if has_first_frame and has_last_frame:
@@ -726,13 +658,6 @@ def _video_generation_constraint(
     if generation_mode == "storyboard":
         return (
             "请根据当前分镜和故事板参考生成一段连续镜头视频，保持分镜剧情、人物、场景、道具、动作顺序和画面收束一致，"
-            "不新增主要人物、场景或关键道具。"
-        )
-    if has_reference_start_frame:
-        return (
-            "请根据当前分镜和多张参考图生成一段连续镜头视频。第一张上传参考图是上一分镜尾帧图，"
-            "必须作为本分镜视频开场的首帧参考；视频开始时的人物、场景、道具、构图和画面状态应承接这张图，"
-            "后续动作、运镜和焦点变化再按当前分镜自然展开。其余参考图用于保持人物身份、场景外观和道具一致，"
             "不新增主要人物、场景或关键道具。"
         )
     return (

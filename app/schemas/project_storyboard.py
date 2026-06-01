@@ -210,7 +210,6 @@ class ProjectStoryboardVideoGenerateRequest(ProjectStoryboardRequestModel):
     resolution: Literal["480p", "720p", "1080p"] = "720p"
     return_last_frame: bool = False
     prompt: Optional[str] = Field(default=None, min_length=1)
-    reference_start_frame_url: Optional[str] = Field(default=None, max_length=2048)
     character_ids: List[UUID] = Field(default_factory=list)
     scene_ids: List[UUID] = Field(default_factory=list)
     prop_ids: List[UUID] = Field(default_factory=list)
@@ -225,7 +224,7 @@ class ProjectStoryboardVideoGenerateRequest(ProjectStoryboardRequestModel):
         if not isinstance(value, dict):
             return value
         data = dict(value)
-        for key in ("reference_start_frame_url", "first_frame_url", "last_frame_url"):
+        for key in ("first_frame_url", "last_frame_url"):
             data[key] = _extract_request_media_url(data.get(key)) or data.get(key)
         if "uploaded_images" in data:
             data["uploaded_images"] = [
@@ -267,6 +266,5 @@ class ProjectStoryboardVideoGenerateOut(SchemaBaseModel):
     generation_mode: str
     resolution: str
     return_last_frame: bool
-    reference_start_frame_url: Optional[str] = None
     status: str
     points_cost: int
