@@ -35,7 +35,7 @@ async def list_project_assets(
     result = await db.execute(
         select(model)
         .where(*conditions)
-        .order_by(model.updated_at.desc())
+        .order_by(model.created_at.desc(), model.id.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
@@ -62,7 +62,7 @@ async def list_project_asset_options(
     result = await db.execute(
         select(model)
         .where(*conditions)
-        .order_by(model.reference_image.is_(None).asc(), model.updated_at.desc())
+        .order_by(model.created_at.desc(), model.id.desc())
         .limit(limit)
     )
     return [_asset_option_payload(item, asset_type) for item in result.scalars().all()], total

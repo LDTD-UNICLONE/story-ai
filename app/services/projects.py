@@ -34,7 +34,7 @@ async def list_projects(
         select(Project)
         .options(selectinload(Project.style))
         .where(*conditions)
-        .order_by(Project.updated_at.desc())
+        .order_by(Project.created_at.desc(), Project.id.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )

@@ -90,13 +90,23 @@ async def get_project_storyboard_or_404(
     storyboard = result.scalar_one_or_none()
     if storyboard is None:
         raise AppException("项目分镜不存在", code=40410, status_code=404)
-    await reconcile_storyboard_video_task(db, storyboard)
+    await reconcile_storyboard_media_tasks(db, storyboard)
     return storyboard
 
 
-async def reconcile_storyboard_video_task(db: AsyncSession, storyboard: ProjectStoryboard) -> None:
-    task_record_id = (storyboard.extra or {}).get("video_generation_task_record_id")
-    status = (storyboard.extra or {}).get("video_generation_status")
+async def reconcile_storyboard_media_tasks(db: AsyncSession, storyboard: ProjectStoryboard) -> None:
+    await _reconcile_storyboard_media_task(db, storyboard, "image_generation_task_record_id", "image_generation_status")
+    await _reconcile_storyboard_media_task(db, storyboard, "video_generation_task_record_id", "video_generation_status")
+
+
+async def _reconcile_storyboard_media_task(
+    db: AsyncSession,
+    storyboard: ProjectStoryboard,
+    task_key: str,
+    status_key: str,
+) -> None:
+    task_record_id = (storyboard.extra or {}).get(task_key)
+    status = (storyboard.extra or {}).get(status_key)
     if not task_record_id or status not in {"pending", "running"}:
         return
     parsed_task_record_id = _parse_uuid(task_record_id)
@@ -308,14 +318,13 @@ async def submit_storyboard_refinement(
         user_id=user.id,
     )
     storyboards = await _list_enabled_storyboards(db, project_id, chapter_id, user.id)
+    continuity_context = _storyboard_continuity_context(storyboards, storyboard)
 
     prompt = render_system_prompt(
         "storyboard_refinement.md",
         storyboard_unit=json.dumps(_storyboard_unit_payload(storyboard), ensure_ascii=False),
-        continuity_context=json.dumps(
-            _storyboard_continuity_context(storyboards, storyboard),
-            ensure_ascii=False,
-        ),
+        previous_storyboard=json.dumps(continuity_context.get("previous"), ensure_ascii=False),
+        next_storyboard=json.dumps(continuity_context.get("next"), ensure_ascii=False),
         characters=await _dump_storyboard_assets(db, ProjectCharacter, project_id, user.id),
         scenes=await _dump_storyboard_assets(db, ProjectScene, project_id, user.id),
         props=await _dump_storyboard_assets(db, ProjectProp, project_id, user.id),
@@ -330,7 +339,7 @@ async def submit_storyboard_refinement(
         extra=payload.extra,
         storyboard=storyboard,
         generation_type="storyboard_refinement",
-        title_prefix="分镜细化与视频提示词生成",
+        title_prefix="分镜细化字段生成",
         status_key="storyboard_refinement_status",
         task_key="storyboard_refinement_task_record_id",
     )
@@ -352,12 +361,9 @@ async def submit_storyboard_image_prompt_generation(
         storyboard_id=storyboard_id,
         user_id=user.id,
     )
-    if not storyboard.screen_execution:
-        raise AppException("请先完成分镜细化或填写画面执行，再生成故事板提示词", code=40032, status_code=400)
-
     prompt = render_system_prompt(
         "storyboard_image_prompt_generation.md",
-        storyboard_execution_item=json.dumps(_storyboard_execution_payload(storyboard), ensure_ascii=False),
+        storyboard_unit=json.dumps(_storyboard_image_prompt_unit_payload(storyboard), ensure_ascii=False),
         characters=await _dump_storyboard_assets(db, ProjectCharacter, project_id, user.id),
         scenes=await _dump_storyboard_assets(db, ProjectScene, project_id, user.id),
         props=await _dump_storyboard_assets(db, ProjectProp, project_id, user.id),
@@ -371,7 +377,7 @@ async def submit_storyboard_image_prompt_generation(
         prompt=prompt,
         extra=payload.extra,
         storyboard=storyboard,
-        generation_type="storyboard_image_prompt_generation",
+        generation_type="storyboard_image_prompt",
         title_prefix="故事板提示词生成",
         status_key="storyboard_image_prompt_generation_status",
         task_key="storyboard_image_prompt_generation_task_record_id",
@@ -759,7 +765,7 @@ async def run_storyboard_stage_in_worker(
 
     if task_record.generation_type == "storyboard_refinement":
         await _apply_storyboard_refinement_items(db, task_record, chapter, items)
-    elif task_record.generation_type == "storyboard_image_prompt_generation":
+    elif _is_storyboard_image_prompt_generation(task_record.generation_type):
         await _apply_storyboard_image_prompt_items(db, task_record, chapter, items)
     elif task_record.generation_type == "storyboard_prompt_generation":
         await _apply_storyboard_prompt_items(db, task_record, chapter, items)
@@ -910,7 +916,7 @@ def _apply_storyboard_refinement_item(
     storyboard.dialogue = _optional_str(item.get("dialogue"))
     storyboard.sound_effect = _optional_str(item.get("sound_effect"))
     storyboard.atmosphere = _optional_str(_first_value(item, "atmosphere", "氛围参考", "画面氛围"))
-    storyboard.video_prompt = _optional_str(item.get("video_prompt"))
+    storyboard.video_prompt = None
     storyboard.duration_suggestion = _optional_str(item.get("duration_suggestion"), 64)
     storyboard.production_focus = _optional_str(item.get("production_focus"))
     storyboard.negative_prompt = _optional_str(item.get("negative_prompt"))
@@ -931,7 +937,10 @@ def _apply_storyboard_image_prompt_item(
     item: Dict[str, Any],
     now,
 ) -> None:
-    storyboard.image_prompt = _optional_str(item.get("image_prompt"))
+    storyboard.image_prompt = _optional_str(_first_value(item, "image_prompt", "图像提示词"))
+    storyboard.video_prompt = _optional_str(_first_value(item, "video_prompt", "视频提示词"))
+    storyboard.duration_suggestion = _optional_str(_first_value(item, "duration_suggestion", "时长建议"), 64)
+    storyboard.negative_prompt = _optional_str(_first_value(item, "negative_prompt", "负面规避词", "负面规避"))
     storyboard.extra = {
         **_clear_status_retry_state(storyboard.extra or {}, "storyboard_image_prompt_generation_status"),
         "storyboard_image_prompt_generation_status": "success",
@@ -971,7 +980,7 @@ def parse_storyboard_stage_items(content: str, generation_type: str) -> List[Dic
             for index, item in enumerate(items or [], start=1)
             if isinstance(item, dict)
         ]
-    if generation_type == "storyboard_image_prompt_generation":
+    if _is_storyboard_image_prompt_generation(generation_type):
         items = _extract_items_by_keys(
             payload,
             (
@@ -1033,7 +1042,6 @@ def _normalize_storyboard_refinement_item(item: Dict[str, Any], index: int) -> D
         "dialogue": _first_value(item, "dialogue", "台词") or "",
         "sound_effect": _first_value(item, "sound_effect", "音效") or "",
         "atmosphere": _first_value(item, "atmosphere", "氛围参考", "画面氛围") or "",
-        "video_prompt": _first_value(item, "video_prompt", "视频提示词") or "",
         "duration_suggestion": _first_value(item, "duration_suggestion", "时长建议") or "",
         "production_focus": _first_value(item, "production_focus", "制作重点", "制作重点提示词") or "",
         "negative_prompt": _first_value(item, "negative_prompt", "负面规避词", "负面规避") or "",
@@ -1055,6 +1063,9 @@ def _normalize_storyboard_image_prompt_item(item: Dict[str, Any], index: int) ->
         **item,
         "shot_number": _first_value(item, "shot_number", "分镜序号") or index,
         "image_prompt": _first_value(item, "image_prompt", "图像提示词") or "",
+        "video_prompt": _first_value(item, "video_prompt", "视频提示词") or "",
+        "duration_suggestion": _first_value(item, "duration_suggestion", "时长建议") or "",
+        "negative_prompt": _first_value(item, "negative_prompt", "负面规避词", "负面规避") or "",
     }
 
 
@@ -1225,6 +1236,14 @@ def _storyboard_execution_payload(storyboard: ProjectStoryboard) -> Dict[str, An
     }
 
 
+def _storyboard_image_prompt_unit_payload(storyboard: ProjectStoryboard) -> Dict[str, Any]:
+    return {
+        "shot_number": storyboard.shot_number,
+        "title": storyboard.title,
+        "source_content": storyboard.source_content,
+    }
+
+
 def _storyboard_continuity_context(
     storyboards: List[ProjectStoryboard],
     current: ProjectStoryboard,
@@ -1316,7 +1335,7 @@ def _task_storyboard_id(task_record: UserTaskRecord) -> Optional[UUID]:
 def _storyboard_stage_keys(generation_type: str) -> Tuple[str, str]:
     if generation_type == "storyboard_refinement":
         return "storyboard_refinement_status", "storyboard_refinement_task_record_id"
-    if generation_type == "storyboard_image_prompt_generation":
+    if _is_storyboard_image_prompt_generation(generation_type):
         return "storyboard_image_prompt_generation_status", "storyboard_image_prompt_generation_task_record_id"
     if generation_type == "storyboard_prompt_generation":
         return "storyboard_prompt_generation_status", "storyboard_prompt_generation_task_record_id"
@@ -1325,12 +1344,16 @@ def _storyboard_stage_keys(generation_type: str) -> Tuple[str, str]:
 
 def _storyboard_stage_title(generation_type: str) -> str:
     if generation_type == "storyboard_refinement":
-        return "分镜细化与视频提示词生成"
-    if generation_type == "storyboard_image_prompt_generation":
+        return "分镜细化字段生成"
+    if _is_storyboard_image_prompt_generation(generation_type):
         return "故事板提示词生成"
     if generation_type == "storyboard_prompt_generation":
         return "视频提示词生成"
     return "分镜制作"
+
+
+def _is_storyboard_image_prompt_generation(generation_type: str) -> bool:
+    return generation_type in {"storyboard_image_prompt", "storyboard_image_prompt_generation"}
 
 
 def _clear_task_retry_state(extra: Dict[str, Any]) -> Dict[str, Any]:

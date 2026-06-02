@@ -59,8 +59,14 @@ async def submit_storyboard_video_generation(
     project = await _get_project_with_style_or_404(db, project_id, user.id)
     ai_model = await _get_enabled_video_model_or_404(db, payload.ai_model_id)
     resolution = _normalize_storyboard_video_resolution(ai_model, payload.resolution)
+    previous_ending_frame = await _previous_storyboard_ending_frame(db, project_id, chapter_id, storyboard, user.id)
 
-    reference_images = await _collect_reference_images(db, project_id, user.id, payload)
+    reference_images = await _collect_reference_images(db, project_id, user.id, payload, storyboard)
+    if payload.generation_mode == "storyboard":
+        if not _clean_prompt_part(storyboard.video_prompt):
+            raise AppException("请先生成故事板提示词，再使用故事版生成视频", code=40033, status_code=400)
+        if not reference_images:
+            raise AppException("请先生成故事版图像后再使用故事版生成视频", code=40034, status_code=400)
     reference_images, dropped_reference_images = _limit_reference_images_for_model(ai_model, payload, reference_images)
     model_extra = _build_storyboard_video_extra(
         project,
@@ -77,6 +83,8 @@ async def submit_storyboard_video_generation(
         payload.generation_mode,
         payload.first_frame_url,
         payload.last_frame_url,
+        previous_ending_frame,
+        model_extra,
     )
     points_cost = calculate_submission_points_cost(ai_model, "video", model_extra)
 
@@ -110,6 +118,7 @@ async def submit_storyboard_video_generation(
             "generation_mode": payload.generation_mode,
             "resolution": resolution,
             "return_last_frame": payload.return_last_frame,
+            "previous_ending_frame": previous_ending_frame,
             "reference_images": reference_images,
             "dropped_reference_images": dropped_reference_images,
             "first_frame_url": payload.first_frame_url,
@@ -264,6 +273,30 @@ async def _get_project_with_style_or_404(db: AsyncSession, project_id: UUID, use
     return project
 
 
+async def _previous_storyboard_ending_frame(
+    db: AsyncSession,
+    project_id: UUID,
+    chapter_id: UUID,
+    storyboard: ProjectStoryboard,
+    user_id: UUID,
+) -> str:
+    result = await db.execute(
+        select(ProjectStoryboard)
+        .where(
+            ProjectStoryboard.project_id == project_id,
+            ProjectStoryboard.chapter_id == chapter_id,
+            ProjectStoryboard.user_id == user_id,
+            ProjectStoryboard.is_enabled.is_(True),
+        )
+        .order_by(ProjectStoryboard.shot_number.asc(), ProjectStoryboard.created_at.asc())
+    )
+    storyboards = list(result.scalars().all())
+    current_index = next((index for index, item in enumerate(storyboards) if item.id == storyboard.id), -1)
+    if current_index <= 0:
+        return ""
+    return _clean_prompt_part(storyboards[current_index - 1].ending_frame)
+
+
 async def _get_enabled_video_model_or_404(db: AsyncSession, ai_model_id: UUID) -> AiModel:
     result = await db.execute(
         select(AiModel).where(
@@ -283,13 +316,30 @@ async def _collect_reference_images(
     project_id: UUID,
     user_id: UUID,
     payload: ProjectStoryboardVideoGenerateRequest,
+    storyboard: Optional[ProjectStoryboard] = None,
 ) -> List[str]:
     urls: List[str] = []
+    if payload.generation_mode == "storyboard" and storyboard is not None:
+        urls.extend(_storyboard_reference_images(storyboard))
+        return await _resolve_reference_image_urls(db, _dedupe(urls))
     urls.extend(payload.uploaded_images or [])
     urls.extend(await _asset_reference_images(db, ProjectCharacter, project_id, user_id, payload.character_ids))
     urls.extend(await _asset_reference_images(db, ProjectScene, project_id, user_id, payload.scene_ids))
     urls.extend(await _asset_reference_images(db, ProjectProp, project_id, user_id, payload.prop_ids))
     return await _resolve_reference_image_urls(db, _dedupe(urls))
+
+
+def _storyboard_reference_images(storyboard: ProjectStoryboard) -> List[str]:
+    extra = storyboard.extra or {}
+    urls: List[str] = []
+    for key in ("image_generation_result", "storyboard_image_result"):
+        url = _first_url(extra.get(key))
+        if url:
+            urls.append(url)
+    result_urls = extra.get("image_generation_result_urls")
+    if isinstance(result_urls, list):
+        urls.extend(_first_url(item) for item in result_urls)
+    return _dedupe([url for url in urls if url])
 
 
 async def _resolve_reference_image_urls(db: AsyncSession, urls: List[str]) -> List[str]:
@@ -340,11 +390,28 @@ def _clean_url(value: Any) -> str:
     return str(value).strip()
 
 
+def _first_url(value: Any) -> str:
+    if isinstance(value, list):
+        for item in value:
+            url = _first_url(item)
+            if url:
+                return url
+        return ""
+    for item in str(value or "").split(","):
+        url = item.strip()
+        if url.startswith(("http://", "https://")):
+            return url
+    return ""
+
+
 def _limit_reference_images_for_model(
     ai_model: AiModel,
     payload: ProjectStoryboardVideoGenerateRequest,
     reference_images: List[str],
 ) -> Tuple[List[str], List[str]]:
+    if payload.generation_mode == "storyboard":
+        return reference_images[:1], reference_images[1:]
+
     max_images = _model_image_limit(ai_model)
     if max_images is None:
         return reference_images, []
@@ -413,6 +480,8 @@ def _build_storyboard_video_extra(
     resolution: str,
 ) -> Dict[str, Any]:
     extra = dict(payload.extra or {})
+    if payload.generation_mode == "storyboard":
+        _clear_video_reference_image_extra(extra)
     extra["resolution"] = resolution
     extra["return_last_frame"] = payload.return_last_frame
     extra.setdefault("aspect_ratio", project.generation_ratio)
@@ -439,6 +508,21 @@ def _build_storyboard_video_extra(
         if media_items:
             extra["media_items"] = media_items
     return extra
+
+
+def _clear_video_reference_image_extra(extra: Dict[str, Any]) -> None:
+    for key in (
+        "image",
+        "images",
+        "image_url",
+        "image_urls",
+        "reference_image",
+        "reference_images",
+        "reference_image_url",
+        "reference_image_urls",
+        "uploaded_images",
+    ):
+        extra.pop(key, None)
 
 
 def _storyboard_duration_seconds(storyboard: ProjectStoryboard) -> Optional[int]:
@@ -550,19 +634,22 @@ def _build_storyboard_video_prompt(
     generation_mode: str = "reference",
     first_frame_url: Optional[str] = None,
     last_frame_url: Optional[str] = None,
+    previous_ending_frame: str = "",
+    model_extra: Optional[Dict[str, Any]] = None,
 ) -> str:
+    if generation_mode == "storyboard":
+        return _build_storyboard_reference_video_prompt(project, storyboard, custom_prompt, model_extra)
+
     style_prompt = _clean_prompt_part(project.style.prompt if project.style else "")
-    main_visual = _first_prompt_part(
-        storyboard.video_prompt,
-        storyboard.screen_execution,
-        storyboard.action,
-    )
+    opening_visual = _first_prompt_part(previous_ending_frame, storyboard.screen_execution, storyboard.action)
     action = _first_prompt_part(storyboard.character_action, storyboard.action)
     character_expression = _clean_prompt_part(storyboard.character_expression)
     scene_name = _clean_prompt_part(storyboard.scene_name)
     scene_state = _clean_prompt_part(storyboard.scene_state)
-    atmosphere = _first_prompt_part(storyboard.atmosphere, storyboard.sound_effect)
+    atmosphere = _clean_prompt_part(storyboard.atmosphere)
+    sound_effect = _clean_prompt_part(storyboard.sound_effect)
     screen_execution = _clean_prompt_part(storyboard.screen_execution)
+    duration_suggestion = _clean_prompt_part(storyboard.duration_suggestion)
 
     parts = [
         _video_generation_constraint(
@@ -575,16 +662,23 @@ def _build_storyboard_video_prompt(
     if style_prompt:
         parts.append(f"整体画面风格为：{style_prompt}")
 
+    if duration_suggestion:
+        parts.append(
+            f"视频建议时长：{duration_suggestion}。"
+            "所有动作、运镜、表情、台词、声音节奏、氛围变化和结尾画面都必须在该时长内自然完成，"
+            "画面中不得出现任何时间文字。"
+        )
+
     if scene_name or scene_state:
-        scene_text = f"画面发生在{scene_name}" if scene_name else "画面场景"
+        scene_text = f"画面发生在{scene_name}" if scene_name else "画面发生在当前分镜场景"
         if scene_state:
             scene_text += f"，场景状态为{scene_state}"
         parts.append(scene_text + "。")
 
-    if main_visual:
-        parts.append(f"视频从以下画面开始：{main_visual}")
+    if opening_visual:
+        parts.append(f"视频开场画面：{opening_visual}")
 
-    if screen_execution and not _same_prompt_part(screen_execution, main_visual):
+    if screen_execution:
         parts.append(f"画面执行：{screen_execution}")
 
     if action:
@@ -606,10 +700,19 @@ def _build_storyboard_video_prompt(
     if atmosphere:
         parts.append(f"画面氛围参考：{atmosphere}")
 
-    if storyboard.dialogue and storyboard.dialogue.strip():
+    if sound_effect:
+        sound_effect_sentence = _as_prompt_sentence(f"声音与节奏参考：{sound_effect}")
         parts.append(
-            f"角色按原文台词说话：{storyboard.dialogue.strip()}。"
-            "台词只作为角色说话动作、口型和表演参考，不生成字幕文字。"
+            sound_effect_sentence +
+            "声音与节奏只作为动作节奏和氛围参考，不生成字幕文字、声音文字或可视化音效文字。"
+        )
+
+    if storyboard.dialogue and storyboard.dialogue.strip():
+        dialogue_sentence = _as_prompt_sentence(f"角色按原文台词进行说话表演：{storyboard.dialogue.strip()}")
+        parts.append(
+            dialogue_sentence +
+            "台词只用于嘴型、停顿、视线和表演节奏参考，"
+            "画面中不得出现字幕、气泡文字、台词文字或任何屏幕文字。"
         )
 
     if storyboard.production_focus and storyboard.production_focus.strip():
@@ -622,9 +725,61 @@ def _build_storyboard_video_prompt(
         parts.append(f"避免出现：{storyboard.negative_prompt.strip()}")
 
     if custom_prompt and custom_prompt.strip():
-        parts.append(f"用户补充要求：{custom_prompt.strip()}")
+        custom_prompt_sentence = _as_prompt_sentence(f"用户补充要求：{custom_prompt.strip()}")
+        parts.append(
+            custom_prompt_sentence +
+            "用户补充要求只能补充当前镜头的表现方式，不得覆盖当前分镜剧情、人物资产、场景资产、"
+            "道具资产、参考图一致性、视频建议时长、制作重点和负面规避要求。"
+        )
 
-    return "\n".join(parts)
+    return "\n\n".join(parts)
+
+
+def _build_storyboard_reference_video_prompt(
+    project: Project,
+    storyboard: ProjectStoryboard,
+    custom_prompt: Optional[str],
+    model_extra: Optional[Dict[str, Any]] = None,
+) -> str:
+    style_prompt = _clean_prompt_part(project.style.prompt if project.style else "")
+    duration_suggestion = _video_prompt_duration_text(storyboard, model_extra or {})
+    video_prompt = _clean_prompt_part(storyboard.video_prompt)
+    dialogue = _clean_prompt_part(storyboard.dialogue)
+    user_prompt = _clean_prompt_part(custom_prompt)
+    negative_prompt = _clean_prompt_part(storyboard.negative_prompt)
+
+    return "\n".join(
+        [
+            "请根据当前分镜的故事版参考图、连续视频画面提示词、整体画面风格和用户补充要求，生成一段连续视频。",
+            "当前视频必须以故事版参考图为主要视觉依据，保持故事版参考图中的人物形象、服装、场景空间、道具位置、构图关系、画面氛围和镜头顺序一致。",
+            f"整体画面风格：{style_prompt}",
+            f"视频建议总时长：{duration_suggestion}",
+            f"连续视频画面提示词：{video_prompt}",
+            f"原文台词参考：{dialogue}",
+            "生成要求：",
+            "1. 必须参考故事版图像生成视频，故事版图像中的人物、服装、场景、道具、构图和空间关系优先保持一致。",
+            "2. 严格按照 video_prompt 中的“通用要求、镜头一、镜头二、镜头三、最后停留画面”进行视频生成。",
+            "3. 每个镜头的秒数必须与 video_prompt 中括号秒数一致。",
+            f"4. 所有镜头总时长必须等于 {duration_suggestion}。",
+            "5. 镜头之间必须保持人物身份、服装、发型、场景空间、道具位置、道具状态、动作方向和视线方向连续。",
+            "6. 每个镜头只表现对应故事版图像的动态画面，不新增当前分镜之外的新剧情。",
+            "7. 可以根据 video_prompt 让故事版图像中的人物产生自然动作、表情变化、视线变化、轻微运镜和焦点变化。",
+            "8. 不得改变故事版图像中的主体身份、人物服装、主要场景、关键道具和主要构图关系。",
+            "9. 台词只用于人物嘴型、停顿、视线和表演节奏参考，不生成字幕、气泡文字或台词文字。",
+            "10. 画面中不得出现字幕、气泡文字、台词文字、屏幕文字、水印、标志或界面元素。",
+            "11. 视频最后必须停留在 video_prompt 中的“最后停留画面”。",
+            f"用户补充要求：{user_prompt}",
+            "用户补充要求只能补充当前视频表现方式，例如动作强度、节奏、氛围、镜头运动或画面质感；不得覆盖当前分镜剧情、故事版参考图、人物资产、场景资产、道具资产、视频建议总时长、镜头连续性和负面规避要求。",
+            f"负面规避：{negative_prompt}",
+        ]
+    )
+
+
+def _video_prompt_duration_text(storyboard: ProjectStoryboard, model_extra: Dict[str, Any]) -> str:
+    seconds = _parse_duration_value_seconds(model_extra.get("duration_seconds") or model_extra.get("duration"))
+    if seconds:
+        return f"{seconds}秒"
+    return _clean_prompt_part(storyboard.duration_suggestion)
 
 
 def _video_generation_constraint(

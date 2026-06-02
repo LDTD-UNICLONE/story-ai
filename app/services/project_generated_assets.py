@@ -17,7 +17,7 @@ PROJECT_GENERATED_ASSET_TARGETS = {
     "character": {"model": ProjectCharacter, "media_type": "image"},
     "scene": {"model": ProjectScene, "media_type": "image"},
     "prop": {"model": ProjectProp, "media_type": "image"},
-    "storyboard": {"model": ProjectStoryboard, "media_type": "video"},
+    "storyboard": {"model": ProjectStoryboard, "media_type": ("image", "video")},
 }
 
 
@@ -98,7 +98,7 @@ async def list_project_generated_asset_history(
     result = await db.execute(
         select(ProjectGeneratedAsset)
         .where(*conditions)
-        .order_by(ProjectGeneratedAsset.is_selected.desc(), ProjectGeneratedAsset.created_at.desc())
+        .order_by(ProjectGeneratedAsset.created_at.desc(), ProjectGeneratedAsset.id.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
@@ -191,9 +191,11 @@ async def _ensure_target_access(
     config = PROJECT_GENERATED_ASSET_TARGETS.get(target_type)
     if config is None:
         raise AppException("不支持的生成历史目标类型", code=40033, status_code=400)
-    expected_media_type = config["media_type"]
-    if media_type and media_type != expected_media_type:
+    expected_media_types = _as_media_types(config["media_type"])
+    if media_type and media_type not in expected_media_types:
         raise AppException("生成历史媒体类型不匹配", code=40035, status_code=400)
+    if not media_type and len(expected_media_types) != 1:
+        raise AppException("请选择生成历史媒体类型", code=40035, status_code=400)
     model = config["model"]
     result = await db.execute(
         select(model).where(
@@ -206,19 +208,22 @@ async def _ensure_target_access(
     target = result.scalar_one_or_none()
     if target is None:
         raise AppException("目标资产不存在", code=40413, status_code=404)
-    return target if return_target else expected_media_type
+    resolved_media_type = media_type or expected_media_types[0]
+    return target if return_target else resolved_media_type
 
 
 def _apply_selected_history_to_target(target: Any, history: ProjectGeneratedAsset, selected_url: Optional[str]) -> None:
     now = beijing_datetime()
     if history.media_type == "image":
-        target.reference_image = selected_url
         target.extra = {
             **(target.extra or {}),
             "image_generation_status": "selected",
             "image_generation_history_id": str(history.id),
             "image_generation_task_record_id": str(history.task_record_id) if history.task_record_id else "",
+            "image_generation_result": selected_url or "",
         }
+        if hasattr(target, "reference_image"):
+            target.reference_image = selected_url
     elif history.media_type == "video":
         target.extra = {
             **(target.extra or {}),
@@ -237,6 +242,14 @@ def _select_result_url(history: ProjectGeneratedAsset, result_url: Optional[str]
     if result_url not in (history.result_urls or []):
         raise AppException("选择的结果地址不属于该生成历史", code=40036, status_code=400)
     return result_url
+
+
+def _as_media_types(value: Any) -> Tuple[str, ...]:
+    if isinstance(value, tuple):
+        return value
+    if isinstance(value, list):
+        return tuple(str(item) for item in value)
+    return (str(value),)
 
 
 def _dedupe_urls(urls: List[str]) -> List[str]:

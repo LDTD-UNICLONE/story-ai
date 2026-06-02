@@ -45,6 +45,7 @@ celery_app = Celery(
         "app.tasks.project_asset_analysis",
         "app.tasks.project_asset_generation",
         "app.tasks.project_storyboard",
+        "app.tasks.project_storyboard_image",
         "app.tasks.project_storyboard_video",
         "app.tasks.provider_reconcile",
     ],
@@ -70,6 +71,7 @@ celery_app.conf.update(
         "tasks.project_storyboard.run_project_storyboard_analysis": _route("text"),
         "tasks.project_storyboard.run_project_storyboard_stage": _route("text"),
         "tasks.project_asset_generation.run_project_asset_image_generation": _route("image"),
+        "tasks.project_storyboard_image.run_project_storyboard_image_generation": _route("image"),
         "tasks.project_storyboard_video.run_project_storyboard_video_generation": _route("video"),
         "tasks.provider_reconcile.reconcile_provider_task": _route("default"),
         "tasks.provider_reconcile.enqueue_pending_provider_reconciliations": _route("default"),
@@ -154,4 +156,4 @@ def clear_task_logging_context(task_id=None, task=None, state=None, retval=None,
     clear_request_context()
 
 # Ensure tasks are registered when the Celery app is imported by scripts or tests.
-from app.tasks import example, model_generation, project_asset_analysis, project_asset_generation, project_chapter, project_storyboard, project_storyboard_video, provider_reconcile  # noqa: E402,F401
+from app.tasks import example, model_generation, project_asset_analysis, project_asset_generation, project_chapter, project_storyboard, project_storyboard_image, project_storyboard_video, provider_reconcile  # noqa: E402,F401

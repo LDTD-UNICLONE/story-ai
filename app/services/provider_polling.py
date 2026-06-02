@@ -7,7 +7,7 @@ def provider_poll_interval_seconds(generation_type: Optional[str]) -> int:
     normalized = str(generation_type or "").strip()
     if normalized in {"video", "storyboard_video"}:
         return max(10, settings.provider_task_video_poll_interval_seconds)
-    if normalized in {"image", "asset_image_generate"}:
+    if normalized in {"image", "asset_image_generate", "storyboard_image"}:
         return max(5, settings.provider_task_image_poll_interval_seconds)
     return max(5, settings.provider_task_poll_interval_seconds)
 

@@ -194,6 +194,7 @@ class ProjectAssetAnalyzeOut(SchemaBaseModel):
     asset_type: str
     status: str
     points_cost: int
+    next_poll_seconds: Optional[int] = None
 
 
 class ProjectAssetImageGenerateRequest(SchemaBaseModel):
@@ -209,3 +210,4 @@ class ProjectAssetImageGenerateOut(SchemaBaseModel):
     asset_id: UUID
     status: str
     points_cost: int
+    next_poll_seconds: Optional[int] = None

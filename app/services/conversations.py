@@ -86,7 +86,7 @@ async def list_conversations(
     result = await db.execute(
         select(Conversation)
         .where(Conversation.user_id == user_id, Conversation.is_enabled.is_(True))
-        .order_by(Conversation.updated_at.desc())
+        .order_by(Conversation.created_at.desc(), Conversation.id.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
@@ -223,11 +223,15 @@ async def list_conversation_messages(
     )
     total = count_result.scalar_one()
 
-    order_by = ConversationMessage.created_at.desc() if order == "desc" else ConversationMessage.created_at.asc()
+    order_by = (
+        (ConversationMessage.created_at.desc(), ConversationMessage.id.desc())
+        if order == "desc"
+        else (ConversationMessage.created_at.asc(), ConversationMessage.id.asc())
+    )
     result = await db.execute(
         select(ConversationMessage)
         .where(ConversationMessage.conversation_id == conversation_id)
-        .order_by(order_by)
+        .order_by(*order_by)
         .offset((page - 1) * page_size)
         .limit(page_size)
     )

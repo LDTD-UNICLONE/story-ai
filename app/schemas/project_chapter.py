@@ -63,3 +63,4 @@ class ProjectChapterProcessOut(SchemaBaseModel):
     chapter: ProjectChapterOut
     task_record_id: UUID
     points_cost: int
+    next_poll_seconds: Optional[int] = None

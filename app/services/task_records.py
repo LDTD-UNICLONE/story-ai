@@ -37,9 +37,10 @@ TASK_RECORD_GENERATION_TYPES = [
     {"label": "场景资产分析", "value": "scene_analysis", "business_type": "project"},
     {"label": "道具资产分析", "value": "prop_analysis", "business_type": "project"},
     {"label": "分镜制作", "value": "storyboard_analysis", "business_type": "project"},
-    {"label": "分镜细化与视频提示词生成", "value": "storyboard_refinement", "business_type": "project"},
-    {"label": "故事板提示词生成", "value": "storyboard_image_prompt_generation", "business_type": "project"},
+    {"label": "分镜细化字段生成", "value": "storyboard_refinement", "business_type": "project"},
+    {"label": "故事板提示词生成", "value": "storyboard_image_prompt", "business_type": "project"},
     {"label": "资产图像生成", "value": "asset_image_generate", "business_type": "project"},
+    {"label": "分镜故事板图像生成", "value": "storyboard_image", "business_type": "project"},
     {"label": "分镜视频生成", "value": "storyboard_video", "business_type": "project"},
 ]
 
@@ -181,7 +182,7 @@ async def _build_user_task_queue_snapshot(
 
 
 def _media_generation_types() -> Tuple[str, ...]:
-    return ("image", "video", "asset_image_generate", "storyboard_video")
+    return ("image", "video", "asset_image_generate", "storyboard_image", "storyboard_video")
 
 
 async def list_task_records(
@@ -218,7 +219,7 @@ async def list_task_records(
     result = await db.execute(
         select(UserTaskRecord)
         .where(*conditions)
-        .order_by(UserTaskRecord.created_at.desc())
+        .order_by(UserTaskRecord.created_at.desc(), UserTaskRecord.id.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
@@ -491,7 +492,7 @@ async def list_provider_reconcile_candidates(db: AsyncSession, limit: int = 100)
         select(UserTaskRecord)
         .where(
             UserTaskRecord.status.in_(("pending", "running")),
-            UserTaskRecord.generation_type.in_(("image", "video", "asset_image_generate", "storyboard_video")),
+            UserTaskRecord.generation_type.in_(("image", "video", "asset_image_generate", "storyboard_image", "storyboard_video")),
         )
         .order_by(UserTaskRecord.updated_at.asc())
         .limit(limit)
@@ -503,6 +504,8 @@ def _provider_generation_type(record: UserTaskRecord) -> Optional[str]:
     if record.business_type == "conversation" and record.generation_type in {"image", "video"}:
         return record.generation_type
     if record.business_type == "project" and record.generation_type == "asset_image_generate":
+        return "image"
+    if record.business_type == "project" and record.generation_type == "storyboard_image":
         return "image"
     if record.business_type == "project" and record.generation_type == "storyboard_video":
         return "video"
@@ -709,13 +712,16 @@ async def _sync_stale_failed_business_state(
         "prop_analysis",
         "storyboard_analysis",
         "storyboard_refinement",
-        "storyboard_image_prompt_generation",
+        "storyboard_image_prompt",
         "storyboard_prompt_generation",
     }:
         await _sync_chapter_analysis_failed(db, record, reason)
         return
     if record.generation_type == "asset_image_generate":
         await _sync_asset_image_failed(db, record, reason)
+        return
+    if record.generation_type == "storyboard_image":
+        await _sync_storyboard_image_failed(db, record, reason)
         return
     if record.generation_type == "storyboard_video":
         await _sync_storyboard_video_failed(db, record, reason)
@@ -768,7 +774,7 @@ async def _sync_chapter_analysis_failed(db: AsyncSession, record: UserTaskRecord
         "prop_analysis": "prop_analysis_status",
         "storyboard_analysis": "storyboard_analysis_status",
         "storyboard_refinement": "storyboard_refinement_status",
-        "storyboard_image_prompt_generation": "storyboard_image_prompt_generation_status",
+        "storyboard_image_prompt": "storyboard_image_prompt_generation_status",
         "storyboard_prompt_generation": "storyboard_prompt_generation_status",
     }.get(record.generation_type)
     task_key = {
@@ -777,7 +783,7 @@ async def _sync_chapter_analysis_failed(db: AsyncSession, record: UserTaskRecord
         "prop_analysis": "prop_analysis_task_record_id",
         "storyboard_analysis": "storyboard_analysis_task_record_id",
         "storyboard_refinement": "storyboard_refinement_task_record_id",
-        "storyboard_image_prompt_generation": "storyboard_image_prompt_generation_task_record_id",
+        "storyboard_image_prompt": "storyboard_image_prompt_generation_task_record_id",
         "storyboard_prompt_generation": "storyboard_prompt_generation_task_record_id",
     }.get(record.generation_type)
     if not status_key:
@@ -828,6 +834,22 @@ async def _sync_storyboard_video_failed(db: AsyncSession, record: UserTaskRecord
     }
 
 
+async def _sync_storyboard_image_failed(db: AsyncSession, record: UserTaskRecord, reason: str) -> None:
+    storyboard_id = (record.extra or {}).get("storyboard_id")
+    parsed_storyboard_id = _parse_uuid(storyboard_id)
+    if parsed_storyboard_id is None:
+        return
+    storyboard = await db.get(ProjectStoryboard, parsed_storyboard_id)
+    if storyboard is None:
+        return
+    storyboard.extra = {
+        **(storyboard.extra or {}),
+        "image_generation_status": "failed",
+        "image_generation_failed_reason": reason,
+        "image_generation_task_record_id": str(record.id),
+    }
+
+
 async def _mark_reconciled_success(
     db: AsyncSession,
     record: UserTaskRecord,
@@ -848,6 +870,8 @@ async def _mark_reconciled_success(
         await _sync_conversation_message_success(db, record, model_result)
     elif record.generation_type == "asset_image_generate":
         await _sync_asset_image_success(db, record, model_result)
+    elif record.generation_type == "storyboard_image":
+        await _sync_storyboard_image_success(db, record, model_result)
     elif record.generation_type == "storyboard_video":
         await _sync_storyboard_video_success(db, record, model_result)
 
@@ -899,6 +923,8 @@ async def _mark_reconciled_failed(
                 }
     elif record.generation_type == "asset_image_generate":
         await _sync_asset_image_failed(db, record, reason)
+    elif record.generation_type == "storyboard_image":
+        await _sync_storyboard_image_failed(db, record, reason)
     elif record.generation_type == "storyboard_video":
         storyboard_id = (record.extra or {}).get("storyboard_id")
         parsed_storyboard_id = _parse_uuid(storyboard_id)
@@ -1009,6 +1035,59 @@ async def _sync_asset_image_success(
     record.extra = {
         **(record.extra or {}),
         "oss_image_url": image_url,
+        "generated_asset_history_id": str(history.id),
+    }
+
+
+async def _sync_storyboard_image_success(
+    db: AsyncSession,
+    record: UserTaskRecord,
+    model_result: ModelRunResult,
+) -> None:
+    storyboard_id = (record.extra or {}).get("storyboard_id")
+    parsed_storyboard_id = _parse_uuid(storyboard_id)
+    if parsed_storyboard_id is None:
+        return
+    storyboard = await db.get(ProjectStoryboard, parsed_storyboard_id)
+    if storyboard is None:
+        return
+    image_url = _first_result_url(model_result.content)
+    if not image_url:
+        return
+    result_urls = extract_result_urls(model_result.content) or [image_url]
+    history = await create_project_generated_asset_history(
+        db,
+        task_record=record,
+        target_type="storyboard",
+        target_id=parsed_storyboard_id,
+        media_type="image",
+        result_urls=result_urls,
+        result_url=image_url,
+        chapter_id=storyboard.chapter_id,
+        generation_mode="storyboard_image",
+        extra={
+            "storyboard_title": storyboard.title,
+            "shot_number": storyboard.shot_number,
+            "aspect_ratio": (record.extra or {}).get("aspect_ratio"),
+            "reference_images": (record.extra or {}).get("reference_images"),
+            "model_result_extra": model_result.extra,
+        },
+    )
+    storyboard.extra = {
+        **(storyboard.extra or {}),
+        "image_generation_status": "success",
+        "image_generation_history_id": str(history.id),
+        "image_generation_task_record_id": str(record.id),
+        "image_generation_result": image_url,
+        "image_generation_result_urls": result_urls,
+        "image_generation_extra": model_result.extra,
+    }
+    storyboard.updated_at = beijing_datetime()
+    record.result = image_url
+    record.extra = {
+        **(record.extra or {}),
+        "oss_image_url": image_url,
+        "storyboard_image_result": image_url,
         "generated_asset_history_id": str(history.id),
     }
 

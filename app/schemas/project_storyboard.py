@@ -167,10 +167,35 @@ class ProjectStoryboardPromptRequest(ProjectStoryboardRequestModel):
     extra: Optional[Dict[str, Any]] = None
 
 
+class ProjectStoryboardImageGenerateRequest(ProjectStoryboardRequestModel):
+    aspect_ratio: Literal["16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3", "21:9"] = "16:9"
+    prompt: Optional[str] = Field(default=None, min_length=1)
+    character_ids: List[UUID] = Field(default_factory=list)
+    scene_ids: List[UUID] = Field(default_factory=list)
+    prop_ids: List[UUID] = Field(default_factory=list)
+    uploaded_images: List[str] = Field(default_factory=list)
+    extra: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_media_url_fields(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        if "uploaded_images" in data:
+            data["uploaded_images"] = [
+                url
+                for url in (_extract_request_media_url(item) for item in _as_request_list(data.get("uploaded_images")))
+                if url
+            ]
+        return data
+
+
 class ProjectStoryboardAnalyzeOut(SchemaBaseModel):
     task_record_id: UUID
     status: str
     points_cost: int
+    next_poll_seconds: Optional[int] = None
 
 
 class ProjectStoryboardUnitRequest(ProjectStoryboardRequestModel):
@@ -268,3 +293,13 @@ class ProjectStoryboardVideoGenerateOut(SchemaBaseModel):
     return_last_frame: bool
     status: str
     points_cost: int
+    next_poll_seconds: Optional[int] = None
+
+
+class ProjectStoryboardImageGenerateOut(SchemaBaseModel):
+    task_record_id: UUID
+    storyboard_id: UUID
+    aspect_ratio: str
+    status: str
+    points_cost: int
+    next_poll_seconds: Optional[int] = None

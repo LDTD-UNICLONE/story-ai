@@ -1,9 +1,11 @@
+from typing import Literal, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.api.v1.endpoints.task_polling import set_task_poll_headers, task_next_poll_seconds
 from app.core.responses import success
 from app.db.session import get_db
 from app.models.user import User
@@ -11,6 +13,8 @@ from app.schemas.project_storyboard import (
     ProjectStoryboardAnalyzeOut,
     ProjectStoryboardAnalyzeRequest,
     ProjectStoryboardCreateRequest,
+    ProjectStoryboardImageGenerateOut,
+    ProjectStoryboardImageGenerateRequest,
     ProjectStoryboardListOut,
     ProjectStoryboardMergeRequest,
     ProjectStoryboardOut,
@@ -43,6 +47,7 @@ from app.services.project_storyboards import (
     submit_storyboard_refinement,
     update_project_storyboard,
 )
+from app.services.project_storyboard_images import submit_storyboard_image_generation
 from app.services.project_storyboard_videos import submit_storyboard_video_generation
 
 router = APIRouter(prefix="/projects/{project_id}/chapters/{chapter_id}/storyboards")
@@ -97,6 +102,7 @@ async def analyze_my_project_storyboards(
     project_id: UUID,
     chapter_id: UUID,
     payload: ProjectStoryboardAnalyzeRequest,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -111,7 +117,9 @@ async def analyze_my_project_storyboards(
         task_record_id=task_record.id,
         status=task_record.status,
         points_cost=points_cost,
+        next_poll_seconds=task_next_poll_seconds(task_record),
     )
+    set_task_poll_headers(response, data.next_poll_seconds)
     return success(data=data.model_dump(mode="json"), message="任务已提交")
 
 
@@ -145,6 +153,7 @@ async def refine_my_project_storyboard(
     chapter_id: UUID,
     storyboard_id: UUID,
     payload: ProjectStoryboardRefineRequest,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -160,7 +169,9 @@ async def refine_my_project_storyboard(
         task_record_id=task_record.id,
         status=task_record.status,
         points_cost=points_cost,
+        next_poll_seconds=task_next_poll_seconds(task_record),
     )
+    set_task_poll_headers(response, data.next_poll_seconds)
     return success(data=data.model_dump(mode="json"), message="任务已提交")
 
 
@@ -170,6 +181,7 @@ async def generate_my_project_storyboard_prompt(
     chapter_id: UUID,
     storyboard_id: UUID,
     payload: ProjectStoryboardPromptRequest,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -185,7 +197,9 @@ async def generate_my_project_storyboard_prompt(
         task_record_id=task_record.id,
         status=task_record.status,
         points_cost=points_cost,
+        next_poll_seconds=task_next_poll_seconds(task_record),
     )
+    set_task_poll_headers(response, data.next_poll_seconds)
     return success(data=data.model_dump(mode="json"), message="任务已提交")
 
 
@@ -212,6 +226,7 @@ async def my_project_storyboard_generation_history(
     project_id: UUID,
     chapter_id: UUID,
     storyboard_id: UUID,
+    media_type: Literal["image", "video"] = Query(default="video"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -230,7 +245,7 @@ async def my_project_storyboard_generation_history(
         user_id=current_user.id,
         target_type="storyboard",
         target_id=storyboard_id,
-        media_type="video",
+        media_type=media_type,
         page=page,
         page_size=page_size,
     )
@@ -250,6 +265,7 @@ async def select_my_project_storyboard_generation_history(
     storyboard_id: UUID,
     history_id: UUID,
     payload: ProjectGeneratedAssetSelectRequest,
+    media_type: Optional[Literal["image", "video"]] = Query(default=None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -267,7 +283,7 @@ async def select_my_project_storyboard_generation_history(
         history_id=history_id,
         target_type="storyboard",
         target_id=storyboard_id,
-        media_type="video",
+        media_type=media_type,
         result_url=payload.result_url,
     )
     data = ProjectGeneratedAssetSelectOut(
@@ -276,6 +292,36 @@ async def select_my_project_storyboard_generation_history(
         last_frame_url=last_frame_url,
     )
     return success(data=data.model_dump(mode="json"), message="选择成功")
+
+
+@router.post("/{storyboard_id}/image-generation")
+async def generate_my_project_storyboard_image(
+    project_id: UUID,
+    chapter_id: UUID,
+    storyboard_id: UUID,
+    payload: ProjectStoryboardImageGenerateRequest,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    task_record, points_cost = await submit_storyboard_image_generation(
+        db,
+        project_id=project_id,
+        chapter_id=chapter_id,
+        storyboard_id=storyboard_id,
+        user=current_user,
+        payload=payload,
+    )
+    data = ProjectStoryboardImageGenerateOut(
+        task_record_id=task_record.id,
+        storyboard_id=storyboard_id,
+        aspect_ratio=(task_record.extra or {}).get("aspect_ratio") or payload.aspect_ratio,
+        status=task_record.status,
+        points_cost=points_cost,
+        next_poll_seconds=task_next_poll_seconds(task_record),
+    )
+    set_task_poll_headers(response, data.next_poll_seconds)
+    return success(data=data.model_dump(mode="json"), message="任务已提交")
 
 
 @router.post("/{storyboard_id}/split")
@@ -310,6 +356,7 @@ async def generate_my_project_storyboard_video(
     chapter_id: UUID,
     storyboard_id: UUID,
     payload: ProjectStoryboardVideoGenerateRequest,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -329,7 +376,9 @@ async def generate_my_project_storyboard_video(
         return_last_frame=payload.return_last_frame,
         status=task_record.status,
         points_cost=points_cost,
+        next_poll_seconds=task_next_poll_seconds(task_record),
     )
+    set_task_poll_headers(response, data.next_poll_seconds)
     return success(data=data.model_dump(mode="json"), message="任务已提交")
 
 

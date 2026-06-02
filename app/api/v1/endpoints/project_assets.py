@@ -1,10 +1,11 @@
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Path, Query
+from fastapi import APIRouter, Depends, Path, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.api.v1.endpoints.task_polling import set_task_poll_headers, task_next_poll_seconds
 from app.core.responses import success
 from app.db.session import get_db
 from app.models.project_asset import ProjectCharacter, ProjectProp, ProjectScene
@@ -211,6 +212,7 @@ async def generate_my_project_character_image(
     project_id: UUID,
     character_id: UUID,
     payload: ProjectAssetImageGenerateRequest,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -228,7 +230,9 @@ async def generate_my_project_character_image(
         asset_id=item.id,
         status=task_record.status,
         points_cost=points_cost,
+        next_poll_seconds=task_next_poll_seconds(task_record),
     )
+    set_task_poll_headers(response, data.next_poll_seconds)
     return success(data=data.model_dump(mode="json"), message="任务已提交")
 
 
@@ -316,6 +320,7 @@ async def generate_my_project_scene_image(
     project_id: UUID,
     scene_id: UUID,
     payload: ProjectAssetImageGenerateRequest,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -333,7 +338,9 @@ async def generate_my_project_scene_image(
         asset_id=item.id,
         status=task_record.status,
         points_cost=points_cost,
+        next_poll_seconds=task_next_poll_seconds(task_record),
     )
+    set_task_poll_headers(response, data.next_poll_seconds)
     return success(data=data.model_dump(mode="json"), message="任务已提交")
 
 
@@ -421,6 +428,7 @@ async def generate_my_project_prop_image(
     project_id: UUID,
     prop_id: UUID,
     payload: ProjectAssetImageGenerateRequest,
+    response: Response,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -438,5 +446,7 @@ async def generate_my_project_prop_image(
         asset_id=item.id,
         status=task_record.status,
         points_cost=points_cost,
+        next_poll_seconds=task_next_poll_seconds(task_record),
     )
+    set_task_poll_headers(response, data.next_poll_seconds)
     return success(data=data.model_dump(mode="json"), message="任务已提交")

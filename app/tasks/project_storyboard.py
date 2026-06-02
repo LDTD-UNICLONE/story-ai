@@ -427,7 +427,7 @@ def _user_failed_reason(exc: Exception) -> str:
 def _stage_keys(generation_type: str) -> tuple[str, str]:
     if generation_type == "storyboard_refinement":
         return "storyboard_refinement_status", "storyboard_refinement_task_record_id"
-    if generation_type == "storyboard_image_prompt_generation":
+    if generation_type in {"storyboard_image_prompt", "storyboard_image_prompt_generation"}:
         return "storyboard_image_prompt_generation_status", "storyboard_image_prompt_generation_task_record_id"
     if generation_type == "storyboard_prompt_generation":
         return "storyboard_prompt_generation_status", "storyboard_prompt_generation_task_record_id"

@@ -337,6 +337,7 @@ async def _upload_url_to_oss(
     content_type = detect_content_type(_filename_from_url(source_url), content_type)
     filename = _filename_from_url(source_url, content_type)
     category = "image" if generation_type == "image" else "video"
+    directory = build_story_directory(category)
     logger.info(
         "Generated media download completed",
         extra=log_extra(
@@ -357,7 +358,7 @@ async def _upload_url_to_oss(
                 event="generated_media_oss_upload_started",
                 generation_type=generation_type,
                 filename=filename,
-                directory=build_story_directory(category),
+                directory=directory,
                 content_type=content_type,
                 timeout_seconds=settings.generated_media_upload_timeout_seconds,
             ),
@@ -368,7 +369,7 @@ async def _upload_url_to_oss(
                 oss_client.upload_fileobj,
                 fileobj,
                 filename,
-                build_story_directory(category),
+                directory,
                 content_type,
             ),
             timeout=settings.generated_media_upload_timeout_seconds,
@@ -391,17 +392,23 @@ async def _upload_url_to_oss(
                 event="generated_media_oss_upload_timeout",
                 generation_type=generation_type,
                 filename=filename,
+                directory=directory,
                 timeout_seconds=settings.generated_media_upload_timeout_seconds,
             ),
         )
         raise AppException("生成媒体转存 OSS 超时，请稍后重试", code=50232, status_code=502) from exc
     except Exception as exc:
-        logger.error(
-            "Generated media OSS upload failed",
+        logger.exception(
+            "Generated media OSS upload failed: generation_type=%s filename=%s directory=%s reason=%s",
+            generation_type,
+            filename,
+            directory,
+            str(exc) or exc.__class__.__name__,
             extra=log_extra(
                 event="generated_media_oss_upload_failed",
                 generation_type=generation_type,
                 filename=filename,
+                directory=directory,
                 reason=str(exc),
             ),
         )
