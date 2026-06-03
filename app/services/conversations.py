@@ -8,6 +8,7 @@ from app.core.timezone import beijing_datetime
 from app.core.exceptions import AppException
 from app.integrations import comfly
 from app.integrations.volcengine_ark_video_specs import (
+    is_known_video_resolution,
     is_volcengine_ark_video_model,
     merge_video_capabilities as merge_ark_video_capabilities,
     normalize_video_resolution,
@@ -530,7 +531,10 @@ async def _build_message_extra_with_context(
     if conversation_type != "text":
         return extra
     if extra.get("messages"):
-        return extra
+        return {
+            **extra,
+            "messages": _normalize_text_request_messages(extra.get("messages"), content, extra),
+        }
 
     chat_mode = str(extra.get("chat_mode") or extra.get("capability") or "chat")
     if chat_mode != "chat":
@@ -561,13 +565,12 @@ def _build_video_message_extra(extra: Dict[str, Any], ai_model: Optional[AiModel
 
     first_frame_url = _extract_media_url(payload.get("first_frame_url") or payload.get("first_frame"))
     last_frame_url = _extract_media_url(payload.get("last_frame_url") or payload.get("last_frame"))
-    if not first_frame_url and not last_frame_url:
-        raise AppException("首尾帧生成需要传入 first_frame_url 或 last_frame_url", code=40012, status_code=400)
+    if not first_frame_url:
+        raise AppException("首尾帧生成需要传入 first_frame_url", code=40012, status_code=400)
 
-    media_items = list(payload.get("media_items") or payload.get("media") or [])
-    if first_frame_url:
-        payload["first_frame_url"] = first_frame_url
-        media_items.append({"type": "image_url", "image_url": {"url": first_frame_url}, "role": "first_frame"})
+    media_items = []
+    payload["first_frame_url"] = first_frame_url
+    media_items.append({"type": "image_url", "image_url": {"url": first_frame_url}, "role": "first_frame"})
     if last_frame_url:
         payload["last_frame_url"] = last_frame_url
         media_items.append({"type": "image_url", "image_url": {"url": last_frame_url}, "role": "last_frame"})
@@ -583,6 +586,8 @@ def _normalize_conversation_video_resolution(ai_model: Optional[AiModel], value:
     if ai_model is not None and (
         ai_model.vendor == "volcengine_ark" or is_volcengine_ark_video_model(ai_model.model_id)
     ):
+        if value not in (None, "") and not is_known_video_resolution(value):
+            raise AppException("火山方舟视频 resolution 参数不支持", code=40012, status_code=400)
         capabilities = merge_ark_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
         return normalize_video_resolution(value or "720p", capabilities)
 
@@ -653,12 +658,63 @@ async def _build_text_context_messages(
     history = list(reversed(result.scalars().all()))
     messages: List[Dict[str, Any]] = []
     for item in history:
-        if not item.content or item.content.startswith("任务已提交") or item.content.startswith("任务执行失败"):
+        if _should_skip_text_context_message(item):
             continue
         role = "assistant" if item.role == "assistant" else "user"
         messages.append({"role": role, "content": item.content})
     messages.append({"role": "user", "content": _build_text_multimodal_content(current_content, current_extra or {})})
     return messages
+
+
+def _normalize_text_request_messages(
+    raw_messages: Any,
+    current_content: str,
+    current_extra: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    messages: List[Dict[str, Any]] = []
+    for item in _as_list(raw_messages):
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip()
+        if role not in {"system", "user", "assistant", "tool"}:
+            continue
+        content = item.get("content")
+        if _is_empty_text_message_content(content):
+            continue
+        if role == "assistant" and _is_placeholder_assistant_content(content):
+            continue
+        messages.append({**item, "role": role, "content": content})
+
+    current_message_content = _build_text_multimodal_content(current_content, current_extra or {})
+    if not messages or messages[-1].get("role") != "user" or messages[-1].get("content") != current_message_content:
+        messages.append({"role": "user", "content": current_message_content})
+    return messages
+
+
+def _should_skip_text_context_message(message: ConversationMessage) -> bool:
+    if not message.content:
+        return True
+    if message.content.startswith("任务已提交") or message.content.startswith("任务执行失败"):
+        return True
+    if _is_placeholder_assistant_content(message.content):
+        return True
+    if message.role == "assistant" and (message.extra or {}).get("task_status") != "success":
+        return True
+    return False
+
+
+def _is_placeholder_assistant_content(content: Any) -> bool:
+    if not isinstance(content, str):
+        return False
+    return content.startswith("模型未返回有效内容")
+
+
+def _is_empty_text_message_content(content: Any) -> bool:
+    if content in (None, ""):
+        return True
+    if isinstance(content, list):
+        return not content
+    return False
 
 
 def _build_text_multimodal_content(content: str, extra: Dict[str, Any]) -> Any:

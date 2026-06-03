@@ -17,6 +17,8 @@ RATIO_ALIASES = {
     "3:4": "3:4",
     "3:2": "3:2",
     "2:3": "2:3",
+    "9:21": "9:21",
+    "keep_ratio": "keep_ratio",
     "adaptive": "adaptive",
 }
 

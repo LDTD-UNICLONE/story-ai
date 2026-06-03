@@ -194,15 +194,7 @@ async def list_task_records(
     page: int,
     page_size: int,
 ) -> Tuple[List[UserTaskRecord], int]:
-    conditions = []
-    if user_id:
-        conditions.append(UserTaskRecord.user_id == user_id)
-    if business_type:
-        conditions.append(UserTaskRecord.business_type == business_type)
-    if generation_type:
-        conditions.append(UserTaskRecord.generation_type == generation_type)
-    if status:
-        conditions.append(UserTaskRecord.status == status)
+    conditions = _task_record_filter_conditions(user_id, business_type, generation_type, status)
 
     await expire_stale_task_records(
         db,
@@ -224,6 +216,65 @@ async def list_task_records(
         .limit(page_size)
     )
     return list(result.scalars().all()), total
+
+
+async def list_admin_task_record_summaries(
+    db: AsyncSession,
+    user_id: Optional[UUID],
+    business_type: Optional[str],
+    generation_type: Optional[str],
+    status: Optional[str],
+    page: int,
+    page_size: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    conditions = _task_record_filter_conditions(user_id, business_type, generation_type, status)
+
+    count_result = await db.execute(
+        select(func.count()).select_from(UserTaskRecord).where(*conditions)
+    )
+    total = count_result.scalar_one()
+
+    result = await db.execute(
+        select(
+            UserTaskRecord.id,
+            UserTaskRecord.user_id,
+            UserTaskRecord.ai_model_id,
+            UserTaskRecord.points_transaction_id,
+            UserTaskRecord.business_type,
+            UserTaskRecord.business_id,
+            UserTaskRecord.generation_type,
+            UserTaskRecord.status,
+            UserTaskRecord.title,
+            func.substr(UserTaskRecord.prompt, 1, 500).label("prompt_preview"),
+            func.substr(UserTaskRecord.result, 1, 500).label("result_preview"),
+            UserTaskRecord.points_cost,
+            UserTaskRecord.created_at,
+            UserTaskRecord.updated_at,
+        )
+        .where(*conditions)
+        .order_by(UserTaskRecord.created_at.desc(), UserTaskRecord.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    return [dict(row._mapping) for row in result.all()], total
+
+
+def _task_record_filter_conditions(
+    user_id: Optional[UUID],
+    business_type: Optional[str],
+    generation_type: Optional[str],
+    status: Optional[str],
+) -> List[Any]:
+    conditions: List[Any] = []
+    if user_id:
+        conditions.append(UserTaskRecord.user_id == user_id)
+    if business_type:
+        conditions.append(UserTaskRecord.business_type == business_type)
+    if generation_type:
+        conditions.append(UserTaskRecord.generation_type == generation_type)
+    if status:
+        conditions.append(UserTaskRecord.status == status)
+    return conditions
 
 
 async def list_user_task_records(
@@ -1177,7 +1228,7 @@ def _is_provider_failed_status(status: str) -> bool:
 def _is_provider_success_result(model_result: ModelRunResult, status: str) -> bool:
     if status in {"success", "succeeded", "completed", "complete", "finished", "done"}:
         return True
-    if status in {"not_start", "in_progress", "running", "pending", "processing", "queued"}:
+    if status in {"not_start", "submitted", "in_progress", "running", "pending", "processing", "queued"}:
         return False
     content = (model_result.content or "").strip()
     return bool(content and content != "生成任务处理中" and not content.startswith("模型任务仍在生成中"))

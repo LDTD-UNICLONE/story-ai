@@ -322,6 +322,8 @@ async def _collect_reference_images(
     if payload.generation_mode == "storyboard" and storyboard is not None:
         urls.extend(_storyboard_reference_images(storyboard))
         return await _resolve_reference_image_urls(db, _dedupe(urls))
+    if payload.generation_mode == "first_last_frame":
+        return []
     urls.extend(payload.uploaded_images or [])
     urls.extend(await _asset_reference_images(db, ProjectCharacter, project_id, user_id, payload.character_ids))
     urls.extend(await _asset_reference_images(db, ProjectScene, project_id, user_id, payload.scene_ids))
@@ -486,8 +488,9 @@ def _build_storyboard_video_extra(
     extra["return_last_frame"] = payload.return_last_frame
     extra.setdefault("aspect_ratio", project.generation_ratio)
     extra.setdefault("ratio", project.generation_ratio)
-    explicit_duration_seconds = _explicit_duration_seconds(extra)
-    suggested_duration_seconds = _storyboard_duration_seconds(storyboard)
+    min_duration_seconds = _video_min_duration_seconds(ai_model)
+    explicit_duration_seconds = _explicit_duration_seconds(extra, min_duration_seconds)
+    suggested_duration_seconds = _storyboard_duration_seconds(storyboard, min_duration_seconds)
     if explicit_duration_seconds:
         _set_video_duration_extra(extra, explicit_duration_seconds, "request_extra")
     elif suggested_duration_seconds:
@@ -495,18 +498,18 @@ def _build_storyboard_video_extra(
         extra["duration_suggestion"] = storyboard.duration_suggestion
     extra["video_mode"] = MODE_TO_PROVIDER_MODE[payload.generation_mode]
     extra["capability"] = MODE_TO_PROVIDER_MODE[payload.generation_mode]
-    if reference_images:
+    if reference_images and payload.generation_mode != "first_last_frame":
         extra["images"] = reference_images
         if ai_model.vendor != VOLCENGINE_ARK_VENDOR and not is_volcengine_ark_video_model(ai_model.model_id):
             extra["image_urls"] = reference_images
     if payload.generation_mode == "first_last_frame":
-        media_items = list(extra.get("media_items") or extra.get("media") or [])
-        if payload.first_frame_url:
-            media_items.append({"type": "image_url", "image_url": {"url": payload.first_frame_url}, "role": "first_frame"})
+        if not payload.first_frame_url:
+            raise AppException("首尾帧生成需要传入 first_frame_url", code=40012, status_code=400)
+        media_items = [{"type": "image_url", "image_url": {"url": payload.first_frame_url}, "role": "first_frame"}]
         if payload.last_frame_url:
             media_items.append({"type": "image_url", "image_url": {"url": payload.last_frame_url}, "role": "last_frame"})
-        if media_items:
-            extra["media_items"] = media_items
+        extra["media_items"] = media_items
+        _clear_video_reference_image_extra(extra)
     return extra
 
 
@@ -525,37 +528,37 @@ def _clear_video_reference_image_extra(extra: Dict[str, Any]) -> None:
         extra.pop(key, None)
 
 
-def _storyboard_duration_seconds(storyboard: ProjectStoryboard) -> Optional[int]:
-    return _parse_duration_suggestion_seconds(storyboard.duration_suggestion)
+def _storyboard_duration_seconds(storyboard: ProjectStoryboard, min_seconds: int = 5) -> Optional[int]:
+    return _parse_duration_suggestion_seconds(storyboard.duration_suggestion, min_seconds)
 
 
-def _parse_duration_suggestion_seconds(value: Optional[str]) -> Optional[int]:
+def _parse_duration_suggestion_seconds(value: Optional[str], min_seconds: int = 5) -> Optional[int]:
     if not value:
         return None
-    return _parse_duration_value_seconds(value)
+    return _parse_duration_value_seconds(value, min_seconds)
 
 
-def _explicit_duration_seconds(extra: Dict[str, Any]) -> Optional[int]:
+def _explicit_duration_seconds(extra: Dict[str, Any], min_seconds: int = 5) -> Optional[int]:
     for key in _duration_extra_keys():
-        seconds = _parse_duration_value_seconds(extra.get(key))
+        seconds = _parse_duration_value_seconds(extra.get(key), min_seconds)
         if seconds:
             return seconds
     return None
 
 
-def _parse_duration_value_seconds(value: Any) -> Optional[int]:
+def _parse_duration_value_seconds(value: Any, min_seconds: int = 5) -> Optional[int]:
     if isinstance(value, bool) or value in (None, ""):
         return None
     if isinstance(value, (int, float)):
         if value <= 0:
             return None
-        return _clamp_video_duration_seconds(math.ceil(float(value)))
+        return _clamp_video_duration_seconds(math.ceil(float(value)), min_seconds)
     normalized = _normalize_duration_text(value)
     values = [float(item) for item in re.findall(r"\d+(?:\.\d+)?", normalized)]
     values.extend(_chinese_duration_numbers(normalized))
     if not values:
         return None
-    return _clamp_video_duration_seconds(math.ceil(max(values)))
+    return _clamp_video_duration_seconds(math.ceil(max(values)), min_seconds)
 
 
 def _normalize_duration_text(value: str) -> str:
@@ -594,8 +597,8 @@ def _parse_chinese_number(value: str) -> Optional[int]:
     return None
 
 
-def _clamp_video_duration_seconds(seconds: int) -> int:
-    return min(max(seconds, 5), 15)
+def _clamp_video_duration_seconds(seconds: int, min_seconds: int = 5) -> int:
+    return min(max(seconds, min_seconds), 15)
 
 
 def _set_video_duration_extra(extra: Dict[str, Any], seconds: int, source: str) -> None:
@@ -613,6 +616,12 @@ def _duration_extra_keys() -> Tuple[str, ...]:
         "duration_seconds",
         "video_duration_seconds",
     )
+
+
+def _video_min_duration_seconds(ai_model: AiModel) -> int:
+    if ai_model.vendor == VOLCENGINE_ARK_VENDOR or is_volcengine_ark_video_model(ai_model.model_id):
+        return 4
+    return 5
 
 
 def _first_generated_last_frame_url(extra: Dict[str, Any]) -> str:
@@ -776,7 +785,8 @@ def _build_storyboard_reference_video_prompt(
 
 
 def _video_prompt_duration_text(storyboard: ProjectStoryboard, model_extra: Dict[str, Any]) -> str:
-    seconds = _parse_duration_value_seconds(model_extra.get("duration_seconds") or model_extra.get("duration"))
+    raw_seconds = model_extra.get("duration_seconds") or model_extra.get("duration")
+    seconds = int(raw_seconds) if isinstance(raw_seconds, int) and raw_seconds > 0 else None
     if seconds:
         return f"{seconds}秒"
     return _clean_prompt_part(storyboard.duration_suggestion)

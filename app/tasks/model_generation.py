@@ -176,6 +176,7 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
                 sanitize_public_message(str(exc) or "模型调用失败"),
                 refund=True,
                 raw_reason=str(exc) or "模型调用失败",
+                failure_extra=_failure_extra(exc),
             )
             return
 
@@ -230,6 +231,7 @@ async def _mark_failed(
     reason: str,
     refund: bool = False,
     raw_reason: Optional[str] = None,
+    failure_extra: Optional[dict] = None,
 ) -> None:
     reason = sanitize_public_message(reason)
     refund_transaction_id = (task_record.extra or {}).get("refund_transaction_id")
@@ -249,6 +251,7 @@ async def _mark_failed(
     task_record.result = reason
     task_record.extra = {
         **(task_record.extra or {}),
+        **(failure_extra or {}),
         "failed_reason": reason,
         "display_message": f"任务执行失败：{reason}",
         "raw_failed_reason": raw_reason or reason,
@@ -274,6 +277,13 @@ async def _mark_failed(
             raw_reason=raw_reason or reason,
         ),
     )
+
+
+def _failure_extra(exc: Exception) -> dict:
+    provider_response_summary = getattr(exc, "provider_response_summary", None)
+    if provider_response_summary:
+        return {"provider_response_summary": provider_response_summary}
+    return {}
 
 
 async def _settle_text_points_after_success(
@@ -405,7 +415,7 @@ async def _resolve_provider_task_result(
 
 def _is_provider_success_result(model_result: ModelRunResult, status: str) -> bool:
     terminal_success_statuses = {"success", "succeeded", "completed", "complete", "finished", "done"}
-    pending_statuses = {"not_start", "in_progress", "running", "pending", "processing", "queued"}
+    pending_statuses = {"not_start", "submitted", "in_progress", "running", "pending", "processing", "queued"}
     if status in terminal_success_statuses:
         return True
     if status in pending_statuses:

@@ -9,16 +9,17 @@ from app.core.responses import success
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.task_record import (
+    AdminTaskRecordListOut,
     AdminTaskRecordInterruptRequest,
     TaskRecordOptionsOut,
-    UserTaskRecordListOut,
+    AdminTaskRecordListItemOut,
     UserTaskRecordOut,
 )
 from app.services.task_records import (
     get_task_record_options,
     get_task_record_or_404,
     interrupt_task_record,
-    list_task_records,
+    list_admin_task_record_summaries,
 )
 
 router = APIRouter(prefix="/admin/task-records")
@@ -35,7 +36,7 @@ async def admin_task_records(
     db: AsyncSession = Depends(get_db),
     current_admin: User = Depends(get_current_admin_user),
 ):
-    records, total = await list_task_records(
+    records, total = await list_admin_task_record_summaries(
         db,
         user_id=user_id,
         business_type=business_type,
@@ -44,8 +45,8 @@ async def admin_task_records(
         page=page,
         page_size=page_size,
     )
-    data = UserTaskRecordListOut(
-        items=[UserTaskRecordOut.model_validate(item) for item in records],
+    data = AdminTaskRecordListOut(
+        items=[AdminTaskRecordListItemOut.model_validate(item) for item in records],
         total=total,
         page=page,
         page_size=page_size,

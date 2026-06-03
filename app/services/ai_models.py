@@ -29,13 +29,11 @@ def resolve_ai_model_capabilities(ai_model: AiModel) -> dict:
 
 
 def _is_ark_video_model(vendor: str, model_type: str, model_id: str) -> bool:
-    return model_type == "video" and (
-        vendor == VOLCENGINE_ARK_VENDOR or is_volcengine_ark_video_model(model_id)
-    )
+    return model_type == "video" and vendor == VOLCENGINE_ARK_VENDOR
 
 
 def _is_comfly_model(vendor: str, model_id: str) -> bool:
-    return vendor in {"comfly", "模型服务"} and not is_volcengine_ark_video_model(model_id)
+    return vendor in {"comfly", "模型服务"}
 
 
 async def list_ai_models(

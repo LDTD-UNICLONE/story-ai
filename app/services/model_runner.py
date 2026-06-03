@@ -1,22 +1,33 @@
+import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 
 from app.core.exceptions import AppException
+from app.core.logging import log_extra
 from app.integrations import comfly
 from app.integrations.comfly_video_specs import merge_video_capabilities
 from app.integrations import volcengine_ark
 from app.integrations.volcengine_ark_video_specs import (
     VOLCENGINE_ARK_VENDOR,
-    is_volcengine_ark_video_model,
     merge_video_capabilities as merge_ark_video_capabilities,
 )
 from app.models.ai_model import AiModel
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class ModelRunResult:
     content: str
     extra: Dict[str, Any] = field(default_factory=dict)
+
+
+class EmptyModelContentError(AppException):
+    def __init__(self, message: str, response_summary: Dict[str, Any]) -> None:
+        super().__init__(message, code=50231, status_code=502)
+        self.provider_response_summary = response_summary
 
 
 async def run_model(
@@ -56,7 +67,17 @@ async def _run_comfly(
         payload = await comfly.create_chat_completion(ai_model.model_id, prompt, extra)
         content = _extract_chat_content(payload) or _extract_media_content(payload)
         if not content:
-            content = _empty_content_message(payload)
+            response_summary = _chat_response_summary(payload)
+            logger.warning(
+                "Comfly chat completion returned empty content: response_summary=%s",
+                json.dumps(response_summary, ensure_ascii=False, default=str),
+                extra=log_extra(
+                    event="comfly_chat_empty_content",
+                    model_id=ai_model.model_id,
+                    response_summary=response_summary,
+                ),
+            )
+            raise EmptyModelContentError(_empty_content_message(payload), response_summary)
         return ModelRunResult(
             content=content,
             extra={
@@ -76,6 +97,8 @@ async def _run_comfly(
                 extra={"task_id": task_id, "task_status": _extract_status(payload), "provider_response": payload},
             )
         content = _extract_chat_content(payload) or _extract_media_content(payload)
+        if not content:
+            raise AppException("图像模型响应格式错误：未返回 task_id 或图片结果", code=50231, status_code=502)
         return ModelRunResult(content=content, extra={"image_mode": image_mode, "provider_response": payload})
 
     if generation_type == "video":
@@ -87,9 +110,9 @@ async def _run_comfly(
         payload = await comfly.create_video_generation(ai_model.model_id, prompt, provider_extra)
         video_mode = str(extra.get("video_mode") or extra.get("capability") or "generation")
         task_id = _extract_task_id(payload)
-        content = f"视频生成任务已提交：{task_id}" if task_id else "视频生成任务已提交"
         if not task_id:
-            content = _extract_chat_content(payload) or _extract_media_content(payload)
+            raise AppException("视频模型响应格式错误：未返回 task_id", code=50232, status_code=502)
+        content = f"视频生成任务已提交：{task_id}"
         return ModelRunResult(
             content=content,
             extra={"task_id": task_id, "task_status": _extract_status(payload), "video_mode": video_mode, "provider_response": payload},
@@ -166,19 +189,23 @@ async def _query_volcengine_ark_task(generation_type: str, task_id: str) -> Mode
 
 
 def _should_use_volcengine_ark(ai_model: AiModel, generation_type: str) -> bool:
-    return generation_type == "video" and (
-        ai_model.vendor == VOLCENGINE_ARK_VENDOR or is_volcengine_ark_video_model(ai_model.model_id)
-    )
+    return generation_type == "video" and ai_model.vendor == VOLCENGINE_ARK_VENDOR
 
 
 def _should_use_comfly(ai_model: AiModel) -> bool:
-    return ai_model.vendor in {"comfly", "模型服务"} and not is_volcengine_ark_video_model(ai_model.model_id)
+    return ai_model.vendor in {"comfly", "模型服务"}
 
 
 def _extract_chat_content(payload: Dict[str, Any]) -> str:
     choices = payload.get("choices") or []
     if choices:
-        message = choices[0].get("message") or {}
+        first_choice = choices[0] if isinstance(choices[0], dict) else {}
+        message = first_choice.get("message") or {}
+        if first_choice.get("text"):
+            return str(first_choice["text"])
+        delta = first_choice.get("delta") if isinstance(first_choice.get("delta"), dict) else {}
+        if delta.get("content"):
+            return str(delta["content"])
         content = message.get("content")
         if isinstance(content, list):
             text_parts = []
@@ -197,6 +224,13 @@ def _extract_chat_content(payload: Dict[str, Any]) -> str:
             return "".join(text_parts) or ",".join(media_parts)
         if content:
             return str(content)
+        for key in ("reasoning_content", "reasoning", "refusal"):
+            value = message.get(key)
+            if value:
+                return str(value)
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            return json.dumps({"tool_calls": tool_calls}, ensure_ascii=False)
     return ""
 
 
@@ -244,6 +278,22 @@ def _empty_content_message(payload: Dict[str, Any]) -> str:
     if finish_reason == "length":
         return "模型未返回有效内容：输出达到长度限制，请调大 max_tokens 或更换模型参数后重试"
     return "模型未返回有效内容"
+
+
+def _chat_response_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
+    choices = payload.get("choices") if isinstance(payload.get("choices"), list) else []
+    first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+    message = first_choice.get("message") if isinstance(first_choice.get("message"), dict) else {}
+    return {
+        "id": payload.get("id"),
+        "object": payload.get("object"),
+        "model": payload.get("model"),
+        "response_keys": sorted(str(key) for key in payload.keys()),
+        "choices_count": len(choices),
+        "finish_reason": first_choice.get("finish_reason"),
+        "message_keys": sorted(str(key) for key in message.keys()),
+        "usage": payload.get("usage"),
+    }
 
 
 def _extract_status(payload: Dict[str, Any]) -> Optional[str]:

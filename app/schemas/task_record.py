@@ -42,6 +42,34 @@ class UserTaskRecordListOut(SchemaBaseModel):
     page_size: int
 
 
+class AdminTaskRecordListItemOut(SchemaBaseModel):
+    id: UUID
+    user_id: UUID
+    ai_model_id: Optional[UUID] = None
+    points_transaction_id: Optional[UUID] = None
+    business_type: str
+    business_id: Optional[UUID] = None
+    generation_type: str
+    status: str
+    title: str
+    prompt_preview: str
+    result_preview: Optional[str] = None
+    points_cost: int
+    created_at: datetime
+    updated_at: datetime
+
+    @field_serializer("result_preview")
+    def serialize_result_preview(self, value: Optional[str]) -> Optional[str]:
+        return sanitize_public_message(value) if value is not None else None
+
+
+class AdminTaskRecordListOut(SchemaBaseModel):
+    items: List[AdminTaskRecordListItemOut]
+    total: int
+    page: int
+    page_size: int
+
+
 class UserTaskRecordBatchRequest(SchemaBaseModel):
     ids: List[UUID] = Field(..., min_length=1, max_length=50)
 

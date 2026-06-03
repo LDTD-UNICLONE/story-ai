@@ -257,22 +257,33 @@ def build_asset_image_prompt(
     generation_mode: str = "general",
     custom_prompt: Optional[str] = None,
 ) -> str:
-    asset_prompt = custom_prompt or asset.prompt or asset.description or asset.name
     style_prompt = project.style.prompt if project.style else ""
     constant_prompt = load_asset_image_constant_prompt(asset_type, generation_mode)
+    asset_prompt = _build_asset_image_prompt_text(asset)
     return "\n".join(
         item
         for item in (
-            f"整体风格：{style_prompt}",
-            f"生成模式：{generation_mode}",
+            f"画面风格：{style_prompt}",
             f"模式提示词：{constant_prompt}",
-            f"生成比例：{project.generation_ratio}",
-            f"资产名称：{asset.name}",
-            f"资产描述：{asset_prompt}",
+            f"资产提示词：{asset_prompt}",
             "请严格围绕该资产生成图像，不要添加与资产无关的主体内容。",
         )
         if item
     )
+
+
+def _build_asset_image_prompt_text(asset: Any) -> str:
+    return (
+        _clean_optional_text(getattr(asset, "prompt", None))
+        or _clean_optional_text(getattr(asset, "description", None))
+        or _clean_optional_text(getattr(asset, "name", None))
+    )
+
+
+def _clean_optional_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
 def normalize_generation_mode(generation_mode: str) -> str:

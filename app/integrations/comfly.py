@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import Any, Dict, List, Optional, Set
 
@@ -5,8 +6,8 @@ import httpx
 
 from app.core.config import settings
 from app.core.exceptions import AppException
-from app.integrations.comfly_dimensions import adapt_image_dimensions, adapt_video_dimensions
-from app.integrations.comfly_video_specs import allowed_video_request_keys
+from app.integrations.comfly_dimensions import adapt_image_dimensions, adapt_video_dimensions, normalize_ratio
+from app.integrations.comfly_video_specs import allowed_video_request_keys, merge_video_capabilities
 
 
 logger = logging.getLogger(__name__)
@@ -46,9 +47,10 @@ CHAT_REQUEST_KEYS = {
     "tool_choice",
 }
 
+CHAT_MESSAGE_KEYS = {"role", "content", "name", "tool_call_id", "tool_calls"}
 CHAT_MESSAGE_ROLES = {"system", "user", "assistant", "tool"}
 CHAT_CONTENT_PART_TYPES = {"text", "image_url"}
-CHAT_CAPABILITIES = {"chat", "analyze_image", "analyze_video", "generate_image", "edit_image"}
+CHAT_CAPABILITIES = {"chat", "analyze_image", "analyze_video"}
 CHAT_MAX_TOKENS_UPPER_BOUND = 65536
 
 
@@ -73,6 +75,8 @@ IMAGE_GENERATION_REQUEST_KEYS = {
     "n",
     "quality",
     "response_format",
+    "style",
+    "user",
 }
 
 
@@ -98,11 +102,13 @@ IMAGE_EDIT_REQUEST_KEYS = {
     "quality",
     "response_format",
     "size",
+    "user",
 }
 
 IMAGE_RESPONSE_FORMAT_VALUES = {"url", "b64_json"}
 IMAGE_QUALITY_VALUES = {"auto", "high", "medium", "low", "standard", "hd"}
 IMAGE_RESOLUTION_QUALITY_VALUES = {"1k", "2k", "3k", "4k"}
+IMAGE_STYLE_VALUES = {"vivid", "natural"}
 IMAGE_MAX_N = 10
 
 IMAGE_CHAT_HELPER_KEYS = {
@@ -125,7 +131,48 @@ VIDEO_GENERATION_HELPER_KEYS = {
     "video_mode",
     "capability",
     "_model_capabilities",
+    "audio",
+    "audio_urls",
+    "image",
+    "image_url",
+    "image_urls",
+    "reference_image",
+    "reference_image_urls",
+    "reference_images",
+    "first_frame",
+    "first_frame_url",
+    "last_frame",
+    "last_frame_url",
+    "media",
+    "media_items",
+    "video",
+    "video_url",
+    "video_urls",
+    "reference_video",
+    "reference_video_urls",
+    "reference_videos",
+    "aspect_ratio",
+    "ratio",
+    "camera_fixed",
 }
+
+VIDEO_BOOL_REQUEST_KEYS = {
+    "camerafixed",
+    "enable_upsample",
+    "enhance_prompt",
+    "generate_audio",
+    "hd",
+    "private",
+    "prompt_extend",
+    "return_last_frame",
+    "watermark",
+}
+VIDEO_INT_REQUEST_KEYS = {"seed"}
+VIDEO_INT_MAX_VALUES = {"seed": 2147483647}
+VIDEO_URL_REQUEST_KEYS = {"audio_url", "character_url", "notify_hook"}
+VIDEO_ARRAY_REQUEST_KEYS = {"character_timestamps"}
+VIDEO_STRING_REQUEST_KEYS = {"negative_prompt", "resolution", "size"}
+VIDEO_URL_OR_BASE64_PREFIXES = ("http://", "https://", "data:")
 
 
 def _base_url() -> str:
@@ -208,7 +255,7 @@ async def list_provider_models() -> List[Dict[str, Any]]:
     except httpx.HTTPError as exc:
         raise AppException("无法连接模型服务", code=50202, status_code=502) from exc
 
-    payload = response.json()
+    payload = _response_payload(response)
     data = payload.get("data")
     if not isinstance(data, list):
         raise AppException("模型列表响应格式错误", code=50203, status_code=502)
@@ -227,7 +274,7 @@ async def _get_json(path: str) -> Dict[str, Any]:
     except httpx.HTTPError as exc:
         raise AppException("无法连接模型服务", code=50202, status_code=502) from exc
 
-    return response.json()
+    return _response_payload(response)
 
 
 async def _post_json(
@@ -246,7 +293,7 @@ async def _post_json(
     except httpx.HTTPError as exc:
         raise AppException("无法连接模型服务", code=50202, status_code=502) from exc
 
-    return response.json()
+    return _response_payload(response)
 
 
 async def _post_multipart(
@@ -266,7 +313,76 @@ async def _post_multipart(
     except httpx.HTTPError as exc:
         raise AppException("无法连接模型服务", code=50202, status_code=502) from exc
 
-    return response.json()
+    return _response_payload(response)
+
+
+def _response_payload(response: httpx.Response) -> Dict[str, Any]:
+    text = response.text or ""
+    try:
+        payload = response.json()
+    except json.JSONDecodeError as exc:
+        payload = _parse_sse_payload(text) or _plain_text_payload(text)
+        if payload:
+            return payload
+        raise AppException(
+            "模型服务响应为空或格式错误",
+            code=50203,
+            status_code=502,
+        ) from exc
+    if not isinstance(payload, dict):
+        return {"data": payload}
+    return payload
+
+
+def _parse_sse_payload(text: str) -> Dict[str, Any]:
+    content_parts: List[str] = []
+    last_payload: Dict[str, Any] = {}
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line.removeprefix("data:").strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            last_payload = payload
+            chunk = _extract_stream_chunk_content(payload)
+            if chunk:
+                content_parts.append(chunk)
+    if content_parts:
+        return {
+            **last_payload,
+            "choices": [{"message": {"content": "".join(content_parts)}}],
+        }
+    return last_payload
+
+
+def _extract_stream_chunk_content(payload: Dict[str, Any]) -> str:
+    choices = payload.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return ""
+    choice = choices[0]
+    delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    content = delta.get("content") or message.get("content") or ""
+    if isinstance(content, list):
+        return "".join(str(item.get("text") or "") if isinstance(item, dict) else str(item) for item in content)
+    return str(content) if content else ""
+
+
+def _plain_text_payload(text: str) -> Dict[str, Any]:
+    content = (text or "").strip()
+    if not content:
+        return {}
+    logger.warning("Comfly returned non-JSON response: %s", content[:500])
+    return {
+        "choices": [{"message": {"content": content}}],
+        "output": content,
+    }
 
 
 def _raise_model_service_http_error(exc: httpx.HTTPStatusError, fallback: str) -> None:
@@ -301,12 +417,22 @@ def validate_chat_completion_request(model: str, prompt: str, extra: Dict[str, A
 
 
 def build_chat_completion_payload(model: str, prompt: str, extra: Dict[str, Any]) -> Dict[str, Any]:
+    model_id = str(model or "").strip()
+    if not model_id:
+        raise AppException("Chat model 不能为空", code=40019, status_code=400)
     payload: Dict[str, Any] = {
-        "model": model,
+        "model": model_id,
         "messages": _normalize_chat_messages(extra.get("messages") or _build_chat_messages(prompt, extra)),
         "stream": False,
     }
     _merge_chat_extra(payload, extra)
+    logger.info(
+        "Comfly chat completion payload prepared: model=%s stream=%s message_count=%s keys=%s",
+        model_id,
+        payload.get("stream"),
+        len(payload["messages"]),
+        sorted(payload.keys()),
+    )
     return payload
 
 
@@ -335,8 +461,6 @@ def _build_chat_content(prompt: str, extra: Dict[str, Any]) -> Any:
         raise AppException("图片分析需要传入图片 URL", code=40009, status_code=400)
     if capability == "analyze_video" and not has_video:
         raise AppException("视频分析需要传入视频 URL", code=40009, status_code=400)
-    if capability == "edit_image" and not has_image:
-        raise AppException("Chat 图像编辑需要传入图片 URL", code=40009, status_code=400)
 
     content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
     for _, url in media_items:
@@ -355,9 +479,7 @@ def _merge_chat_extra(payload: Dict[str, Any], extra: Dict[str, Any]) -> None:
             payload[key] = _normalize_chat_max_tokens(value)
             continue
         if key == "stream":
-            if value:
-                raise AppException("当前后端任务模式不支持 Chat 流式返回", code=40019, status_code=400)
-            payload["stream"] = False
+            payload[key] = _normalize_chat_bool(key, value)
             continue
         if key in {"temperature", "top_p", "presence_penalty", "frequency_penalty"}:
             payload[key] = _normalize_chat_float(key, value)
@@ -367,6 +489,21 @@ def _merge_chat_extra(payload: Dict[str, Any], extra: Dict[str, Any]) -> None:
             continue
         if key == "stop":
             payload[key] = _normalize_chat_stop(value)
+            continue
+        if key == "logit_bias":
+            payload[key] = _normalize_chat_object_or_null(key, value)
+            continue
+        if key == "response_format":
+            payload[key] = _normalize_chat_response_format(value)
+            continue
+        if key == "tools":
+            payload[key] = _normalize_chat_tools(value)
+            continue
+        if key == "tool_choice":
+            payload[key] = _normalize_chat_tool_choice(value)
+            continue
+        if key == "user":
+            payload[key] = str(value)
             continue
         payload[key] = value
 
@@ -382,7 +519,23 @@ def _normalize_chat_messages(value: Any) -> List[Dict[str, Any]]:
         role = str(item.get("role") or "").strip()
         if role not in CHAT_MESSAGE_ROLES:
             raise AppException("Chat message role 不正确", code=40019, status_code=400)
-        messages.append({"role": role, "content": _normalize_chat_content(item.get("content"))})
+        unknown_keys = set(item) - CHAT_MESSAGE_KEYS
+        if unknown_keys:
+            raise AppException("Chat message 包含不支持的字段", code=40019, status_code=400)
+        if role == "tool" and item.get("tool_call_id") in (None, ""):
+            raise AppException("Chat tool message 必须包含 tool_call_id", code=40019, status_code=400)
+        if item.get("content") is None and item.get("tool_calls") is not None:
+            content = ""
+        else:
+            content = _normalize_chat_content(item.get("content"))
+        message = {"role": role, "content": content}
+        if item.get("name") not in (None, ""):
+            message["name"] = str(item["name"])
+        if item.get("tool_call_id") not in (None, ""):
+            message["tool_call_id"] = str(item["tool_call_id"])
+        if item.get("tool_calls") is not None:
+            message["tool_calls"] = _normalize_chat_tool_calls(item["tool_calls"])
+        messages.append(message)
     return messages
 
 
@@ -398,7 +551,10 @@ def _normalize_chat_content(value: Any) -> Any:
             if content_type not in CHAT_CONTENT_PART_TYPES:
                 raise AppException("Chat message content 类型不支持", code=40019, status_code=400)
             if content_type == "text":
-                content.append({"type": "text", "text": str(item.get("text") or "")})
+                text = str(item.get("text") or "")
+                if not text:
+                    raise AppException("Chat 文本内容不能为空", code=40019, status_code=400)
+                content.append({"type": "text", "text": text})
                 continue
             media_value = item.get(content_type)
             url = _extract_media_url(media_value)
@@ -425,9 +581,14 @@ def _normalize_chat_float(key: str, value: Any) -> float:
 
 def _normalize_chat_int(key: str, value: Any) -> int:
     try:
-        return int(value)
+        normalized = int(value)
     except (TypeError, ValueError) as exc:
         raise AppException(f"Chat 参数 {key} 必须是整数", code=40019, status_code=400) from exc
+    if key == "n" and normalized < 1:
+        raise AppException("Chat 参数 n 必须大于等于 1", code=40019, status_code=400)
+    if key == "seen" and normalized < 0:
+        raise AppException("Chat 参数 seen 必须大于等于 0", code=40019, status_code=400)
+    return normalized
 
 
 def _normalize_chat_stop(value: Any) -> Any:
@@ -436,6 +597,68 @@ def _normalize_chat_stop(value: Any) -> Any:
     if isinstance(value, list) and all(isinstance(item, str) for item in value):
         return value
     raise AppException("Chat 参数 stop 必须是字符串或字符串数组", code=40019, status_code=400)
+
+
+def _normalize_chat_bool(key: str, value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise AppException(f"Chat 参数 {key} 必须是布尔值", code=40019, status_code=400)
+
+
+def _normalize_chat_object_or_null(key: str, value: Any) -> Any:
+    if value is None or isinstance(value, dict):
+        return value
+    raise AppException(f"Chat 参数 {key} 必须是对象或 null", code=40019, status_code=400)
+
+
+def _normalize_chat_response_format(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise AppException("Chat 参数 response_format 必须是对象", code=40019, status_code=400)
+    response_type = value.get("type")
+    if response_type is not None and str(response_type) not in {"text", "json_object", "json_schema"}:
+        raise AppException("Chat 参数 response_format.type 不支持", code=40019, status_code=400)
+    if response_type == "json_schema" and not isinstance(value.get("json_schema"), dict):
+        raise AppException("Chat 参数 response_format.json_schema 必须是对象", code=40019, status_code=400)
+    return value
+
+
+def _normalize_chat_tools(value: Any) -> List[Any]:
+    if not isinstance(value, list):
+        raise AppException("Chat 参数 tools 必须是数组", code=40019, status_code=400)
+    for tool in value:
+        if isinstance(tool, str):
+            continue
+        if not isinstance(tool, dict):
+            raise AppException("Chat 参数 tools 数组项必须是字符串或对象", code=40019, status_code=400)
+        tool_type = tool.get("type")
+        if tool_type is not None and str(tool_type) != "function":
+            raise AppException("Chat 参数 tools.type 仅支持 function", code=40019, status_code=400)
+        function = tool.get("function")
+        if function is not None:
+            if not isinstance(function, dict):
+                raise AppException("Chat 参数 tools.function 必须是对象", code=40019, status_code=400)
+            if not str(function.get("name") or "").strip():
+                raise AppException("Chat 参数 tools.function.name 不能为空", code=40019, status_code=400)
+    return value
+
+
+def _normalize_chat_tool_choice(value: Any) -> Any:
+    if isinstance(value, str):
+        if value not in {"none", "auto", "required"}:
+            raise AppException("Chat 参数 tool_choice 字符串值不支持", code=40019, status_code=400)
+        return value
+    if isinstance(value, dict):
+        return value
+    raise AppException("Chat 参数 tool_choice 必须是字符串或对象", code=40019, status_code=400)
+
+
+def _normalize_chat_tool_calls(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        raise AppException("Chat message tool_calls 必须是数组", code=40019, status_code=400)
+    for item in value:
+        if not isinstance(item, dict):
+            raise AppException("Chat message tool_calls 数组项必须是对象", code=40019, status_code=400)
+    return value
 
 
 def _collect_chat_media_items(extra: Dict[str, Any]) -> List[tuple[str, str]]:
@@ -502,12 +725,20 @@ def build_image_generation_payload(
     prompt: str,
     extra: Dict[str, Any],
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
-    payload: Dict[str, Any] = {"model": model, "prompt": _normalize_image_prompt(prompt)}
+    model_id = _normalize_model_id(model, "绘图 model 不能为空")
+    payload: Dict[str, Any] = {"model": model_id, "prompt": _normalize_image_prompt(prompt)}
     params = _build_image_query_params(extra)
     _normalize_generation_images(payload, extra)
     _merge_image_extra(payload, extra, IMAGE_GENERATION_REQUEST_KEYS, IMAGE_GENERATION_HELPER_KEYS)
-    adapt_image_dimensions(model, payload, extra)
+    adapt_image_dimensions(model_id, payload, extra)
     _normalize_image_payload(payload)
+    logger.info(
+        "Comfly image generation payload prepared: model=%s async=%s keys=%s params=%s",
+        model_id,
+        params.get("async"),
+        sorted(payload.keys()),
+        sorted(params.keys()),
+    )
     return payload, params
 
 
@@ -583,10 +814,11 @@ def build_image_edit_data(
     if not image_urls:
         raise AppException("图像编辑需要传入 image", code=40007, status_code=400)
 
-    data: Dict[str, Any] = {"model": model, "prompt": _normalize_image_prompt(prompt)}
+    model_id = _normalize_model_id(model, "绘图 model 不能为空")
+    data: Dict[str, Any] = {"model": model_id, "prompt": _normalize_image_prompt(prompt)}
     params = _build_image_query_params(extra)
     _merge_image_extra(data, extra, IMAGE_EDIT_REQUEST_KEYS, IMAGE_EDIT_HELPER_KEYS)
-    adapt_image_dimensions(model, data, extra)
+    adapt_image_dimensions(model_id, data, extra)
     _normalize_image_payload(data)
 
     mask_url = _collect_mask_input_url(extra)
@@ -598,10 +830,13 @@ async def query_image_generation(task_id: str) -> Dict[str, Any]:
 
 
 async def create_video_generation(model: str, prompt: str, extra: Dict[str, Any]) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {"model": model, "prompt": prompt}
-    allowed_keys = allowed_video_request_keys(model, extra.get("_model_capabilities") or {})
-    _normalize_video_images(payload, extra, allowed_keys)
-    _merge_video_extra(payload, model, extra, VIDEO_GENERATION_HELPER_KEYS)
+    model_id = _normalize_model_id(model, "视频 model 不能为空")
+    capabilities = merge_video_capabilities(model_id, extra.get("_model_capabilities") or {})
+    capabilities["model_id"] = model_id
+    allowed_keys = allowed_video_request_keys(model_id, capabilities)
+    payload: Dict[str, Any] = {"model": model_id, "prompt": _normalize_video_prompt(prompt)}
+    _normalize_video_media(payload, extra, allowed_keys, capabilities)
+    _merge_video_extra(payload, model_id, extra, VIDEO_GENERATION_HELPER_KEYS, capabilities)
     return await _post_json("/v2/videos/generations", payload)
 
 
@@ -610,12 +845,12 @@ async def query_video_generation(task_id: str) -> Dict[str, Any]:
 
 
 def _build_image_query_params(extra: Dict[str, Any]) -> Dict[str, Any]:
-    params: Dict[str, Any] = {}
+    params: Dict[str, Any] = {"async": "true"}
     async_value = extra.get("async")
     if async_value is None:
         async_value = extra.get("is_async")
-    if async_value is not None and _normalize_bool_param("async", async_value):
-        params["async"] = "true"
+    if async_value is not None and not _normalize_bool_param("async", async_value):
+        raise AppException("绘图任务必须使用 async=true 异步处理", code=40020, status_code=400)
 
     webhook = extra.get("webhook")
     if webhook is not None:
@@ -686,13 +921,37 @@ def _normalize_image_request_value(key: str, value: Any) -> Any:
         if text not in IMAGE_QUALITY_VALUES:
             raise AppException("绘图 quality 参数不支持", code=40020, status_code=400)
         return text
+    if key == "style":
+        text = str(value).strip().lower()
+        if not text:
+            return None
+        if text not in IMAGE_STYLE_VALUES:
+            raise AppException("绘图 style 只支持 vivid 或 natural", code=40020, status_code=400)
+        return text
+    if key == "user":
+        text = str(value).strip()
+        return text or None
     return value
+
+
+def _normalize_model_id(model: str, message: str) -> str:
+    text = str(model or "").strip()
+    if not text:
+        raise AppException(message, code=40020, status_code=400)
+    return text
 
 
 def _normalize_image_prompt(prompt: str) -> str:
     text = str(prompt or "").strip()
     if not text:
         raise AppException("绘图 prompt 不能为空", code=40020, status_code=400)
+    return text
+
+
+def _normalize_video_prompt(prompt: str) -> str:
+    text = str(prompt or "").strip()
+    if not text:
+        raise AppException("视频 prompt 不能为空", code=40021, status_code=400)
     return text
 
 
@@ -754,29 +1013,57 @@ def _merge_video_extra(
     model: str,
     extra: Dict[str, Any],
     excluded_keys: Set[str],
+    capabilities: Dict[str, Any],
 ) -> None:
-    allowed_keys = allowed_video_request_keys(model, extra.get("_model_capabilities") or {})
+    allowed_keys = allowed_video_request_keys(model, capabilities)
     for key, value in extra.items():
         if key in excluded_keys or key not in allowed_keys or value is None:
             continue
         if key == "images" and key in payload:
             continue
-        payload[key] = value
+        if key == "videos" and key in payload:
+            continue
+        if key == "audio_url" and key in payload:
+            continue
+        normalized = _normalize_video_request_value(key, value, capabilities)
+        if normalized is None:
+            continue
+        payload[key] = normalized
+    if "camerafixed" in allowed_keys and "camerafixed" not in payload and extra.get("camera_fixed") is not None:
+        payload["camerafixed"] = _normalize_video_request_value("camerafixed", extra["camera_fixed"], capabilities)
     adapt_video_dimensions(payload, extra, allowed_keys)
+    _apply_video_ratio_alias(payload, extra, allowed_keys, capabilities)
+    _normalize_video_payload(payload, capabilities)
 
 
-def _normalize_video_images(payload: Dict[str, Any], extra: Dict[str, Any], allowed_keys: Set[str]) -> None:
-    if "images" not in allowed_keys:
-        return
+def _normalize_video_media(
+    payload: Dict[str, Any],
+    extra: Dict[str, Any],
+    allowed_keys: Set[str],
+    capabilities: Dict[str, Any],
+) -> None:
+    if "images" in allowed_keys:
+        image_urls = _collect_video_image_urls(extra)
+        if image_urls:
+            _validate_video_media_limit("images", image_urls, capabilities)
+            payload["images"] = image_urls
 
-    image_urls = _collect_video_image_urls(extra)
-    if image_urls:
-        payload["images"] = image_urls
+    if "videos" in allowed_keys:
+        video_urls = _collect_video_urls(extra)
+        if video_urls:
+            payload["videos"] = [_normalize_video_url(value, "videos") for value in video_urls]
+
+    if "audio_url" in allowed_keys and "audio_url" not in payload:
+        audio_url = _collect_video_audio_url(extra)
+        if audio_url:
+            payload["audio_url"] = _normalize_video_url(audio_url, "audio_url")
 
 
 def _collect_video_image_urls(extra: Dict[str, Any]) -> List[str]:
     video_mode = str(extra.get("video_mode") or extra.get("capability") or "").strip()
-    if video_mode == "first_last_frame":
+    if video_mode == "first_last_frame" or any(
+        key in extra for key in ("first_frame_url", "first_frame", "last_frame_url", "last_frame")
+    ):
         return _collect_first_last_frame_urls(extra)
 
     values: List[Any] = []
@@ -802,6 +1089,182 @@ def _collect_first_last_frame_urls(extra: Dict[str, Any]) -> List[str]:
             seen.add(url)
             urls.append(url)
     return urls
+
+
+def _collect_video_urls(extra: Dict[str, Any]) -> List[str]:
+    values: List[Any] = []
+    for key in ("videos", "video", "video_url", "video_urls", "reference_video", "reference_video_urls", "reference_videos"):
+        if key in extra:
+            values.extend(_as_list(extra[key]))
+    return _collect_urls(values)
+
+
+def _collect_video_audio_url(extra: Dict[str, Any]) -> Optional[str]:
+    values: List[Any] = []
+    for key in ("audio_url", "audio", "audio_urls"):
+        if key in extra:
+            values.extend(_as_list(extra[key]))
+    urls = _collect_urls(values)
+    return urls[0] if urls else None
+
+
+def _apply_video_ratio_alias(
+    payload: Dict[str, Any],
+    extra: Dict[str, Any],
+    allowed_keys: Set[str],
+    capabilities: Dict[str, Any],
+) -> None:
+    if "ratio" not in allowed_keys or "ratio" in payload:
+        return
+    ratio = normalize_ratio(extra.get("ratio") or extra.get("aspect_ratio"))
+    if not ratio:
+        return
+    payload["ratio"] = _normalize_video_choice("ratio", ratio, capabilities, value_key="ratios")
+
+
+def _normalize_video_payload(payload: Dict[str, Any], capabilities: Dict[str, Any]) -> None:
+    for key in list(payload.keys()):
+        if key in {"model", "prompt", "images", "videos"}:
+            continue
+        normalized = _normalize_video_request_value(key, payload[key], capabilities)
+        if normalized is None:
+            payload.pop(key, None)
+            continue
+        payload[key] = normalized
+    _validate_sora2_payload(payload)
+
+
+def _normalize_video_request_value(key: str, value: Any, capabilities: Dict[str, Any]) -> Any:
+    if isinstance(value, str) and not value.strip():
+        return None
+    if key == "images":
+        urls = [_normalize_video_image_url(item) for item in _collect_urls(_as_list(value))]
+        _validate_video_media_limit("images", urls, capabilities)
+        return urls
+    if key == "videos":
+        return [_normalize_video_url(item, "videos") for item in _collect_urls(_as_list(value))]
+    if key == "audio_url":
+        return _normalize_video_url(value, key)
+    if key in VIDEO_URL_REQUEST_KEYS:
+        return _normalize_video_url(value, key)
+    if key in VIDEO_BOOL_REQUEST_KEYS:
+        return _normalize_strict_bool(key, value)
+    if key in VIDEO_INT_REQUEST_KEYS:
+        return _normalize_video_int(key, value, 0, VIDEO_INT_MAX_VALUES[key])
+    if key == "duration":
+        return _normalize_video_duration(value, capabilities)
+    if key in {"aspect_ratio", "ratio"}:
+        ratio = normalize_ratio(value)
+        if not ratio:
+            raise AppException(f"视频参数 {key} 不支持", code=40021, status_code=400)
+        return _normalize_video_choice(key, ratio, capabilities, value_key="ratios")
+    if key == "resolution":
+        return _normalize_video_resolution_value(value, capabilities)
+    if key in VIDEO_ARRAY_REQUEST_KEYS:
+        if isinstance(value, list):
+            return value
+        text = str(value).strip()
+        return text or None
+    if key in VIDEO_STRING_REQUEST_KEYS:
+        text = str(value).strip()
+        return text or None
+    return value
+
+
+def _normalize_video_duration(value: Any, capabilities: Dict[str, Any]) -> Any:
+    if isinstance(value, bool):
+        raise AppException("视频 duration 必须是整数或枚举字符串", code=40021, status_code=400)
+    text = str(value).strip()
+    if not text:
+        return None
+    allowed = capabilities.get("durations")
+    if allowed:
+        allowed_text = {str(item) for item in allowed}
+        if text not in allowed_text:
+            raise AppException(f"视频 duration 仅支持 {', '.join(sorted(allowed_text))}", code=40021, status_code=400)
+    try:
+        number = int(text)
+    except ValueError:
+        return text
+    return text if _is_sora2_model(str(capabilities.get("model_id") or "")) else number
+
+
+def _normalize_video_resolution_value(value: Any, capabilities: Dict[str, Any]) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise AppException("视频 resolution 不能为空", code=40021, status_code=400)
+    allowed = capabilities.get("resolutions")
+    if allowed:
+        normalized = {str(item).lower(): str(item) for item in allowed}
+        if text.lower() not in normalized:
+            raise AppException(f"视频 resolution 仅支持 {', '.join(str(item) for item in allowed)}", code=40021, status_code=400)
+        return normalized[text.lower()]
+    return text
+
+
+def _normalize_video_choice(key: str, value: str, capabilities: Dict[str, Any], *, value_key: str) -> str:
+    allowed = capabilities.get(value_key)
+    if not allowed:
+        return value
+    normalized = {str(item).lower(): str(item) for item in allowed}
+    lowered = str(value).strip().lower()
+    if lowered not in normalized:
+        raise AppException(f"视频参数 {key} 仅支持 {', '.join(str(item) for item in allowed)}", code=40021, status_code=400)
+    return normalized[lowered]
+
+
+def _normalize_video_int(key: str, value: Any, lower: int, upper: int) -> int:
+    if isinstance(value, bool):
+        raise AppException(f"视频参数 {key} 必须是整数", code=40021, status_code=400)
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise AppException(f"视频参数 {key} 必须是整数", code=40021, status_code=400) from exc
+    if number < lower or number > upper:
+        raise AppException(f"视频参数 {key} 必须在 {lower}-{upper} 之间", code=40021, status_code=400)
+    return number
+
+
+def _normalize_strict_bool(key: str, value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise AppException(f"视频参数 {key} 必须是布尔值", code=40021, status_code=400)
+
+
+def _normalize_video_image_url(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text.startswith(VIDEO_URL_OR_BASE64_PREFIXES):
+        raise AppException("视频 images 必须是 URL 或 base64 data URL", code=40021, status_code=400)
+    return text
+
+
+def _normalize_video_url(value: Any, key: str) -> str:
+    url = _extract_media_url(value)
+    text = str(url or value or "").strip()
+    if not text.startswith(("http://", "https://")):
+        raise AppException(f"视频参数 {key} 必须是 HTTP(S) URL", code=40021, status_code=400)
+    return text
+
+
+def _validate_video_media_limit(key: str, values: List[str], capabilities: Dict[str, Any]) -> None:
+    media_limits = capabilities.get("media_limits") or {}
+    limit = media_limits.get(key)
+    if isinstance(limit, int) and limit > 0 and len(values) > limit:
+        raise AppException(f"视频 {key} 最多支持 {limit} 个", code=40021, status_code=400)
+
+
+def _validate_sora2_payload(payload: Dict[str, Any]) -> None:
+    model_id = str(payload.get("model") or "")
+    if not _is_sora2_model(model_id):
+        return
+    if payload.get("hd") is True and model_id != "sora-2-pro":
+        raise AppException("Sora2 仅 sora-2-pro 支持 hd", code=40021, status_code=400)
+    if str(payload.get("duration") or "") == "25" and model_id != "sora-2-pro":
+        raise AppException("Sora2 仅 sora-2-pro 支持 25 秒", code=40021, status_code=400)
+
+
+def _is_sora2_model(model: str) -> bool:
+    return str(model or "").strip().lower().replace("_", "-").startswith("sora-2")
 
 
 def _collect_urls(values: List[Any]) -> List[str]:

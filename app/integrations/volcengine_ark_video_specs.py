@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional, Set
 
 VOLCENGINE_ARK_VENDOR = "volcengine_ark"
 VOLCENGINE_ARK_VIDEO_MODEL_PREFIXES = ("doubao-seedance",)
-VOLCENGINE_ARK_VIDEO_RATIOS = ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
+VOLCENGINE_ARK_VIDEO_RATIOS = ["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
 VOLCENGINE_ARK_VIDEO_RESOLUTION_ORDER = ("480p", "720p", "1080p")
 VOLCENGINE_ARK_VIDEO_RESOLUTIONS_BY_MODEL = {
     "doubao-seedance-2-0-260128": ["480p", "720p", "1080p"],
@@ -24,17 +24,25 @@ VOLCENGINE_ARK_VIDEO_CAPABILITIES: Dict[str, Any] = {
         {"name": "resolution", "type": "select", "label": "分辨率", "required": False, "options": DEFAULT_VIDEO_RESOLUTIONS},
         {"name": "generate_audio", "type": "boolean", "label": "生成音频", "required": False},
         {"name": "return_last_frame", "type": "boolean", "label": "返回尾帧", "required": False},
+        {"name": "watermark", "type": "boolean", "label": "水印", "required": False},
     ],
     "request_keys": [
+        "callback_url",
         "duration",
+        "execution_expires_after",
         "generate_audio",
+        "priority",
         "ratio",
         "resolution",
         "return_last_frame",
+        "safety_identifier",
+        "seed",
+        "tools",
+        "watermark",
     ],
     "media_limits": {"images": 9, "videos": 3, "audios": 3},
     "defaults": {
-        "text_ratio": "16:9",
+        "text_ratio": "adaptive",
         "reference_ratio": "adaptive",
         "duration": 5,
         "resolution": "720p",
@@ -63,7 +71,7 @@ def merge_video_capabilities(
     capabilities["fields"] = _video_fields(resolutions)
     capabilities["defaults"] = {
         **deepcopy(VOLCENGINE_ARK_VIDEO_CAPABILITIES["defaults"]),
-        "reference_ratio": "16:9",
+        "reference_ratio": "adaptive",
         "resolution": resolutions[-1],
     }
     capabilities["resolutions"] = resolutions
@@ -75,7 +83,7 @@ def merge_video_capabilities(
     capabilities["fields"] = _video_fields(resolutions)
     capabilities["defaults"] = {
         **deepcopy(VOLCENGINE_ARK_VIDEO_CAPABILITIES["defaults"]),
-        "reference_ratio": "16:9",
+        "reference_ratio": "adaptive",
         "resolution": resolutions[-1],
     }
     capabilities["resolutions"] = resolutions
@@ -105,6 +113,10 @@ def normalize_video_resolution(value: Any, capabilities: Optional[Dict[str, Any]
     if lower_or_equal:
         return max(lower_or_equal)[1]
     return min(indexed)[1]
+
+
+def is_known_video_resolution(value: Any) -> bool:
+    return _normalize_resolution(value) is not None
 
 
 def _supported_resolutions(model_id: str) -> list[str]:

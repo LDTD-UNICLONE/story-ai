@@ -1,4 +1,5 @@
 import inspect
+import re
 from typing import Any, Dict, List, Optional, Set
 
 from starlette.concurrency import run_in_threadpool
@@ -7,7 +8,11 @@ from app.core.config import settings
 from app.core.exceptions import AppException
 from app.integrations.comfly import _as_list, _extract_media_url
 from app.integrations.comfly_dimensions import normalize_ratio
-from app.integrations.volcengine_ark_video_specs import allowed_video_request_keys, normalize_video_resolution
+from app.integrations.volcengine_ark_video_specs import (
+    allowed_video_request_keys,
+    is_known_video_resolution,
+    normalize_video_resolution,
+)
 
 
 _client: Optional[Any] = None
@@ -40,8 +45,8 @@ VIDEO_HELPER_KEYS = {
     "resolution",
 }
 
-DEFAULT_TEXT_VIDEO_RATIO = "16:9"
-DEFAULT_REFERENCE_VIDEO_RATIO = "16:9"
+DEFAULT_TEXT_VIDEO_RATIO = "adaptive"
+DEFAULT_REFERENCE_VIDEO_RATIO = "adaptive"
 DEFAULT_VIDEO_DURATION = 5
 DEFAULT_GENERATE_AUDIO = True
 DEFAULT_WATERMARK = False
@@ -64,6 +69,15 @@ ALLOWED_ROLES_BY_TYPE = {
     "video_url": {"reference_video"},
     "audio_url": {"reference_audio"},
 }
+
+UNSUPPORTED_SEEDANCE_2_REQUEST_KEYS = {
+    "camera_fixed",
+    "draft",
+    "draft_task_id",
+    "frames",
+    "service_tier",
+}
+MAX_SEED = 2**32 - 1
 
 
 async def init_volcengine_ark_client() -> Any:
@@ -88,8 +102,9 @@ async def close_volcengine_ark_client() -> None:
 
 async def create_video_generation(model: str, prompt: str, extra: Dict[str, Any]) -> Dict[str, Any]:
     client = await init_volcengine_ark_client()
+    model_id = _normalize_model_id(model)
     payload: Dict[str, Any] = {
-        "model": model,
+        "model": model_id,
         "content": _build_content(prompt, extra),
     }
     _merge_video_extra(payload, extra)
@@ -185,7 +200,10 @@ def _build_content(prompt: str, extra: Dict[str, Any]) -> List[Dict[str, Any]]:
         _validate_multimodal_content(content)
         return content
 
-    content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+    content: List[Dict[str, Any]] = []
+    text = str(prompt or "").strip()
+    if text:
+        content.append({"type": "text", "text": text})
     content.extend(_build_media_content(extra))
     _validate_multimodal_content(content)
     return content
@@ -208,16 +226,16 @@ def _normalize_content_items(raw_content: Any) -> List[Dict[str, Any]]:
     content: List[Dict[str, Any]] = []
     for value in _as_list(raw_content):
         if not isinstance(value, dict):
-            continue
+            raise AppException("火山方舟 content 数组项必须是对象", code=40010, status_code=400)
         item_type = str(value.get("type") or "").strip()
         if item_type == "text":
-            text = value.get("text")
-            if text:
-                content.append({"type": "text", "text": str(text)})
+            text = str(value.get("text") or "").strip()
+            if not text:
+                raise AppException("火山方舟 text content 不能为空", code=40010, status_code=400)
+            content.append({"type": "text", "text": text})
             continue
         item = _normalize_media_item(value)
-        if item:
-            content.append(item)
+        content.append(item)
     return content
 
 
@@ -267,23 +285,28 @@ def _collect_media_items(extra: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _normalize_media_item(value: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(value, dict):
-        return None
+        raise AppException("火山方舟媒体 content 必须是对象", code=40010, status_code=400)
 
     item_type = str(value.get("type") or "").strip()
     role = value.get("role")
     url = _extract_ark_media_url(value)
     if not item_type:
         item_type = _infer_media_item_type(value)
-    if item_type not in MEDIA_KEY_BY_TYPE or not url:
-        return None
+    if item_type == "draft_task":
+        raise AppException("Seedance 2.0 暂不支持 draft_task 输入", code=40010, status_code=400)
+    if item_type not in MEDIA_KEY_BY_TYPE:
+        raise AppException("火山方舟 content.type 不支持", code=40010, status_code=400)
+    if not url:
+        raise AppException("火山方舟媒体 content 缺少 url", code=40010, status_code=400)
 
     media_key = MEDIA_KEY_BY_TYPE[item_type]
-    normalized_role = str(role) if role else DEFAULT_ROLE_BY_TYPE[item_type]
-    if normalized_role not in ALLOWED_ROLES_BY_TYPE[item_type]:
+    normalized_role = str(role).strip() if role not in (None, "") else ""
+    if normalized_role and normalized_role not in ALLOWED_ROLES_BY_TYPE[item_type]:
         raise AppException("火山方舟多模态参考 role 不支持", code=40010, status_code=400)
 
     normalized: Dict[str, Any] = {"type": item_type, media_key: {"url": url}}
-    normalized["role"] = normalized_role
+    if normalized_role:
+        normalized["role"] = normalized_role
     return normalized
 
 
@@ -332,27 +355,67 @@ def _validate_multimodal_content(content: List[Dict[str, Any]]) -> None:
         raise AppException("火山方舟多模态参考最多支持 3 个音频", code=40010, status_code=400)
     if audio_count and not image_count and not video_count:
         raise AppException("火山方舟多模态参考不支持仅文本加音频或纯音频输入", code=40010, status_code=400)
+    if not image_count and not video_count and not audio_count:
+        if not any(item.get("type") == "text" and str(item.get("text") or "").strip() for item in content):
+            raise AppException("文生视频需要传入文本提示词", code=40010, status_code=400)
+        return
+
+    image_roles = [str(item.get("role") or "") for item in content if item.get("type") == "image_url"]
+    has_first_frame = "first_frame" in image_roles
+    has_last_frame = "last_frame" in image_roles
+    has_reference_image = "reference_image" in image_roles
+    has_roleless_image = any(role == "" for role in image_roles)
+    has_reference_video_or_audio = video_count > 0 or audio_count > 0
+
+    if has_last_frame:
+        if not has_first_frame:
+            raise AppException("首尾帧生成必须同时传入 first_frame 和 last_frame", code=40010, status_code=400)
+        if image_count != 2 or has_reference_image or has_roleless_image or has_reference_video_or_audio:
+            raise AppException("首尾帧生成只允许 1 张首帧图和 1 张尾帧图", code=40010, status_code=400)
+        return
+
+    if has_first_frame:
+        if image_count != 1 or has_reference_image or has_reference_video_or_audio:
+            raise AppException("首帧生成只允许 1 张首帧图，不可混入参考图、视频或音频", code=40010, status_code=400)
+        return
+
+    if has_roleless_image and image_count == 1 and not has_reference_video_or_audio:
+        return
+
+    if image_count and (has_roleless_image or not has_reference_image):
+        raise AppException("多模态参考图片必须设置 role=reference_image", code=40010, status_code=400)
+    if video_count and not _all_content_role(content, "video_url", "reference_video"):
+        raise AppException("多模态参考视频必须设置 role=reference_video", code=40010, status_code=400)
+    if audio_count and not _all_content_role(content, "audio_url", "reference_audio"):
+        raise AppException("多模态参考音频必须设置 role=reference_audio", code=40010, status_code=400)
 
 
 def _count_content_type(content: List[Dict[str, Any]], item_type: str) -> int:
     return sum(1 for item in content if item.get("type") == item_type)
 
 
+def _all_content_role(content: List[Dict[str, Any]], item_type: str, role: str) -> bool:
+    return all(str(item.get("role") or "") == role for item in content if item.get("type") == item_type)
+
+
 def _merge_video_extra(payload: Dict[str, Any], extra: Dict[str, Any]) -> None:
     capabilities = extra.get("_model_capabilities") or {}
     allowed_keys = allowed_video_request_keys(capabilities)
+    _reject_unsupported_seedance_2_keys(extra)
     for key, value in extra.items():
         if key in VIDEO_HELPER_KEYS or key not in allowed_keys or value is None:
             continue
-        payload[key] = value
+        payload[key] = _normalize_video_request_value(key, value)
 
     allowed_ratios = set(capabilities.get("ratios") or [])
     ratio = normalize_ratio(extra.get("aspect_ratio") or extra.get("ratio"))
     if ratio and allowed_ratios and ratio not in allowed_ratios:
-        ratio = None
+        raise AppException("火山方舟视频 ratio 参数不支持", code=40010, status_code=400)
     if ratio and "ratio" in allowed_keys and "ratio" not in payload:
         payload["ratio"] = ratio
     if "resolution" in allowed_keys:
+        if extra.get("resolution") not in (None, "") and not is_known_video_resolution(extra.get("resolution")):
+            raise AppException("火山方舟视频 resolution 参数不支持", code=40010, status_code=400)
         payload["resolution"] = normalize_video_resolution(extra.get("resolution"), capabilities)
     _apply_video_defaults(payload, extra, allowed_keys, capabilities)
 
@@ -379,6 +442,103 @@ def _apply_video_defaults(
         payload["generate_audio"] = DEFAULT_GENERATE_AUDIO
     if "watermark" not in payload:
         payload["watermark"] = DEFAULT_WATERMARK
+
+
+def _reject_unsupported_seedance_2_keys(extra: Dict[str, Any]) -> None:
+    for key in UNSUPPORTED_SEEDANCE_2_REQUEST_KEYS:
+        if key in extra and extra.get(key) is not None:
+            raise AppException(f"Seedance 2.0 暂不支持参数 {key}", code=40010, status_code=400)
+
+
+def _normalize_video_request_value(key: str, value: Any) -> Any:
+    if key == "duration":
+        return _normalize_duration(value)
+    if key in {"generate_audio", "return_last_frame", "watermark"}:
+        return _normalize_bool(key, value)
+    if key == "resolution":
+        return str(value).strip().lower()
+    if key == "ratio":
+        ratio = normalize_ratio(value)
+        if not ratio:
+            raise AppException("火山方舟视频 ratio 参数不支持", code=40010, status_code=400)
+        return ratio
+    if key == "seed":
+        return _normalize_int_range("seed", value, -1, MAX_SEED)
+    if key == "execution_expires_after":
+        return _normalize_int_range("execution_expires_after", value, 3600, 259200)
+    if key == "priority":
+        return _normalize_int_range("priority", value, 0, 9)
+    if key == "callback_url":
+        return _normalize_callback_url(value)
+    if key == "safety_identifier":
+        return _normalize_safety_identifier(value)
+    if key == "tools":
+        return _normalize_tools(value)
+    return value
+
+
+def _normalize_duration(value: Any) -> int:
+    if isinstance(value, bool):
+        raise AppException("火山方舟视频 duration 必须是整数", code=40010, status_code=400)
+    try:
+        duration = int(value)
+    except (TypeError, ValueError) as exc:
+        raise AppException("火山方舟视频 duration 必须是整数", code=40010, status_code=400) from exc
+    if duration == -1:
+        return duration
+    if duration < 4 or duration > 15:
+        raise AppException("Seedance 2.0 视频 duration 仅支持 4-15 秒或 -1", code=40010, status_code=400)
+    return duration
+
+
+def _normalize_bool(key: str, value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise AppException(f"火山方舟视频 {key} 必须是布尔值", code=40010, status_code=400)
+
+
+def _normalize_int_range(key: str, value: Any, lower: int, upper: int) -> int:
+    if isinstance(value, bool):
+        raise AppException(f"火山方舟视频 {key} 必须是整数", code=40010, status_code=400)
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise AppException(f"火山方舟视频 {key} 必须是整数", code=40010, status_code=400) from exc
+    if number < lower or number > upper:
+        raise AppException(f"火山方舟视频 {key} 必须在 {lower}-{upper} 之间", code=40010, status_code=400)
+    return number
+
+
+def _normalize_callback_url(value: Any) -> str:
+    url = str(value or "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise AppException("火山方舟视频 callback_url 必须是 http(s) URL", code=40010, status_code=400)
+    return url
+
+
+def _normalize_safety_identifier(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or len(text) > 64 or not re.fullmatch(r"[A-Za-z0-9._:-]+", text):
+        raise AppException("火山方舟视频 safety_identifier 必须是 1-64 位英文字符串", code=40010, status_code=400)
+    return text
+
+
+def _normalize_tools(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        raise AppException("火山方舟视频 tools 必须是数组", code=40010, status_code=400)
+    tools: List[Dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict) or item.get("type") != "web_search":
+            raise AppException("火山方舟视频 tools 仅支持 type=web_search", code=40010, status_code=400)
+        tools.append({"type": "web_search"})
+    return tools
+
+
+def _normalize_model_id(model: str) -> str:
+    model_id = str(model or "").strip()
+    if not model_id:
+        raise AppException("火山方舟视频 model 不能为空", code=40010, status_code=400)
+    return model_id
 
 
 def _has_reference_media(payload: Dict[str, Any], extra: Dict[str, Any]) -> bool:
