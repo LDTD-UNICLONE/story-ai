@@ -18,6 +18,7 @@ from app.api.v1.endpoints import (
     task_records,
     uploads,
     users,
+    works,
 )
 from app.api.v1.endpoints.admin import announcements as admin_announcements
 from app.api.v1.endpoints.admin import materials as admin_materials
@@ -29,6 +30,7 @@ from app.api.v1.endpoints.admin import styles as admin_styles
 from app.api.v1.endpoints.admin import system_logs as admin_system_logs
 from app.api.v1.endpoints.admin import task_records as admin_task_records
 from app.api.v1.endpoints.admin import users as admin_users
+from app.api.v1.endpoints.admin import works as admin_works
 
 api_router = APIRouter()
 api_router.include_router(admin_announcements.router, tags=["Admin Announcements"])
@@ -41,6 +43,7 @@ api_router.include_router(admin_styles.router, tags=["Admin Styles"])
 api_router.include_router(admin_system_logs.router, tags=["Admin System Logs"])
 api_router.include_router(admin_task_records.router, tags=["Admin Task Records"])
 api_router.include_router(admin_users.router, tags=["Admin Users"])
+api_router.include_router(admin_works.router, tags=["Admin Works"])
 api_router.include_router(announcements.router, tags=["Announcements"])
 api_router.include_router(auth.router, tags=["Auth"])
 api_router.include_router(conversations.router, tags=["Conversations"])
@@ -57,4 +60,5 @@ api_router.include_router(styles.router, tags=["Styles"])
 api_router.include_router(task_records.router, tags=["Task Records"])
 api_router.include_router(uploads.router, tags=["Uploads"])
 api_router.include_router(users.router, tags=["Users"])
+api_router.include_router(works.router, tags=["Works"])
 api_router.include_router(health.router, tags=["Health"])

@@ -11,6 +11,7 @@ from app.models.project_storyboard import ProjectStoryboard
 from app.models.style import Style
 from app.models.task_record import UserTaskRecord
 from app.models.user import User
+from app.models.work import UserWork, UserWorkLike, UserWorkMedia, UserWorkUpload
 
 __all__ = [
     "AiModel",
@@ -30,4 +31,8 @@ __all__ = [
     "UserPointsTransaction",
     "UserRechargeOrder",
     "UserTaskRecord",
+    "UserWork",
+    "UserWorkLike",
+    "UserWorkMedia",
+    "UserWorkUpload",
 ]

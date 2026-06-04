@@ -5,7 +5,6 @@ from fastapi import UploadFile
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
 from app.core.exceptions import AppException
 from app.models.material import Material
 from app.schemas.material import (
@@ -18,12 +17,6 @@ from app.services.uploads import detect_content_type, upload_story_file
 MATERIAL_UPLOAD_CATEGORY = "material"
 
 
-def build_material_image_url(material_id: UUID, *, admin: bool = False) -> str:
-    prefix = settings.api_prefix.rstrip("/")
-    route_prefix = "admin/materials" if admin else "materials"
-    return f"{prefix}/{route_prefix}/{material_id}/image"
-
-
 def build_material_out(material: Material) -> MaterialBaseOut:
     return MaterialBaseOut(
         id=material.id,
@@ -31,7 +24,7 @@ def build_material_out(material: Material) -> MaterialBaseOut:
         category=material.category,
         description=material.description,
         tags=material.tags or [],
-        image_url=build_material_image_url(material.id),
+        image_url=material.image_url,
         filename=material.filename,
         content_type=material.content_type,
         size=material.size,
@@ -41,7 +34,6 @@ def build_material_out(material: Material) -> MaterialBaseOut:
 
 def build_admin_material_out(material: Material) -> AdminMaterialOut:
     base = build_material_out(material).model_dump()
-    base["image_url"] = build_material_image_url(material.id, admin=True)
     return AdminMaterialOut(
         **base,
         is_enabled=material.is_enabled,

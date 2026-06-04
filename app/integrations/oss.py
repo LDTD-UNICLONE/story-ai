@@ -62,6 +62,26 @@ class OssClient:
         except Exception as exc:
             raise AppException("OSS 文件读取失败", code=50012, status_code=500) from exc
 
+    def get_object_range(self, object_key: str, start: int, end: Optional[int] = None):
+        byte_range = (start, end) if end is not None else (start, "")
+        try:
+            return self.bucket.get_object(object_key, byte_range=byte_range)
+        except Exception as exc:
+            raise AppException("OSS 文件读取失败", code=50012, status_code=500) from exc
+
+    def delete_object(self, object_key: str) -> None:
+        try:
+            result = self.bucket.delete_object(object_key)
+        except Exception as exc:
+            raise AppException(f"OSS 文件删除失败：{_oss_exception_message(exc)}", code=50014, status_code=500) from exc
+        if result.status >= 300:
+            request_id = getattr(result, "request_id", "") or "-"
+            raise AppException(
+                f"OSS 文件删除失败：status={result.status}, request_id={request_id}",
+                code=50014,
+                status_code=500,
+            )
+
 
 def _oss_exception_message(exc: Exception) -> str:
     parts = []
