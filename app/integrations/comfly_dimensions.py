@@ -81,11 +81,14 @@ IMAGE_MODEL_SIZE_POLICIES = {
         "qualities": ("2k", "3k", "4k"),
         "default_quality": "2k",
         "allow_custom_size": False,
+        "min_pixels": 3686400,
     },
     "doubao-seedream-4-5-251128": {
         "qualities": ("2k", "4k"),
         "default_quality": "2k",
         "allow_custom_size": False,
+        "fallback_quality": "4k",
+        "min_pixels": 3686400,
     },
 }
 
@@ -93,6 +96,13 @@ DEFAULT_IMAGE_SIZE_POLICY = {
     "qualities": ("1k", "2k", "4k"),
     "default_quality": "2k",
     "allow_custom_size": False,
+}
+
+DOUBAO_SEEDREAM_IMAGE_SIZE_POLICY = {
+    "qualities": ("2k", "3k", "4k"),
+    "default_quality": "2k",
+    "allow_custom_size": False,
+    "min_pixels": 3686400,
 }
 
 VIDEO_SIZE_BY_RATIO = {
@@ -195,6 +205,8 @@ def _image_size_policy(model: str) -> Dict[str, Any]:
     for model_id, policy in IMAGE_MODEL_SIZE_POLICIES.items():
         if normalized.endswith(model_id) or model_id in normalized:
             return policy
+    if "seedream" in normalized or "doubao" in normalized:
+        return DOUBAO_SEEDREAM_IMAGE_SIZE_POLICY
     return DEFAULT_IMAGE_SIZE_POLICY
 
 
@@ -206,13 +218,12 @@ def _model_image_size(
     quality = _select_image_quality(policy, extra)
     target_ratio = ratio or DEFAULT_RATIO_BY_IMAGE_QUALITY.get(quality, "1:1")
     size = COMFLY_IMAGE_SIZE_BY_RATIO.get(quality, {}).get(target_ratio)
-    if size:
+    if size and _satisfies_min_pixels(size, policy):
         return size
 
-    fallback_quality = policy.get("fallback_quality")
-    if fallback_quality:
+    for fallback_quality in _fallback_qualities(policy, quality):
         size = COMFLY_IMAGE_SIZE_BY_RATIO.get(str(fallback_quality), {}).get(target_ratio)
-        if size:
+        if size and _satisfies_min_pixels(size, policy):
             return size
     return None
 
@@ -275,6 +286,8 @@ def _normalize_quality(value: Any) -> Optional[str]:
 
 
 def _is_custom_size_allowed(policy: Dict[str, Any], requested_size: str) -> bool:
+    if not _satisfies_min_pixels(requested_size, policy):
+        return False
     if policy.get("allow_custom_size"):
         return True
     return any(
@@ -293,3 +306,34 @@ def _normalize_size(value: Any) -> Optional[str]:
     if not width.isdigit() or not height.isdigit():
         return None
     return f"{int(width)}x{int(height)}"
+
+
+def _fallback_qualities(policy: Dict[str, Any], selected_quality: str) -> Tuple[str, ...]:
+    qualities = tuple(str(quality) for quality in policy["qualities"])
+    selected_index = IMAGE_QUALITY_ORDER.index(selected_quality)
+    higher_qualities = tuple(
+        quality
+        for quality in qualities
+        if IMAGE_QUALITY_ORDER.index(quality) > selected_index
+    )
+    configured = policy.get("fallback_quality")
+    if configured:
+        configured_text = str(configured)
+        if configured_text in qualities and configured_text not in higher_qualities:
+            higher_qualities = (configured_text, *higher_qualities)
+    return higher_qualities
+
+
+def _satisfies_min_pixels(size: str, policy: Dict[str, Any]) -> bool:
+    min_pixels = int(policy.get("min_pixels") or 0)
+    if min_pixels <= 0:
+        return True
+    width, height = _size_pixels(size)
+    return width * height >= min_pixels
+
+
+def _size_pixels(size: str) -> Tuple[int, int]:
+    width, _, height = size.partition("x")
+    if not width.isdigit() or not height.isdigit():
+        return 0, 0
+    return int(width), int(height)
