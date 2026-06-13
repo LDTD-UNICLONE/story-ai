@@ -28,6 +28,18 @@ class WorkMediaCreateItem(SchemaBaseModel):
     sort_order: int = Field(default=0, ge=0)
 
 
+class WorkMediaUpdateItem(SchemaBaseModel):
+    media_id: Optional[UUID] = None
+    upload_id: Optional[UUID] = None
+    sort_order: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_media_source(self) -> "WorkMediaUpdateItem":
+        if bool(self.media_id) == bool(self.upload_id):
+            raise ValueError("作品媒体项必须且只能包含 media_id 或 upload_id")
+        return self
+
+
 class WorkCreateRequest(SchemaBaseModel):
     title: str = Field(..., min_length=1, max_length=128)
     description: Optional[str] = Field(default=None, max_length=2000)
@@ -47,6 +59,7 @@ class WorkUpdateRequest(SchemaBaseModel):
     description: Optional[str] = Field(default=None, max_length=2000)
     visibility: Optional[WorkVisibility] = None
     status: Optional[WorkOwnerStatus] = None
+    media_items: Optional[List[WorkMediaUpdateItem]] = Field(default=None, max_length=20)
 
 
 class AdminWorkUpdateRequest(SchemaBaseModel):

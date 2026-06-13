@@ -1,5 +1,5 @@
 from pathlib import PurePosixPath
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from uuid import UUID, uuid4
 
 from fastapi import UploadFile
@@ -210,15 +210,30 @@ async def update_work(db: AsyncSession, work_id: UUID, user: User, payload: Work
     if work.user_id != user.id:
         raise AppException("无权修改该作品", code=40320, status_code=403)
     data = payload.model_dump(exclude_unset=True)
+    media_items = data.pop("media_items", None)
+    target_status = data.get("status", work.status)
     if "status" in data:
         if data["status"] not in WORK_OWNER_STATUSES:
             raise AppException("作品状态参数不正确", code=40043, status_code=400)
-        if data["status"] == "published" and not await _work_has_media(db, work.id):
+    if target_status == "published":
+        if media_items is not None and not media_items:
             raise AppException("发布作品至少需要一个媒体文件", code=40045, status_code=400)
-    for key, value in data.items():
-        setattr(work, key, value)
-    work.updated_at = beijing_datetime()
-    await db.commit()
+        if media_items is None and not await _work_has_media(db, work.id):
+            raise AppException("发布作品至少需要一个媒体文件", code=40045, status_code=400)
+
+    removed_object_keys: List[str] = []
+    try:
+        if media_items is not None:
+            removed_object_keys = await _replace_work_media(db, work.id, user.id, media_items)
+        for key, value in data.items():
+            setattr(work, key, value)
+        work.updated_at = beijing_datetime()
+        await db.flush()
+        await _delete_oss_objects(removed_object_keys)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
     await db.refresh(work)
     return await _build_work_out(db, work, user)
 
@@ -375,6 +390,73 @@ async def _uploads_for_create(
     return [by_id[upload_id] for upload_id in upload_ids]
 
 
+async def _replace_work_media(
+    db: AsyncSession,
+    work_id: UUID,
+    user_id: UUID,
+    media_items: Sequence[Dict[str, Any]],
+) -> List[str]:
+    existing_media = await _work_media_items(db, work_id)
+    existing_by_id = {media.id: media for media in existing_media}
+    kept_media_ids: Set[UUID] = set()
+    upload_ids: List[UUID] = []
+    sort_by_media_id: Dict[UUID, int] = {}
+    sort_by_upload_id: Dict[UUID, int] = {}
+
+    for item in media_items:
+        media_id = item.get("media_id")
+        upload_id = item.get("upload_id")
+        sort_order = item.get("sort_order", 0)
+
+        if media_id:
+            if media_id in kept_media_ids:
+                raise AppException("作品媒体不能重复选择同一个资源", code=40049, status_code=400)
+            if media_id not in existing_by_id:
+                raise AppException("作品媒体不存在或不属于该作品", code=40049, status_code=400)
+            kept_media_ids.add(media_id)
+            sort_by_media_id[media_id] = sort_order
+            continue
+
+        if upload_id in sort_by_upload_id:
+            raise AppException("作品媒体不能重复选择同一个上传文件", code=40041, status_code=400)
+        upload_ids.append(upload_id)
+        sort_by_upload_id[upload_id] = sort_order
+
+    uploads = await _uploads_for_create(db, user_id, upload_ids)
+    removed_object_keys: List[str] = []
+
+    for media_id, sort_order in sort_by_media_id.items():
+        media = existing_by_id[media_id]
+        media.sort_order = sort_order
+        media.updated_at = beijing_datetime()
+
+    for media in existing_media:
+        if media.id in kept_media_ids:
+            continue
+        if media.object_key:
+            removed_object_keys.append(media.object_key)
+        if media.thumbnail_object_key:
+            removed_object_keys.append(media.thumbnail_object_key)
+        await db.delete(media)
+
+    for upload in uploads:
+        media = UserWorkMedia(
+            id=uuid4(),
+            work_id=work_id,
+            media_type=upload.media_type,
+            url=upload.url,
+            object_key=upload.object_key,
+            filename=upload.filename,
+            content_type=upload.content_type,
+            size=upload.size,
+            sort_order=sort_by_upload_id.get(upload.id, 0),
+        )
+        upload.is_used = True
+        db.add(media)
+
+    return removed_object_keys
+
+
 async def _get_work_or_404(db: AsyncSession, work_id: UUID) -> UserWork:
     result = await db.execute(select(UserWork).where(UserWork.id == work_id))
     work = result.scalar_one_or_none()
@@ -503,6 +585,10 @@ async def _delete_work_oss_objects(db: AsyncSession, work_id: UUID) -> None:
             object_keys.append(object_key)
         if thumbnail_object_key:
             object_keys.append(thumbnail_object_key)
+    await _delete_oss_objects(object_keys)
+
+
+async def _delete_oss_objects(object_keys: Sequence[str]) -> None:
     object_keys = list(dict.fromkeys(object_keys))
     if not object_keys:
         return
