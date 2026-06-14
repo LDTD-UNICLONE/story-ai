@@ -46,6 +46,44 @@ TEXT_MULTIMODAL_MEDIA_KEYS = (
     "video_url",
     "video_urls",
 )
+FIRST_FRAME_URL_KEYS = (
+    "first_frame_url",
+    "first_frame",
+    "firstFrameUrl",
+    "firstFrame",
+    "first_image_url",
+    "firstImageUrl",
+    "start_frame_url",
+    "start_frame",
+    "startFrameUrl",
+    "startFrame",
+    "start_image_url",
+    "startImageUrl",
+    "reference_first_frame_url",
+    "reference_start_frame_url",
+)
+LAST_FRAME_URL_KEYS = (
+    "last_frame_url",
+    "last_frame",
+    "lastFrameUrl",
+    "lastFrame",
+    "last_image_url",
+    "lastImageUrl",
+    "end_frame_url",
+    "end_frame",
+    "endFrameUrl",
+    "endFrame",
+    "end_image_url",
+    "endImageUrl",
+    "ending_frame_url",
+    "endingFrameUrl",
+    "tail_frame_url",
+    "tailFrameUrl",
+    "reference_last_frame_url",
+    "reference_end_frame_url",
+)
+FIRST_FRAME_ROLES = {"first_frame", "start_frame", "reference_first_frame", "reference_start_frame"}
+LAST_FRAME_ROLES = {"last_frame", "end_frame", "ending_frame", "tail_frame", "reference_last_frame"}
 
 
 async def get_enabled_conversation_model_or_404(
@@ -554,17 +592,22 @@ def _build_video_message_extra(extra: Dict[str, Any], ai_model: Optional[AiModel
 
     if generation_mode == "reference":
         reference_images = _dedupe(
-            _collect_extra_urls(payload, ("images", "image_urls", "uploaded_images", "reference_images"))
+            [
+                *_collect_extra_urls(payload, ("images", "image_urls", "uploaded_images", "reference_images")),
+                *_collect_media_image_urls(payload, {"reference_image"}, allow_roleless=True),
+            ]
         )
         if reference_images:
             payload["images"] = reference_images
             payload["image_urls"] = reference_images
-        payload.pop("first_frame_url", None)
-        payload.pop("last_frame_url", None)
+        _drop_frame_url_keys(payload)
+        payload.pop("media", None)
+        payload.pop("media_items", None)
+        payload.pop("content", None)
         return payload
 
-    first_frame_url = _extract_media_url(payload.get("first_frame_url") or payload.get("first_frame"))
-    last_frame_url = _extract_media_url(payload.get("last_frame_url") or payload.get("last_frame"))
+    first_frame_url = _extract_frame_url(payload, FIRST_FRAME_URL_KEYS, FIRST_FRAME_ROLES)
+    last_frame_url = _extract_frame_url(payload, LAST_FRAME_URL_KEYS, LAST_FRAME_ROLES)
     if not first_frame_url:
         raise AppException("首尾帧生成需要传入 first_frame_url", code=40012, status_code=400)
 
@@ -579,6 +622,9 @@ def _build_video_message_extra(extra: Dict[str, Any], ai_model: Optional[AiModel
     payload.pop("image_urls", None)
     payload.pop("uploaded_images", None)
     payload.pop("reference_images", None)
+    payload.pop("media", None)
+    payload.pop("content", None)
+    _drop_frame_url_keys(payload, keep={"first_frame_url", "last_frame_url"})
     return payload
 
 
@@ -627,6 +673,49 @@ def _collect_extra_urls(extra: Dict[str, Any], keys: Tuple[str, ...]) -> List[st
             if url:
                 urls.append(url)
     return urls
+
+
+def _extract_frame_url(extra: Dict[str, Any], keys: Tuple[str, ...], roles: set[str]) -> str:
+    for key in keys:
+        url = _extract_media_url(extra.get(key))
+        if url:
+            return url
+    for key in ("media_items", "media", "content"):
+        for item in _as_list(extra.get(key)):
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip()
+            if role not in roles:
+                continue
+            url = _extract_media_url(item)
+            if url:
+                return url
+    return ""
+
+
+def _collect_media_image_urls(extra: Dict[str, Any], roles: set[str], *, allow_roleless: bool = False) -> List[str]:
+    urls: List[str] = []
+    for key in ("media_items", "media", "content"):
+        for item in _as_list(extra.get(key)):
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "image_url").strip()
+            if item_type != "image_url":
+                continue
+            role = str(item.get("role") or "").strip()
+            if role not in roles and not (allow_roleless and not role):
+                continue
+            url = _extract_media_url(item)
+            if url:
+                urls.append(url)
+    return urls
+
+
+def _drop_frame_url_keys(extra: Dict[str, Any], keep: Optional[set[str]] = None) -> None:
+    keep = keep or set()
+    for key in (*FIRST_FRAME_URL_KEYS, *LAST_FRAME_URL_KEYS):
+        if key not in keep:
+            extra.pop(key, None)
 
 
 def _dedupe(values: List[str]) -> List[str]:

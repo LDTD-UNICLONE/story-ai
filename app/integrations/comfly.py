@@ -173,6 +173,44 @@ VIDEO_URL_REQUEST_KEYS = {"audio_url", "character_url", "notify_hook"}
 VIDEO_ARRAY_REQUEST_KEYS = {"character_timestamps"}
 VIDEO_STRING_REQUEST_KEYS = {"negative_prompt", "resolution", "size"}
 VIDEO_URL_OR_BASE64_PREFIXES = ("http://", "https://", "data:")
+FIRST_FRAME_URL_KEYS = (
+    "first_frame_url",
+    "first_frame",
+    "firstFrameUrl",
+    "firstFrame",
+    "first_image_url",
+    "firstImageUrl",
+    "start_frame_url",
+    "start_frame",
+    "startFrameUrl",
+    "startFrame",
+    "start_image_url",
+    "startImageUrl",
+    "reference_first_frame_url",
+    "reference_start_frame_url",
+)
+LAST_FRAME_URL_KEYS = (
+    "last_frame_url",
+    "last_frame",
+    "lastFrameUrl",
+    "lastFrame",
+    "last_image_url",
+    "lastImageUrl",
+    "end_frame_url",
+    "end_frame",
+    "endFrameUrl",
+    "endFrame",
+    "end_image_url",
+    "endImageUrl",
+    "ending_frame_url",
+    "endingFrameUrl",
+    "tail_frame_url",
+    "tailFrameUrl",
+    "reference_last_frame_url",
+    "reference_end_frame_url",
+)
+FIRST_FRAME_ROLES = {"first_frame", "start_frame", "reference_first_frame", "reference_start_frame"}
+LAST_FRAME_ROLES = {"last_frame", "end_frame", "ending_frame", "tail_frame", "reference_last_frame"}
 
 
 def _base_url() -> str:
@@ -1076,17 +1114,27 @@ def _collect_video_image_urls(extra: Dict[str, Any]) -> List[str]:
 def _collect_first_last_frame_urls(extra: Dict[str, Any]) -> List[str]:
     urls: List[str] = []
     seen: Set[str] = set()
-    for key in ("first_frame_url", "first_frame", "last_frame_url", "last_frame"):
-        url = _extract_media_url(extra.get(key))
+    for url in (
+        *_collect_frame_urls(extra, FIRST_FRAME_URL_KEYS, FIRST_FRAME_ROLES),
+        *_collect_frame_urls(extra, LAST_FRAME_URL_KEYS, LAST_FRAME_ROLES),
+    ):
         if url and url not in seen:
             seen.add(url)
             urls.append(url)
+    return urls
+
+
+def _collect_frame_urls(extra: Dict[str, Any], keys: tuple[str, ...], roles: Set[str]) -> List[str]:
+    urls: List[str] = []
+    for key in keys:
+        url = _extract_media_url(extra.get(key))
+        if url:
+            urls.append(url)
     for item in _as_list(extra.get("media_items") or extra.get("media")):
-        if not isinstance(item, dict) or item.get("role") not in {"first_frame", "last_frame"}:
+        if not isinstance(item, dict) or str(item.get("role") or "").strip() not in roles:
             continue
         url = _extract_media_url(item)
-        if url and url not in seen:
-            seen.add(url)
+        if url:
             urls.append(url)
     return urls
 

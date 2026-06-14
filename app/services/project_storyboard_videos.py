@@ -483,7 +483,7 @@ def _build_storyboard_video_extra(
 ) -> Dict[str, Any]:
     extra = dict(payload.extra or {})
     if payload.generation_mode == "storyboard":
-        _clear_video_reference_image_extra(extra)
+        _clear_video_reference_media_extra(extra)
     extra["resolution"] = resolution
     extra["return_last_frame"] = payload.return_last_frame
     extra.setdefault("aspect_ratio", project.generation_ratio)
@@ -505,25 +505,42 @@ def _build_storyboard_video_extra(
     if payload.generation_mode == "first_last_frame":
         if not payload.first_frame_url:
             raise AppException("首尾帧生成需要传入 first_frame_url", code=40012, status_code=400)
+        _clear_video_reference_media_extra(extra)
+        extra["first_frame_url"] = payload.first_frame_url
         media_items = [{"type": "image_url", "image_url": {"url": payload.first_frame_url}, "role": "first_frame"}]
         if payload.last_frame_url:
+            extra["last_frame_url"] = payload.last_frame_url
             media_items.append({"type": "image_url", "image_url": {"url": payload.last_frame_url}, "role": "last_frame"})
         extra["media_items"] = media_items
-        _clear_video_reference_image_extra(extra)
     return extra
 
 
-def _clear_video_reference_image_extra(extra: Dict[str, Any]) -> None:
+def _clear_video_reference_media_extra(extra: Dict[str, Any]) -> None:
     for key in (
+        "audio",
+        "audio_url",
+        "audio_urls",
+        "audios",
+        "content",
         "image",
         "images",
         "image_url",
         "image_urls",
+        "media",
+        "media_items",
         "reference_image",
         "reference_images",
         "reference_image_url",
         "reference_image_urls",
+        "reference_video",
+        "reference_video_url",
+        "reference_video_urls",
+        "reference_videos",
         "uploaded_images",
+        "video",
+        "video_url",
+        "video_urls",
+        "videos",
     ):
         extra.pop(key, None)
 

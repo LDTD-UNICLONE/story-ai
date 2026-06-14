@@ -8,6 +8,46 @@ from app.core.public_messages import sanitize_public_data
 from app.schemas.base import SchemaBaseModel
 
 
+FIRST_FRAME_URL_KEYS = (
+    "first_frame_url",
+    "first_frame",
+    "firstFrameUrl",
+    "firstFrame",
+    "first_image_url",
+    "firstImageUrl",
+    "start_frame_url",
+    "start_frame",
+    "startFrameUrl",
+    "startFrame",
+    "start_image_url",
+    "startImageUrl",
+    "reference_first_frame_url",
+    "reference_start_frame_url",
+)
+LAST_FRAME_URL_KEYS = (
+    "last_frame_url",
+    "last_frame",
+    "lastFrameUrl",
+    "lastFrame",
+    "last_image_url",
+    "lastImageUrl",
+    "end_frame_url",
+    "end_frame",
+    "endFrameUrl",
+    "endFrame",
+    "end_image_url",
+    "endImageUrl",
+    "ending_frame_url",
+    "endingFrameUrl",
+    "tail_frame_url",
+    "tailFrameUrl",
+    "reference_last_frame_url",
+    "reference_end_frame_url",
+)
+FIRST_FRAME_ROLES = {"first_frame", "start_frame", "reference_first_frame", "reference_start_frame"}
+LAST_FRAME_ROLES = {"last_frame", "end_frame", "ending_frame", "tail_frame", "reference_last_frame"}
+
+
 class ProjectStoryboardOut(SchemaBaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -249,8 +289,15 @@ class ProjectStoryboardVideoGenerateRequest(ProjectStoryboardRequestModel):
         if not isinstance(value, dict):
             return value
         data = dict(value)
-        for key in ("first_frame_url", "last_frame_url"):
-            data[key] = _extract_request_media_url(data.get(key)) or data.get(key)
+        data["first_frame_url"] = (
+            _extract_request_frame_url(data, FIRST_FRAME_URL_KEYS, FIRST_FRAME_ROLES)
+            or data.get("first_frame_url")
+        )
+        data["last_frame_url"] = (
+            _extract_request_frame_url(data, LAST_FRAME_URL_KEYS, LAST_FRAME_ROLES)
+            or data.get("last_frame_url")
+        )
+        _drop_request_frame_aliases(data)
         if "uploaded_images" in data:
             data["uploaded_images"] = [
                 url
@@ -268,6 +315,31 @@ def _as_request_list(value: Any) -> List[Any]:
     if isinstance(value, tuple):
         return list(value)
     return [value]
+
+
+def _extract_request_frame_url(data: Dict[str, Any], keys: tuple[str, ...], roles: set[str]) -> str:
+    for source in (data, data.get("extra") if isinstance(data.get("extra"), dict) else {}):
+        for key in keys:
+            url = _extract_request_media_url(source.get(key))
+            if url:
+                return url
+        for media_key in ("media_items", "media", "content"):
+            for item in _as_request_list(source.get(media_key)):
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role") or "").strip()
+                if role not in roles:
+                    continue
+                url = _extract_request_media_url(item)
+                if url:
+                    return url
+    return ""
+
+
+def _drop_request_frame_aliases(data: Dict[str, Any]) -> None:
+    for key in (*FIRST_FRAME_URL_KEYS, *LAST_FRAME_URL_KEYS, "media_items", "media", "content"):
+        if key not in {"first_frame_url", "last_frame_url"}:
+            data.pop(key, None)
 
 
 def _extract_request_media_url(value: Any) -> str:
