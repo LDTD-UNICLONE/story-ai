@@ -209,8 +209,30 @@ LAST_FRAME_URL_KEYS = (
     "reference_last_frame_url",
     "reference_end_frame_url",
 )
-FIRST_FRAME_ROLES = {"first_frame", "start_frame", "reference_first_frame", "reference_start_frame"}
-LAST_FRAME_ROLES = {"last_frame", "end_frame", "ending_frame", "tail_frame", "reference_last_frame"}
+FIRST_FRAME_ROLES = {
+    "first_frame",
+    "firstFrame",
+    "start_frame",
+    "startFrame",
+    "reference_first_frame",
+    "referenceFirstFrame",
+    "reference_start_frame",
+    "referenceStartFrame",
+}
+LAST_FRAME_ROLES = {
+    "last_frame",
+    "lastFrame",
+    "end_frame",
+    "endFrame",
+    "ending_frame",
+    "endingFrame",
+    "tail_frame",
+    "tailFrame",
+    "reference_last_frame",
+    "referenceLastFrame",
+    "reference_end_frame",
+    "referenceEndFrame",
+}
 
 
 def _base_url() -> str:
@@ -1131,12 +1153,16 @@ def _collect_frame_urls(extra: Dict[str, Any], keys: tuple[str, ...], roles: Set
         if url:
             urls.append(url)
     for item in _as_list(extra.get("media_items") or extra.get("media")):
-        if not isinstance(item, dict) or str(item.get("role") or "").strip() not in roles:
+        if not isinstance(item, dict) or _normalize_frame_role(item.get("role")) not in roles:
             continue
         url = _extract_media_url(item)
         if url:
             urls.append(url)
     return urls
+
+
+def _normalize_frame_role(value: Any) -> str:
+    return str(value or "").strip().replace("-", "_")
 
 
 def _collect_video_urls(extra: Dict[str, Any]) -> List[str]:

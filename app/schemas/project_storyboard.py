@@ -44,8 +44,30 @@ LAST_FRAME_URL_KEYS = (
     "reference_last_frame_url",
     "reference_end_frame_url",
 )
-FIRST_FRAME_ROLES = {"first_frame", "start_frame", "reference_first_frame", "reference_start_frame"}
-LAST_FRAME_ROLES = {"last_frame", "end_frame", "ending_frame", "tail_frame", "reference_last_frame"}
+FIRST_FRAME_ROLES = {
+    "first_frame",
+    "firstFrame",
+    "start_frame",
+    "startFrame",
+    "reference_first_frame",
+    "referenceFirstFrame",
+    "reference_start_frame",
+    "referenceStartFrame",
+}
+LAST_FRAME_ROLES = {
+    "last_frame",
+    "lastFrame",
+    "end_frame",
+    "endFrame",
+    "ending_frame",
+    "endingFrame",
+    "tail_frame",
+    "tailFrame",
+    "reference_last_frame",
+    "referenceLastFrame",
+    "reference_end_frame",
+    "referenceEndFrame",
+}
 
 
 class ProjectStoryboardOut(SchemaBaseModel):
@@ -327,7 +349,7 @@ def _extract_request_frame_url(data: Dict[str, Any], keys: tuple[str, ...], role
             for item in _as_request_list(source.get(media_key)):
                 if not isinstance(item, dict):
                     continue
-                role = str(item.get("role") or "").strip()
+                role = _normalize_request_frame_role(item.get("role"))
                 if role not in roles:
                     continue
                 url = _extract_request_media_url(item)
@@ -355,6 +377,10 @@ def _extract_request_media_url(value: Any) -> str:
             if isinstance(nested, dict) and isinstance(nested.get("url"), str):
                 return nested["url"].strip()
     return ""
+
+
+def _normalize_request_frame_role(value: Any) -> str:
+    return str(value or "").strip().replace("-", "_")
 
 
 class ProjectStoryboardVideoGenerateOut(SchemaBaseModel):

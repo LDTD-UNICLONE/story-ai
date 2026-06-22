@@ -82,8 +82,30 @@ LAST_FRAME_URL_KEYS = (
     "reference_last_frame_url",
     "reference_end_frame_url",
 )
-FIRST_FRAME_ROLES = {"first_frame", "start_frame", "reference_first_frame", "reference_start_frame"}
-LAST_FRAME_ROLES = {"last_frame", "end_frame", "ending_frame", "tail_frame", "reference_last_frame"}
+FIRST_FRAME_ROLES = {
+    "first_frame",
+    "firstFrame",
+    "start_frame",
+    "startFrame",
+    "reference_first_frame",
+    "referenceFirstFrame",
+    "reference_start_frame",
+    "referenceStartFrame",
+}
+LAST_FRAME_ROLES = {
+    "last_frame",
+    "lastFrame",
+    "end_frame",
+    "endFrame",
+    "ending_frame",
+    "endingFrame",
+    "tail_frame",
+    "tailFrame",
+    "reference_last_frame",
+    "referenceLastFrame",
+    "reference_end_frame",
+    "referenceEndFrame",
+}
 
 
 async def get_enabled_conversation_model_or_404(
@@ -593,13 +615,70 @@ def _build_video_message_extra(extra: Dict[str, Any], ai_model: Optional[AiModel
     if generation_mode == "reference":
         reference_images = _dedupe(
             [
-                *_collect_extra_urls(payload, ("images", "image_urls", "uploaded_images", "reference_images")),
+                *_collect_extra_urls(
+                    payload,
+                    (
+                        "images",
+                        "image",
+                        "image_url",
+                        "image_urls",
+                        "uploaded_images",
+                        "reference_image",
+                        "reference_image_url",
+                        "reference_images",
+                        "reference_image_urls",
+                    ),
+                ),
                 *_collect_media_image_urls(payload, {"reference_image"}, allow_roleless=True),
+            ]
+        )
+        reference_videos = _dedupe(
+            [
+                *_collect_extra_urls(
+                    payload,
+                    (
+                        "videos",
+                        "video",
+                        "video_url",
+                        "video_urls",
+                        "uploaded_videos",
+                        "reference_video",
+                        "reference_video_url",
+                        "reference_videos",
+                        "reference_video_urls",
+                    ),
+                ),
+                *_collect_media_urls(payload, "video_url", {"reference_video"}),
+            ]
+        )
+        reference_audios = _dedupe(
+            [
+                *_collect_extra_urls(
+                    payload,
+                    (
+                        "audios",
+                        "audio",
+                        "audio_url",
+                        "audio_urls",
+                        "uploaded_audios",
+                        "reference_audio",
+                        "reference_audio_url",
+                        "reference_audios",
+                        "reference_audio_urls",
+                    ),
+                ),
+                *_collect_media_urls(payload, "audio_url", {"reference_audio"}),
             ]
         )
         if reference_images:
             payload["images"] = reference_images
             payload["image_urls"] = reference_images
+        if reference_videos:
+            payload["videos"] = reference_videos
+            payload["video_urls"] = reference_videos
+        if reference_audios:
+            payload["audios"] = reference_audios
+            payload["audio_urls"] = reference_audios
         _drop_frame_url_keys(payload)
         payload.pop("media", None)
         payload.pop("media_items", None)
@@ -655,7 +734,14 @@ def _normalize_conversation_video_generation_mode(value: Any) -> str:
         "参考生成": "reference",
         "reference_generation": "reference",
         "image_to_video": "reference",
+        "多模态参考": "reference",
+        "参考图生成": "reference",
+        "首帧生成": "first_last_frame",
+        "首帧模式": "first_last_frame",
+        "first_frame": "first_last_frame",
+        "first-frame": "first_last_frame",
         "首尾帧生成": "first_last_frame",
+        "首尾帧模式": "first_last_frame",
         "first-last-frame": "first_last_frame",
         "first_last": "first_last_frame",
     }
@@ -684,7 +770,7 @@ def _extract_frame_url(extra: Dict[str, Any], keys: Tuple[str, ...], roles: set[
         for item in _as_list(extra.get(key)):
             if not isinstance(item, dict):
                 continue
-            role = str(item.get("role") or "").strip()
+            role = _normalize_frame_role(item.get("role"))
             if role not in roles:
                 continue
             url = _extract_media_url(item)
@@ -702,13 +788,59 @@ def _collect_media_image_urls(extra: Dict[str, Any], roles: set[str], *, allow_r
             item_type = str(item.get("type") or "image_url").strip()
             if item_type != "image_url":
                 continue
-            role = str(item.get("role") or "").strip()
+            role = _normalize_frame_role(item.get("role"))
             if role not in roles and not (allow_roleless and not role):
                 continue
             url = _extract_media_url(item)
             if url:
                 urls.append(url)
     return urls
+
+
+def _collect_media_urls(extra: Dict[str, Any], item_type: str, roles: set[str]) -> List[str]:
+    urls: List[str] = []
+    for key in ("media_items", "media", "content"):
+        for item in _as_list(extra.get(key)):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type") or "").strip() != item_type:
+                continue
+            if _normalize_frame_role(item.get("role")) not in roles:
+                continue
+            url = _extract_media_url(item)
+            if url:
+                urls.append(url)
+    return urls
+
+
+def _normalize_frame_role(value: Any) -> str:
+    role = str(value or "").strip().replace("-", "_")
+    aliases = {
+        "reference": "reference_image",
+        "referenceImage": "reference_image",
+        "ref_image": "reference_image",
+        "refImage": "reference_image",
+        "image": "reference_image",
+        "video": "reference_video",
+        "ref_video": "reference_video",
+        "refVideo": "reference_video",
+        "referenceVideo": "reference_video",
+        "audio": "reference_audio",
+        "ref_audio": "reference_audio",
+        "refAudio": "reference_audio",
+        "referenceAudio": "reference_audio",
+        "firstFrame": "first_frame",
+        "startFrame": "start_frame",
+        "referenceFirstFrame": "reference_first_frame",
+        "referenceStartFrame": "reference_start_frame",
+        "lastFrame": "last_frame",
+        "endFrame": "end_frame",
+        "endingFrame": "ending_frame",
+        "tailFrame": "tail_frame",
+        "referenceLastFrame": "reference_last_frame",
+        "referenceEndFrame": "reference_end_frame",
+    }
+    return aliases.get(role, role)
 
 
 def _drop_frame_url_keys(extra: Dict[str, Any], keep: Optional[set[str]] = None) -> None:
@@ -843,7 +975,7 @@ def _extract_media_url(value: Any) -> str:
     if isinstance(value, str):
         return value
     if isinstance(value, dict):
-        for key in ("url", "image_url", "video_url", "file_url", "oss_url"):
+        for key in ("url", "image_url", "video_url", "audio_url", "file_url", "oss_url"):
             nested = value.get(key)
             if isinstance(nested, str):
                 return nested

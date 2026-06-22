@@ -69,6 +69,39 @@ ALLOWED_ROLES_BY_TYPE = {
     "video_url": {"reference_video"},
     "audio_url": {"reference_audio"},
 }
+MEDIA_ROLE_ALIASES = {
+    "reference": "reference_image",
+    "referenceImage": "reference_image",
+    "ref_image": "reference_image",
+    "refImage": "reference_image",
+    "image": "reference_image",
+    "firstFrame": "first_frame",
+    "start_frame": "first_frame",
+    "startFrame": "first_frame",
+    "reference_first_frame": "first_frame",
+    "referenceFirstFrame": "first_frame",
+    "reference_start_frame": "first_frame",
+    "referenceStartFrame": "first_frame",
+    "lastFrame": "last_frame",
+    "end_frame": "last_frame",
+    "endFrame": "last_frame",
+    "ending_frame": "last_frame",
+    "endingFrame": "last_frame",
+    "tail_frame": "last_frame",
+    "tailFrame": "last_frame",
+    "reference_last_frame": "last_frame",
+    "referenceLastFrame": "last_frame",
+    "reference_end_frame": "last_frame",
+    "referenceEndFrame": "last_frame",
+    "video": "reference_video",
+    "ref_video": "reference_video",
+    "refVideo": "reference_video",
+    "referenceVideo": "reference_video",
+    "audio": "reference_audio",
+    "ref_audio": "reference_audio",
+    "refAudio": "reference_audio",
+    "referenceAudio": "reference_audio",
+}
 
 UNSUPPORTED_SEEDANCE_2_REQUEST_KEYS = {
     "camera_fixed",
@@ -300,7 +333,7 @@ def _normalize_media_item(value: Any) -> Optional[Dict[str, Any]]:
         raise AppException("火山方舟媒体 content 缺少 url", code=40010, status_code=400)
 
     media_key = MEDIA_KEY_BY_TYPE[item_type]
-    normalized_role = str(role).strip() if role not in (None, "") else ""
+    normalized_role = _normalize_media_role(role)
     if normalized_role and normalized_role not in ALLOWED_ROLES_BY_TYPE[item_type]:
         raise AppException("火山方舟多模态参考 role 不支持", code=40010, status_code=400)
 
@@ -308,6 +341,11 @@ def _normalize_media_item(value: Any) -> Optional[Dict[str, Any]]:
     if normalized_role:
         normalized["role"] = normalized_role
     return normalized
+
+
+def _normalize_media_role(value: Any) -> str:
+    role = str(value).strip().replace("-", "_") if value not in (None, "") else ""
+    return MEDIA_ROLE_ALIASES.get(role, role)
 
 
 def _normalize_video_task_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
