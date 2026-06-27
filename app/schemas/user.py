@@ -5,6 +5,13 @@ from pydantic import ConfigDict, Field, field_validator
 from app.schemas.base import SchemaBaseModel
 
 
+def _normalize_optional_string(value: object) -> object:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    return value
+
+
 class UserOut(SchemaBaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -37,6 +44,11 @@ class AdminUserCreateRequest(SchemaBaseModel):
     is_enabled: bool = True
     points_balance: int = Field(default=0, ge=0)
 
+    @field_validator("avatar", "phone", "email", mode="before")
+    @classmethod
+    def normalize_optional_strings(cls, value: object) -> object:
+        return _normalize_optional_string(value)
+
 
 class AdminUserUpdateRequest(SchemaBaseModel):
     account: Optional[str] = Field(default=None, min_length=3, max_length=64)
@@ -47,12 +59,22 @@ class AdminUserUpdateRequest(SchemaBaseModel):
     is_admin: Optional[bool] = None
     is_enabled: Optional[bool] = None
 
+    @field_validator("avatar", "phone", "email", mode="before")
+    @classmethod
+    def normalize_optional_strings(cls, value: object) -> object:
+        return _normalize_optional_string(value)
+
 
 class UserProfileUpdateRequest(SchemaBaseModel):
     model_config = ConfigDict(extra="forbid")
 
     nickname: Optional[str] = Field(default=None, min_length=1, max_length=64)
     avatar: Optional[str] = Field(default=None, max_length=512)
+
+    @field_validator("avatar", mode="before")
+    @classmethod
+    def normalize_optional_strings(cls, value: object) -> object:
+        return _normalize_optional_string(value)
 
 
 class AdminPasswordResetRequest(SchemaBaseModel):
@@ -67,6 +89,11 @@ class RegisterRequest(SchemaBaseModel):
     phone: str = Field(..., min_length=11, max_length=11)
     sms_code: str = Field(..., min_length=4, max_length=8, description="手机短信验证码")
     email: Optional[str] = Field(default=None, max_length=255)
+
+    @field_validator("avatar", "email", mode="before")
+    @classmethod
+    def normalize_optional_strings(cls, value: object) -> object:
+        return _normalize_optional_string(value)
 
     @field_validator("phone")
     @classmethod
