@@ -1,9 +1,11 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager, suppress
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.router import api_router
 from app.core.config import settings
@@ -70,6 +72,9 @@ def create_app() -> FastAPI:
 
     register_exception_handlers(app)
     app.include_router(api_router, prefix=settings.api_prefix)
+    frontend_dir = Path(__file__).resolve().parent / "frontend"
+    if frontend_dir.exists():
+        app.mount("/ui", StaticFiles(directory=frontend_dir, html=True), name="ui")
     return app
 
 

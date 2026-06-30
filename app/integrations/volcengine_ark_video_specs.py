@@ -5,9 +5,9 @@ from typing import Any, Dict, Optional, Set
 VOLCENGINE_ARK_VENDOR = "volcengine_ark"
 VOLCENGINE_ARK_VIDEO_MODEL_PREFIXES = ("doubao-seedance",)
 VOLCENGINE_ARK_VIDEO_RATIOS = ["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
-VOLCENGINE_ARK_VIDEO_RESOLUTION_ORDER = ("480p", "720p", "1080p")
+VOLCENGINE_ARK_VIDEO_RESOLUTION_ORDER = ("480p", "720p", "1080p", "4k")
 VOLCENGINE_ARK_VIDEO_RESOLUTIONS_BY_MODEL = {
-    "doubao-seedance-2-0-260128": ["480p", "720p", "1080p"],
+    "doubao-seedance-2-0-260128": ["480p", "720p", "1080p", "4k"],
     "doubao-seedance-2-0-fast-260128": ["480p", "720p"],
 }
 DEFAULT_VIDEO_RESOLUTIONS = ["480p", "720p"]
@@ -72,7 +72,7 @@ def merge_video_capabilities(
     capabilities["defaults"] = {
         **deepcopy(VOLCENGINE_ARK_VIDEO_CAPABILITIES["defaults"]),
         "reference_ratio": "adaptive",
-        "resolution": resolutions[-1],
+        "resolution": _default_resolution(resolutions),
     }
     capabilities["resolutions"] = resolutions
     capabilities["ratios"] = list(VOLCENGINE_ARK_VIDEO_RATIOS)
@@ -84,7 +84,7 @@ def merge_video_capabilities(
     capabilities["defaults"] = {
         **deepcopy(VOLCENGINE_ARK_VIDEO_CAPABILITIES["defaults"]),
         "reference_ratio": "adaptive",
-        "resolution": resolutions[-1],
+        "resolution": _default_resolution(resolutions),
     }
     capabilities["resolutions"] = resolutions
     capabilities["ratios"] = list(VOLCENGINE_ARK_VIDEO_RATIOS)
@@ -103,7 +103,10 @@ def normalize_video_resolution(value: Any, capabilities: Optional[Dict[str, Any]
     requested = _normalize_resolution(value)
     if requested is None:
         defaults = (capabilities or {}).get("defaults") or {}
-        return defaults.get("resolution") or resolutions[-1]
+        default_resolution = _normalize_resolution(defaults.get("resolution"))
+        if default_resolution in resolutions:
+            return default_resolution
+        return _default_resolution(resolutions)
     if requested in resolutions:
         return requested
 
@@ -117,6 +120,13 @@ def normalize_video_resolution(value: Any, capabilities: Optional[Dict[str, Any]
 
 def is_known_video_resolution(value: Any) -> bool:
     return _normalize_resolution(value) is not None
+
+
+def is_video_resolution_supported(value: Any, capabilities: Optional[Dict[str, Any]] = None) -> bool:
+    requested = _normalize_resolution(value)
+    if requested is None:
+        return True
+    return requested in _capability_resolutions(capabilities)
 
 
 def _supported_resolutions(model_id: str) -> list[str]:
@@ -135,6 +145,10 @@ def _video_fields(resolutions: list[str]) -> list[Dict[str, Any]]:
         elif field.get("name") == "ratio":
             field["options"] = list(VOLCENGINE_ARK_VIDEO_RATIOS)
     return fields
+
+
+def _default_resolution(resolutions: list[str]) -> str:
+    return "720p" if "720p" in resolutions else resolutions[-1]
 
 
 def _capability_resolutions(capabilities: Optional[Dict[str, Any]]) -> list[str]:
@@ -159,5 +173,12 @@ def _normalize_resolution(value: Any) -> Optional[str]:
         "1080": "1080p",
         "1080p": "1080p",
         "1k": "1080p",
+        "2160": "4k",
+        "2160p": "4k",
+        "3840": "4k",
+        "3840x2160": "4k",
+        "4": "4k",
+        "4k": "4k",
+        "uhd": "4k",
     }
     return aliases.get(normalized)

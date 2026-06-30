@@ -11,6 +11,7 @@ from app.integrations.comfly_dimensions import normalize_ratio
 from app.integrations.volcengine_ark_video_specs import (
     allowed_video_request_keys,
     is_known_video_resolution,
+    is_video_resolution_supported,
     normalize_video_resolution,
 )
 
@@ -23,6 +24,7 @@ VIDEO_HELPER_KEYS = {
     "aspect_ratio",
     "capability",
     "content",
+    "generation_mode",
     "media",
     "media_items",
     "audio",
@@ -33,9 +35,52 @@ VIDEO_HELPER_KEYS = {
     "image_url",
     "image_urls",
     "images",
+    "uploaded_images",
+    "reference_audio",
+    "reference_audio_url",
+    "reference_audio_urls",
+    "reference_audios",
     "reference_first_frame_url",
+    "reference_image",
+    "reference_image_url",
+    "reference_image_urls",
+    "reference_images",
+    "reference_last_frame_url",
+    "reference_video",
+    "reference_video_url",
+    "reference_video_urls",
+    "reference_videos",
     "reference_start_frame_url",
+    "reference_end_frame_url",
     "start_frame_reference_url",
+    "first_frame_url",
+    "first_frame",
+    "firstFrameUrl",
+    "firstFrame",
+    "first_image_url",
+    "firstImageUrl",
+    "start_frame_url",
+    "start_frame",
+    "startFrameUrl",
+    "startFrame",
+    "start_image_url",
+    "startImageUrl",
+    "last_frame_url",
+    "last_frame",
+    "lastFrameUrl",
+    "lastFrame",
+    "last_image_url",
+    "lastImageUrl",
+    "end_frame_url",
+    "end_frame",
+    "endFrameUrl",
+    "endFrame",
+    "end_image_url",
+    "endImageUrl",
+    "ending_frame_url",
+    "endingFrameUrl",
+    "tail_frame_url",
+    "tailFrameUrl",
     "video",
     "video_url",
     "video_urls",
@@ -53,6 +98,42 @@ DEFAULT_WATERMARK = False
 MAX_REFERENCE_IMAGES = 9
 MAX_REFERENCE_VIDEOS = 3
 MAX_REFERENCE_AUDIOS = 3
+FIRST_FRAME_URL_KEYS = (
+    "first_frame_url",
+    "first_frame",
+    "firstFrameUrl",
+    "firstFrame",
+    "first_image_url",
+    "firstImageUrl",
+    "start_frame_url",
+    "start_frame",
+    "startFrameUrl",
+    "startFrame",
+    "start_image_url",
+    "startImageUrl",
+    "reference_first_frame_url",
+    "reference_start_frame_url",
+)
+LAST_FRAME_URL_KEYS = (
+    "last_frame_url",
+    "last_frame",
+    "lastFrameUrl",
+    "lastFrame",
+    "last_image_url",
+    "lastImageUrl",
+    "end_frame_url",
+    "end_frame",
+    "endFrameUrl",
+    "endFrame",
+    "end_image_url",
+    "endImageUrl",
+    "ending_frame_url",
+    "endingFrameUrl",
+    "tail_frame_url",
+    "tailFrameUrl",
+    "reference_last_frame_url",
+    "reference_end_frame_url",
+)
 
 MEDIA_KEY_BY_TYPE = {
     "image_url": "image_url",
@@ -227,18 +308,64 @@ def _get_video_task(client: Any, task_id: str) -> Any:
 
 
 def _build_content(prompt: str, extra: Dict[str, Any]) -> List[Dict[str, Any]]:
+    generation_mode = _normalize_video_generation_mode(extra)
+    if generation_mode == "text_to_video":
+        content = _build_text_to_video_content(prompt, extra)
+        _validate_multimodal_content(content, generation_mode)
+        return content
+
+    if generation_mode == "first_last_frame":
+        content = _build_first_last_frame_content(prompt, extra)
+        _validate_multimodal_content(content, generation_mode)
+        return content
+
     raw_content = extra.get("content")
     if raw_content:
         content = _normalize_content_items(raw_content)
-        _validate_multimodal_content(content)
+        _validate_multimodal_content(content, generation_mode)
         return content
 
+    content = _build_reference_content(prompt, extra)
+    _validate_multimodal_content(content, generation_mode)
+    return content
+
+
+def _build_reference_content(prompt: str, extra: Dict[str, Any]) -> List[Dict[str, Any]]:
     content: List[Dict[str, Any]] = []
     text = str(prompt or "").strip()
     if text:
         content.append({"type": "text", "text": text})
     content.extend(_build_media_content(extra))
-    _validate_multimodal_content(content)
+    return content
+
+
+def _build_text_to_video_content(prompt: str, extra: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_content = extra.get("content")
+    if raw_content:
+        content = _normalize_content_items(raw_content)
+        media_items = [item for item in content if item.get("type") != "text"]
+        if media_items:
+            raise AppException("文生视频不能传入图片、视频或音频参考素材", code=40010, status_code=400)
+        return content
+
+    text = str(prompt or "").strip()
+    if not text:
+        raise AppException("文生视频需要传入文本提示词", code=40010, status_code=400)
+    return [{"type": "text", "text": text}]
+
+
+def _build_first_last_frame_content(prompt: str, extra: Dict[str, Any]) -> List[Dict[str, Any]]:
+    first_frame_url = _extract_frame_url(extra, FIRST_FRAME_URL_KEYS, {"first_frame"}, allow_roleless=True)
+    last_frame_url = _extract_frame_url(extra, LAST_FRAME_URL_KEYS, {"last_frame"})
+
+    content: List[Dict[str, Any]] = []
+    text = str(prompt or "").strip()
+    if text:
+        content.append({"type": "text", "text": text})
+    if first_frame_url:
+        content.append({"type": "image_url", "image_url": {"url": first_frame_url}, "role": "first_frame"})
+    if last_frame_url:
+        content.append({"type": "image_url", "image_url": {"url": last_frame_url}, "role": "last_frame"})
     return content
 
 
@@ -274,7 +401,17 @@ def _normalize_content_items(raw_content: Any) -> List[Dict[str, Any]]:
 
 def _collect_image_urls(extra: Dict[str, Any]) -> List[str]:
     values: List[Any] = []
-    for key in ("images", "image", "image_url", "image_urls"):
+    for key in (
+        "images",
+        "image",
+        "image_url",
+        "image_urls",
+        "uploaded_images",
+        "reference_image",
+        "reference_image_url",
+        "reference_images",
+        "reference_image_urls",
+    ):
         if key in extra:
             values.extend(_as_list(extra[key]))
     return _collect_urls(values)
@@ -282,7 +419,16 @@ def _collect_image_urls(extra: Dict[str, Any]) -> List[str]:
 
 def _collect_video_urls(extra: Dict[str, Any]) -> List[str]:
     values: List[Any] = []
-    for key in ("videos", "video", "video_url", "video_urls"):
+    for key in (
+        "videos",
+        "video",
+        "video_url",
+        "video_urls",
+        "reference_video",
+        "reference_video_url",
+        "reference_videos",
+        "reference_video_urls",
+    ):
         if key in extra:
             values.extend(_as_list(extra[key]))
     return _collect_urls(values)
@@ -290,7 +436,16 @@ def _collect_video_urls(extra: Dict[str, Any]) -> List[str]:
 
 def _collect_audio_urls(extra: Dict[str, Any]) -> List[str]:
     values: List[Any] = []
-    for key in ("audios", "audio", "audio_url", "audio_urls"):
+    for key in (
+        "audios",
+        "audio",
+        "audio_url",
+        "audio_urls",
+        "reference_audio",
+        "reference_audio_url",
+        "reference_audios",
+        "reference_audio_urls",
+    ):
         if key in extra:
             values.extend(_as_list(extra[key]))
     return _collect_urls(values)
@@ -348,10 +503,122 @@ def _normalize_media_role(value: Any) -> str:
     return MEDIA_ROLE_ALIASES.get(role, role)
 
 
+def _normalize_video_generation_mode(extra: Dict[str, Any]) -> str:
+    raw_mode = _first_non_empty(extra.get("generation_mode"), extra.get("video_mode"), extra.get("capability"))
+    if raw_mode not in (None, ""):
+        mode = str(raw_mode).strip().replace("-", "_")
+        aliases = {
+            "文生视频": "text_to_video",
+            "文本生成视频": "text_to_video",
+            "text": "text_to_video",
+            "text2video": "text_to_video",
+            "textToVideo": "text_to_video",
+            "text_to_video": "text_to_video",
+            "t2v": "text_to_video",
+            "参考生成": "reference",
+            "多模态参考": "reference",
+            "多模态参考生成": "reference",
+            "参考图生成": "reference",
+            "reference": "reference",
+            "referenceGeneration": "reference",
+            "reference_generation": "reference",
+            "multimodalReference": "reference",
+            "multimodal_reference": "reference",
+            "imageToVideo": "reference",
+            "image_to_video": "reference",
+            "storyboard": "reference",
+            "首帧生成": "first_last_frame",
+            "首帧模式": "first_last_frame",
+            "首尾帧生成": "first_last_frame",
+            "首尾帧模式": "first_last_frame",
+            "firstFrame": "first_last_frame",
+            "first_frame": "first_last_frame",
+            "first_last": "first_last_frame",
+            "firstLast": "first_last_frame",
+            "firstLastFrame": "first_last_frame",
+            "first_last_frame": "first_last_frame",
+        }
+        if mode not in aliases:
+            raise AppException("火山方舟视频 generation_mode 不支持", code=40010, status_code=400)
+        return aliases[mode]
+
+    if _has_first_last_frame_input(extra):
+        return "first_last_frame"
+    if _has_reference_media_input(extra):
+        return "reference"
+    return "text_to_video"
+
+
+def _first_non_empty(*values: Any) -> Any:
+    for value in values:
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _has_first_last_frame_input(extra: Dict[str, Any]) -> bool:
+    return bool(
+        _extract_frame_url(extra, FIRST_FRAME_URL_KEYS, {"first_frame"}, allow_roleless=True)
+        or _extract_frame_url(extra, LAST_FRAME_URL_KEYS, {"last_frame"})
+    )
+
+
+def _has_reference_media_input(extra: Dict[str, Any]) -> bool:
+    if _collect_image_urls(extra) or _collect_video_urls(extra) or _collect_audio_urls(extra):
+        return True
+    for key in ("media_items", "media", "content"):
+        for item in _as_list(extra.get(key)):
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "").strip() or _infer_media_item_type(item)
+            role = _normalize_media_role(item.get("role"))
+            if item_type == "image_url" and role == "reference_image":
+                return True
+            if item_type == "video_url" and role == "reference_video":
+                return True
+            if item_type == "audio_url" and role == "reference_audio":
+                return True
+    return False
+
+
+def _extract_frame_url(
+    extra: Dict[str, Any],
+    keys: tuple[str, ...],
+    roles: Set[str],
+    *,
+    allow_roleless: bool = False,
+) -> str:
+    for key in keys:
+        url = _extract_ark_media_url(extra.get(key))
+        if url:
+            return url
+
+    roleless_images: List[str] = []
+    for key in ("media_items", "media", "content"):
+        for item in _as_list(extra.get(key)):
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "").strip() or _infer_media_item_type(item)
+            if item_type != "image_url":
+                continue
+            url = _extract_ark_media_url(item)
+            if not url:
+                continue
+            role = _normalize_media_role(item.get("role"))
+            if role in roles:
+                return url
+            if not role:
+                roleless_images.append(url)
+
+    if allow_roleless and len(roleless_images) == 1:
+        return roleless_images[0]
+    return ""
+
+
 def _normalize_video_task_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(payload)
     normalized["content"] = _normalize_content_items(normalized.get("content") or [])
-    _validate_multimodal_content(normalized["content"])
+    _validate_multimodal_content(normalized["content"], _normalize_video_generation_mode(normalized))
     return normalized
 
 
@@ -377,13 +644,14 @@ def _extract_ark_media_url(value: Any) -> Optional[str]:
     return None
 
 
-def _validate_multimodal_content(content: List[Dict[str, Any]]) -> None:
+def _validate_multimodal_content(content: List[Dict[str, Any]], generation_mode: str = "") -> None:
     if not content:
         raise AppException("火山方舟视频生成 content 不能为空", code=40010, status_code=400)
 
     image_count = _count_content_type(content, "image_url")
     video_count = _count_content_type(content, "video_url")
     audio_count = _count_content_type(content, "audio_url")
+    media_count = image_count + video_count + audio_count
 
     if image_count > MAX_REFERENCE_IMAGES:
         raise AppException("火山方舟多模态参考最多支持 9 张图片", code=40010, status_code=400)
@@ -393,7 +661,17 @@ def _validate_multimodal_content(content: List[Dict[str, Any]]) -> None:
         raise AppException("火山方舟多模态参考最多支持 3 个音频", code=40010, status_code=400)
     if audio_count and not image_count and not video_count:
         raise AppException("火山方舟多模态参考不支持仅文本加音频或纯音频输入", code=40010, status_code=400)
-    if not image_count and not video_count and not audio_count:
+
+    if generation_mode == "text_to_video":
+        if media_count:
+            raise AppException("文生视频不能传入图片、视频或音频参考素材", code=40010, status_code=400)
+        if not any(item.get("type") == "text" and str(item.get("text") or "").strip() for item in content):
+            raise AppException("文生视频需要传入文本提示词", code=40010, status_code=400)
+        return
+
+    if not media_count:
+        if generation_mode == "reference":
+            raise AppException("参考生成需要至少传入参考图片或参考视频", code=40010, status_code=400)
         if not any(item.get("type") == "text" and str(item.get("text") or "").strip() for item in content):
             raise AppException("文生视频需要传入文本提示词", code=40010, status_code=400)
         return
@@ -404,6 +682,12 @@ def _validate_multimodal_content(content: List[Dict[str, Any]]) -> None:
     has_reference_image = "reference_image" in image_roles
     has_roleless_image = any(role == "" for role in image_roles)
     has_reference_video_or_audio = video_count > 0 or audio_count > 0
+
+    if generation_mode == "reference" and (has_first_frame or has_last_frame or has_roleless_image):
+        raise AppException("参考生成图片必须设置 role=reference_image，不能混用首帧或尾帧", code=40010, status_code=400)
+
+    if generation_mode == "first_last_frame" and not has_first_frame:
+        raise AppException("首帧/首尾帧生成需要传入 first_frame", code=40010, status_code=400)
 
     if has_last_frame:
         if not has_first_frame:
@@ -454,6 +738,8 @@ def _merge_video_extra(payload: Dict[str, Any], extra: Dict[str, Any]) -> None:
     if "resolution" in allowed_keys:
         if extra.get("resolution") not in (None, "") and not is_known_video_resolution(extra.get("resolution")):
             raise AppException("火山方舟视频 resolution 参数不支持", code=40010, status_code=400)
+        if extra.get("resolution") not in (None, "") and not is_video_resolution_supported(extra.get("resolution"), capabilities):
+            raise AppException("当前火山方舟视频模型不支持该 resolution 参数", code=40010, status_code=400)
         payload["resolution"] = normalize_video_resolution(extra.get("resolution"), capabilities)
     _apply_video_defaults(payload, extra, allowed_keys, capabilities)
 

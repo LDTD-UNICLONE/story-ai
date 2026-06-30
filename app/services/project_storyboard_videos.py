@@ -16,6 +16,7 @@ from app.core.timezone import beijing_datetime
 from app.integrations.comfly_video_specs import merge_video_capabilities as merge_comfly_video_capabilities
 from app.integrations.volcengine_ark_video_specs import (
     VOLCENGINE_ARK_VENDOR,
+    is_video_resolution_supported,
     is_volcengine_ark_video_model,
     merge_video_capabilities as merge_ark_video_capabilities,
     normalize_video_resolution,
@@ -40,6 +41,7 @@ from app.services.task_records import create_user_task_record, refresh_task_reco
 
 
 MODE_TO_PROVIDER_MODE = {
+    "text_to_video": "text_to_video",
     "reference": "image_to_video",
     "first_last_frame": "first_last_frame",
     "storyboard": "storyboard",
@@ -319,6 +321,8 @@ async def _collect_reference_images(
     storyboard: Optional[ProjectStoryboard] = None,
 ) -> List[str]:
     urls: List[str] = []
+    if payload.generation_mode == "text_to_video":
+        return []
     if payload.generation_mode == "storyboard" and storyboard is not None:
         urls.extend(_storyboard_reference_images(storyboard))
         return await _resolve_reference_image_urls(db, _dedupe(urls))
@@ -448,6 +452,8 @@ def _model_image_limit(ai_model: AiModel) -> Optional[int]:
 def _normalize_storyboard_video_resolution(ai_model: AiModel, resolution: str) -> str:
     if ai_model.vendor == VOLCENGINE_ARK_VENDOR or is_volcengine_ark_video_model(ai_model.model_id):
         capabilities = merge_ark_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
+        if not is_video_resolution_supported(resolution, capabilities):
+            raise AppException("当前火山方舟视频模型不支持该 resolution 参数", code=40012, status_code=400)
         return normalize_video_resolution(resolution, capabilities)
     return resolution
 
@@ -482,7 +488,7 @@ def _build_storyboard_video_extra(
     resolution: str,
 ) -> Dict[str, Any]:
     extra = dict(payload.extra or {})
-    if payload.generation_mode == "storyboard":
+    if payload.generation_mode in {"storyboard", "text_to_video"}:
         _clear_video_reference_media_extra(extra)
     extra["resolution"] = resolution
     extra["return_last_frame"] = payload.return_last_frame
@@ -498,6 +504,11 @@ def _build_storyboard_video_extra(
         extra["duration_suggestion"] = storyboard.duration_suggestion
     extra["video_mode"] = MODE_TO_PROVIDER_MODE[payload.generation_mode]
     extra["capability"] = MODE_TO_PROVIDER_MODE[payload.generation_mode]
+    if payload.generation_mode == "text_to_video":
+        _drop_frame_url_keys(extra)
+        return extra
+    if payload.generation_mode == "reference" and not reference_images and not _has_reference_image_or_video_extra(extra):
+        raise AppException("参考生成需要至少传入参考图片或参考视频", code=40012, status_code=400)
     if reference_images and payload.generation_mode != "first_last_frame":
         extra["images"] = reference_images
         if ai_model.vendor != VOLCENGINE_ARK_VENDOR and not is_volcengine_ark_video_model(ai_model.model_id):
@@ -543,6 +554,99 @@ def _clear_video_reference_media_extra(extra: Dict[str, Any]) -> None:
         "videos",
     ):
         extra.pop(key, None)
+
+
+def _drop_frame_url_keys(extra: Dict[str, Any]) -> None:
+    for key in (
+        "first_frame_url",
+        "first_frame",
+        "firstFrameUrl",
+        "firstFrame",
+        "first_image_url",
+        "firstImageUrl",
+        "start_frame_url",
+        "start_frame",
+        "startFrameUrl",
+        "startFrame",
+        "start_image_url",
+        "startImageUrl",
+        "reference_first_frame_url",
+        "reference_start_frame_url",
+        "last_frame_url",
+        "last_frame",
+        "lastFrameUrl",
+        "lastFrame",
+        "last_image_url",
+        "lastImageUrl",
+        "end_frame_url",
+        "end_frame",
+        "endFrameUrl",
+        "endFrame",
+        "end_image_url",
+        "endImageUrl",
+        "ending_frame_url",
+        "endingFrameUrl",
+        "tail_frame_url",
+        "tailFrameUrl",
+        "reference_last_frame_url",
+        "reference_end_frame_url",
+    ):
+        extra.pop(key, None)
+
+
+def _has_reference_image_or_video_extra(extra: Dict[str, Any]) -> bool:
+    for key in (
+        "image",
+        "image_url",
+        "image_urls",
+        "images",
+        "reference_image",
+        "reference_image_url",
+        "reference_image_urls",
+        "reference_images",
+        "uploaded_images",
+        "video",
+        "video_url",
+        "video_urls",
+        "videos",
+        "reference_video",
+        "reference_video_url",
+        "reference_video_urls",
+        "reference_videos",
+    ):
+        if _has_extra_value(extra.get(key)):
+            return True
+    for key in ("media", "media_items", "content"):
+        for item in _as_list(extra.get(key)):
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "").strip()
+            role = str(item.get("role") or "").strip().replace("-", "_")
+            if item_type == "video_url" or role in {"reference_video", "video", "ref_video", "referenceVideo"}:
+                return True
+            if item_type == "image_url" and role in {"", "reference_image", "reference", "image", "ref_image", "referenceImage"}:
+                return True
+    return False
+
+
+def _has_extra_value(value: Any) -> bool:
+    if value in (None, "", []):
+        return False
+    if isinstance(value, dict):
+        return any(_has_extra_value(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_extra_value(item) for item in value)
+    return True
+
+
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
 
 
 def _storyboard_duration_seconds(storyboard: ProjectStoryboard, min_seconds: int = 5) -> Optional[int]:
@@ -814,6 +918,12 @@ def _video_generation_constraint(
     has_first_frame: bool = False,
     has_last_frame: bool = False,
 ) -> str:
+    if generation_mode == "text_to_video":
+        return (
+            "请根据当前分镜文本生成一段连续镜头视频。画面必须遵循当前分镜剧情、人物、场景、道具、"
+            "动作、镜头语言、氛围和结尾要求；不依赖任何参考图、参考视频或参考音频，"
+            "不新增主要人物、场景或关键道具。"
+        )
     if generation_mode == "first_last_frame":
         if has_first_frame and has_last_frame:
             return (

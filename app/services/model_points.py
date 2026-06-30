@@ -14,10 +14,11 @@ from app.models.task_record import UserTaskRecord
 from app.services.points import change_user_points
 
 
+# 4K is only available on the standard Seedance 2.0 model.
 SEEDANCE_VIDEO_UNIT_POINTS = {
     "doubao-seedance-2-0-260128": {
-        "no_video": {"480p": 6, "720p": 12, "1080p": 30},
-        "with_video": {"480p": 7, "720p": 13, "1080p": 35},
+        "no_video": {"480p": 6, "720p": 12, "1080p": 30, "4k": 60},
+        "with_video": {"480p": 7, "720p": 13, "1080p": 35, "4k": 80},
     },
     "doubao-seedance-2-0-fast-260128": {
         "no_video": {"480p": 5, "720p": 10},
@@ -315,7 +316,16 @@ def _video_billing_resolution(ai_model: AiModel, extra: Dict[str, Any]) -> Optio
 
 
 def _has_video_reference(extra: Dict[str, Any]) -> bool:
-    for key in ("video", "video_url", "video_urls", "videos", "reference_video", "reference_videos"):
+    for key in (
+        "video",
+        "video_url",
+        "video_urls",
+        "videos",
+        "reference_video",
+        "reference_video_url",
+        "reference_video_urls",
+        "reference_videos",
+    ):
         if _has_value(extra.get(key)):
             return True
     for key in ("media", "media_items", "content"):

@@ -293,8 +293,8 @@ class ProjectStoryboardSplitRequest(ProjectStoryboardRequestModel):
 
 class ProjectStoryboardVideoGenerateRequest(ProjectStoryboardRequestModel):
     ai_model_id: UUID
-    generation_mode: Literal["reference", "first_last_frame", "storyboard"] = "reference"
-    resolution: Literal["480p", "720p", "1080p"] = "720p"
+    generation_mode: Literal["text_to_video", "reference", "first_last_frame", "storyboard"] = "reference"
+    resolution: Literal["480p", "720p", "1080p", "4k"] = "720p"
     return_last_frame: bool = False
     prompt: Optional[str] = Field(default=None, min_length=1)
     character_ids: List[UUID] = Field(default_factory=list)
@@ -311,6 +311,8 @@ class ProjectStoryboardVideoGenerateRequest(ProjectStoryboardRequestModel):
         if not isinstance(value, dict):
             return value
         data = dict(value)
+        if "generation_mode" in data:
+            data["generation_mode"] = _normalize_video_generation_mode(data.get("generation_mode"))
         data["first_frame_url"] = (
             _extract_request_frame_url(data, FIRST_FRAME_URL_KEYS, FIRST_FRAME_ROLES)
             or data.get("first_frame_url")
@@ -381,6 +383,44 @@ def _extract_request_media_url(value: Any) -> str:
 
 def _normalize_request_frame_role(value: Any) -> str:
     return str(value or "").strip().replace("-", "_")
+
+
+def _normalize_video_generation_mode(value: Any) -> str:
+    mode = str(value or "reference").strip().replace("-", "_")
+    aliases = {
+        "文生视频": "text_to_video",
+        "文本生成视频": "text_to_video",
+        "text": "text_to_video",
+        "text2video": "text_to_video",
+        "textToVideo": "text_to_video",
+        "text_to_video": "text_to_video",
+        "t2v": "text_to_video",
+        "参考生成": "reference",
+        "多模态参考": "reference",
+        "多模态参考生成": "reference",
+        "参考图生成": "reference",
+        "reference": "reference",
+        "referenceGeneration": "reference",
+        "reference_generation": "reference",
+        "imageToVideo": "reference",
+        "image_to_video": "reference",
+        "multimodalReference": "reference",
+        "multimodal_reference": "reference",
+        "首帧生成": "first_last_frame",
+        "首帧模式": "first_last_frame",
+        "首尾帧生成": "first_last_frame",
+        "首尾帧模式": "first_last_frame",
+        "firstFrame": "first_last_frame",
+        "first_frame": "first_last_frame",
+        "firstLast": "first_last_frame",
+        "firstLastFrame": "first_last_frame",
+        "first_last": "first_last_frame",
+        "first_last_frame": "first_last_frame",
+        "storyboard": "storyboard",
+        "故事版生成": "storyboard",
+        "故事版视频": "storyboard",
+    }
+    return aliases.get(mode, mode)
 
 
 class ProjectStoryboardVideoGenerateOut(SchemaBaseModel):

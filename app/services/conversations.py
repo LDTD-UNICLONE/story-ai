@@ -9,6 +9,7 @@ from app.core.exceptions import AppException
 from app.integrations import comfly
 from app.integrations.volcengine_ark_video_specs import (
     is_known_video_resolution,
+    is_video_resolution_supported,
     is_volcengine_ark_video_model,
     merge_video_capabilities as merge_ark_video_capabilities,
     normalize_video_resolution,
@@ -33,6 +34,7 @@ from app.tasks.model_generation import run_conversation_generation
 SUPPORTED_CONVERSATION_TYPES = {"text", "image", "video"}
 DEFAULT_TEXT_CONTEXT_MESSAGE_LIMIT = 20
 CONVERSATION_VIDEO_MODE_TO_PROVIDER_MODE = {
+    "text_to_video": "text_to_video",
     "reference": "image_to_video",
     "first_last_frame": "first_last_frame",
 }
@@ -605,12 +607,18 @@ async def _build_message_extra_with_context(
 
 
 def _build_video_message_extra(extra: Dict[str, Any], ai_model: Optional[AiModel] = None) -> Dict[str, Any]:
-    generation_mode = _normalize_conversation_video_generation_mode(extra.get("generation_mode"))
+    generation_mode = _normalize_conversation_video_generation_mode(extra.get("generation_mode"), extra)
     payload = dict(extra)
     payload["generation_mode"] = generation_mode
     payload["resolution"] = _normalize_conversation_video_resolution(ai_model, payload.get("resolution"))
     payload["video_mode"] = CONVERSATION_VIDEO_MODE_TO_PROVIDER_MODE[generation_mode]
     payload["capability"] = CONVERSATION_VIDEO_MODE_TO_PROVIDER_MODE[generation_mode]
+
+    if generation_mode == "text_to_video":
+        if _has_video_media_input(payload):
+            raise AppException("文生视频不能传入参考图片、参考视频、参考音频或首尾帧图片", code=40012, status_code=400)
+        _drop_video_media_keys(payload)
+        return payload
 
     if generation_mode == "reference":
         reference_images = _dedupe(
@@ -679,6 +687,10 @@ def _build_video_message_extra(extra: Dict[str, Any], ai_model: Optional[AiModel
         if reference_audios:
             payload["audios"] = reference_audios
             payload["audio_urls"] = reference_audios
+        if reference_audios and not (reference_images or reference_videos):
+            raise AppException("参考音频不能单独使用，需要同时传入参考图片或参考视频", code=40012, status_code=400)
+        if not reference_images and not reference_videos:
+            raise AppException("参考生成需要至少传入参考图片或参考视频", code=40012, status_code=400)
         _drop_frame_url_keys(payload)
         payload.pop("media", None)
         payload.pop("media_items", None)
@@ -714,6 +726,8 @@ def _normalize_conversation_video_resolution(ai_model: Optional[AiModel], value:
         if value not in (None, "") and not is_known_video_resolution(value):
             raise AppException("火山方舟视频 resolution 参数不支持", code=40012, status_code=400)
         capabilities = merge_ark_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
+        if value not in (None, "") and not is_video_resolution_supported(value, capabilities):
+            raise AppException("当前火山方舟视频模型不支持该 resolution 参数", code=40012, status_code=400)
         return normalize_video_resolution(value or "720p", capabilities)
 
     normalized = str(value or "720p").strip().lower()
@@ -728,13 +742,34 @@ def _normalize_conversation_video_resolution(ai_model: Optional[AiModel], value:
     return normalized if normalized in {"480p", "720p", "1080p"} else "720p"
 
 
-def _normalize_conversation_video_generation_mode(value: Any) -> str:
-    mode = str(value or "reference").strip()
+def _normalize_conversation_video_generation_mode(value: Any, extra: Optional[Dict[str, Any]] = None) -> str:
+    if value in (None, ""):
+        extra = extra or {}
+        if _has_first_last_frame_input(extra):
+            return "first_last_frame"
+        if _has_reference_media_input(extra):
+            return "reference"
+        return "text_to_video"
+
+    mode = str(value).strip()
     aliases = {
+        "文生视频": "text_to_video",
+        "文本生成视频": "text_to_video",
+        "text": "text_to_video",
+        "text2video": "text_to_video",
+        "textToVideo": "text_to_video",
+        "text_to_video": "text_to_video",
+        "text-to-video": "text_to_video",
+        "t2v": "text_to_video",
         "参考生成": "reference",
+        "referenceGeneration": "reference",
         "reference_generation": "reference",
+        "imageToVideo": "reference",
         "image_to_video": "reference",
+        "multimodalReference": "reference",
+        "multimodal_reference": "reference",
         "多模态参考": "reference",
+        "多模态参考生成": "reference",
         "参考图生成": "reference",
         "首帧生成": "first_last_frame",
         "首帧模式": "first_last_frame",
@@ -742,13 +777,106 @@ def _normalize_conversation_video_generation_mode(value: Any) -> str:
         "first-frame": "first_last_frame",
         "首尾帧生成": "first_last_frame",
         "首尾帧模式": "first_last_frame",
+        "firstFrame": "first_last_frame",
         "first-last-frame": "first_last_frame",
+        "firstLast": "first_last_frame",
+        "firstLastFrame": "first_last_frame",
         "first_last": "first_last_frame",
     }
     mode = aliases.get(mode, mode)
     if mode not in CONVERSATION_VIDEO_MODE_TO_PROVIDER_MODE:
         raise AppException("不支持的视频生成方式", code=40012, status_code=400)
     return mode
+
+
+def _has_first_last_frame_input(extra: Dict[str, Any]) -> bool:
+    return bool(
+        _extract_frame_url(extra, FIRST_FRAME_URL_KEYS, FIRST_FRAME_ROLES)
+        or _extract_frame_url(extra, LAST_FRAME_URL_KEYS, LAST_FRAME_ROLES)
+    )
+
+
+def _has_reference_media_input(extra: Dict[str, Any]) -> bool:
+    return bool(
+        _collect_extra_urls(
+            extra,
+            (
+                "images",
+                "image",
+                "image_url",
+                "image_urls",
+                "uploaded_images",
+                "reference_image",
+                "reference_image_url",
+                "reference_images",
+                "reference_image_urls",
+                "videos",
+                "video",
+                "video_url",
+                "video_urls",
+                "uploaded_videos",
+                "reference_video",
+                "reference_video_url",
+                "reference_videos",
+                "reference_video_urls",
+                "audios",
+                "audio",
+                "audio_url",
+                "audio_urls",
+                "uploaded_audios",
+                "reference_audio",
+                "reference_audio_url",
+                "reference_audios",
+                "reference_audio_urls",
+            ),
+        )
+        or _collect_media_image_urls(extra, {"reference_image"}, allow_roleless=True)
+        or _collect_media_urls(extra, "video_url", {"reference_video"})
+        or _collect_media_urls(extra, "audio_url", {"reference_audio"})
+    )
+
+
+def _has_video_media_input(extra: Dict[str, Any]) -> bool:
+    return _has_first_last_frame_input(extra) or _has_reference_media_input(extra)
+
+
+def _drop_video_media_keys(extra: Dict[str, Any]) -> None:
+    for key in (
+        "audio",
+        "audio_url",
+        "audio_urls",
+        "audios",
+        "content",
+        "image",
+        "image_url",
+        "image_urls",
+        "images",
+        "last_frame_url",
+        "last_frame",
+        "media",
+        "media_items",
+        "reference_audio",
+        "reference_audio_url",
+        "reference_audio_urls",
+        "reference_audios",
+        "reference_image",
+        "reference_image_url",
+        "reference_image_urls",
+        "reference_images",
+        "reference_video",
+        "reference_video_url",
+        "reference_video_urls",
+        "reference_videos",
+        "uploaded_audios",
+        "uploaded_images",
+        "uploaded_videos",
+        "video",
+        "video_url",
+        "video_urls",
+        "videos",
+    ):
+        extra.pop(key, None)
+    _drop_frame_url_keys(extra)
 
 
 def _collect_extra_urls(extra: Dict[str, Any], keys: Tuple[str, ...]) -> List[str]:
