@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
-from pydantic import ConfigDict, Field, field_serializer
+from pydantic import ConfigDict, Field, field_serializer, model_validator
 
 from app.core.public_messages import sanitize_public_data, sanitize_public_message
 from app.schemas.base import SchemaBaseModel
@@ -67,10 +67,124 @@ class ConversationMessageListOut(SchemaBaseModel):
     page_size: int
 
 
+_MESSAGE_EXTRA_COMPAT_FIELDS = {
+    "aspect_ratio",
+    "audio",
+    "audio_url",
+    "audio_urls",
+    "audioUrl",
+    "audioUrls",
+    "audios",
+    "attachment",
+    "attachment_url",
+    "attachment_urls",
+    "attachmentUrl",
+    "attachmentUrls",
+    "attachments",
+    "duration",
+    "duration_seconds",
+    "file",
+    "file_list",
+    "file_url",
+    "file_urls",
+    "fileList",
+    "fileUrl",
+    "fileUrls",
+    "files",
+    "first_frame",
+    "first_frame_url",
+    "firstFrame",
+    "firstFrameUrl",
+    "generation_mode",
+    "generate_audio",
+    "image",
+    "image_url",
+    "image_urls",
+    "imageUrl",
+    "imageUrls",
+    "images",
+    "last_frame",
+    "last_frame_url",
+    "lastFrame",
+    "lastFrameUrl",
+    "media",
+    "media_items",
+    "ratio",
+    "reference_audio",
+    "reference_audio_url",
+    "reference_audios",
+    "reference_audio_urls",
+    "reference_image",
+    "reference_image_url",
+    "reference_images",
+    "reference_image_urls",
+    "reference_video",
+    "reference_video_url",
+    "reference_videos",
+    "reference_video_urls",
+    "referenceAudio",
+    "referenceAudioUrl",
+    "referenceAudios",
+    "referenceAudioUrls",
+    "referenceImage",
+    "referenceImageUrl",
+    "referenceImageUrls",
+    "referenceImages",
+    "referenceVideo",
+    "referenceVideoUrl",
+    "referenceVideoUrls",
+    "referenceVideos",
+    "resolution",
+    "return_last_frame",
+    "seed",
+    "uploaded_audios",
+    "uploaded_file",
+    "uploaded_files",
+    "uploaded_images",
+    "uploaded_videos",
+    "uploadedAudios",
+    "uploadedFile",
+    "uploadedFiles",
+    "uploadedImages",
+    "uploadedVideos",
+    "upload",
+    "upload_file",
+    "upload_files",
+    "upload_list",
+    "uploadFile",
+    "uploadFiles",
+    "uploadList",
+    "uploads",
+    "video",
+    "video_url",
+    "video_urls",
+    "videoUrl",
+    "videoUrls",
+    "videos",
+    "watermark",
+}
+
+
 class ConversationSendMessageRequest(SchemaBaseModel):
     content: str = Field(..., min_length=1)
     ai_model_id: Optional[UUID] = None
     extra: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def merge_top_level_extra_fields(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        extra = data.get("extra")
+        normalized_extra: Dict[str, Any] = dict(extra) if isinstance(extra, dict) else {}
+        for key in list(data.keys()):
+            if key not in _MESSAGE_EXTRA_COMPAT_FIELDS:
+                continue
+            normalized_extra.setdefault(key, data.pop(key))
+        if normalized_extra:
+            data["extra"] = normalized_extra
+        return data
 
 
 class ConversationSendMessageOut(SchemaBaseModel):

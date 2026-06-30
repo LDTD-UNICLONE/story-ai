@@ -108,6 +108,88 @@ LAST_FRAME_ROLES = {
     "reference_end_frame",
     "referenceEndFrame",
 }
+REFERENCE_IMAGE_URL_KEYS = (
+    "images",
+    "image",
+    "image_url",
+    "image_urls",
+    "imageUrl",
+    "imageUrls",
+    "uploaded_images",
+    "uploadedImages",
+    "reference_image",
+    "reference_image_url",
+    "reference_images",
+    "reference_image_urls",
+    "referenceImage",
+    "referenceImageUrl",
+    "referenceImages",
+    "referenceImageUrls",
+)
+REFERENCE_VIDEO_URL_KEYS = (
+    "videos",
+    "video",
+    "video_url",
+    "video_urls",
+    "videoUrl",
+    "videoUrls",
+    "uploaded_videos",
+    "uploadedVideos",
+    "reference_video",
+    "reference_video_url",
+    "reference_videos",
+    "reference_video_urls",
+    "referenceVideo",
+    "referenceVideoUrl",
+    "referenceVideos",
+    "referenceVideoUrls",
+)
+REFERENCE_AUDIO_URL_KEYS = (
+    "audios",
+    "audio",
+    "audio_url",
+    "audio_urls",
+    "audioUrl",
+    "audioUrls",
+    "uploaded_audios",
+    "uploadedAudios",
+    "reference_audio",
+    "reference_audio_url",
+    "reference_audios",
+    "reference_audio_urls",
+    "referenceAudio",
+    "referenceAudioUrl",
+    "referenceAudios",
+    "referenceAudioUrls",
+)
+GENERIC_UPLOAD_MEDIA_KEYS = (
+    "file",
+    "files",
+    "file_list",
+    "file_url",
+    "file_urls",
+    "fileList",
+    "fileUrl",
+    "fileUrls",
+    "upload",
+    "upload_file",
+    "upload_files",
+    "upload_list",
+    "uploadFile",
+    "uploadFiles",
+    "uploadList",
+    "uploads",
+    "uploaded_file",
+    "uploaded_files",
+    "uploadedFile",
+    "uploadedFiles",
+    "attachment",
+    "attachments",
+    "attachment_url",
+    "attachment_urls",
+    "attachmentUrl",
+    "attachmentUrls",
+)
 
 
 async def get_enabled_conversation_model_or_404(
@@ -623,58 +705,19 @@ def _build_video_message_extra(extra: Dict[str, Any], ai_model: Optional[AiModel
     if generation_mode == "reference":
         reference_images = _dedupe(
             [
-                *_collect_extra_urls(
-                    payload,
-                    (
-                        "images",
-                        "image",
-                        "image_url",
-                        "image_urls",
-                        "uploaded_images",
-                        "reference_image",
-                        "reference_image_url",
-                        "reference_images",
-                        "reference_image_urls",
-                    ),
-                ),
+                *_collect_reference_image_urls(payload),
                 *_collect_media_image_urls(payload, {"reference_image"}, allow_roleless=True),
             ]
         )
         reference_videos = _dedupe(
             [
-                *_collect_extra_urls(
-                    payload,
-                    (
-                        "videos",
-                        "video",
-                        "video_url",
-                        "video_urls",
-                        "uploaded_videos",
-                        "reference_video",
-                        "reference_video_url",
-                        "reference_videos",
-                        "reference_video_urls",
-                    ),
-                ),
+                *_collect_reference_video_urls(payload),
                 *_collect_media_urls(payload, "video_url", {"reference_video"}),
             ]
         )
         reference_audios = _dedupe(
             [
-                *_collect_extra_urls(
-                    payload,
-                    (
-                        "audios",
-                        "audio",
-                        "audio_url",
-                        "audio_urls",
-                        "uploaded_audios",
-                        "reference_audio",
-                        "reference_audio_url",
-                        "reference_audios",
-                        "reference_audio_urls",
-                    ),
-                ),
+                *_collect_reference_audio_urls(payload),
                 *_collect_media_urls(payload, "audio_url", {"reference_audio"}),
             ]
         )
@@ -690,7 +733,11 @@ def _build_video_message_extra(extra: Dict[str, Any], ai_model: Optional[AiModel
         if reference_audios and not (reference_images or reference_videos):
             raise AppException("参考音频不能单独使用，需要同时传入参考图片或参考视频", code=40012, status_code=400)
         if not reference_images and not reference_videos:
-            raise AppException("参考生成需要至少传入参考图片或参考视频", code=40012, status_code=400)
+            raise AppException(
+                "参考生成需要至少传入参考图片或参考视频；上传后请把 /uploads/file 返回的 data.url 放入 extra.uploaded_images",
+                code=40012,
+                status_code=400,
+            )
         _drop_frame_url_keys(payload)
         payload.pop("media", None)
         payload.pop("media_items", None)
@@ -798,38 +845,9 @@ def _has_first_last_frame_input(extra: Dict[str, Any]) -> bool:
 
 def _has_reference_media_input(extra: Dict[str, Any]) -> bool:
     return bool(
-        _collect_extra_urls(
-            extra,
-            (
-                "images",
-                "image",
-                "image_url",
-                "image_urls",
-                "uploaded_images",
-                "reference_image",
-                "reference_image_url",
-                "reference_images",
-                "reference_image_urls",
-                "videos",
-                "video",
-                "video_url",
-                "video_urls",
-                "uploaded_videos",
-                "reference_video",
-                "reference_video_url",
-                "reference_videos",
-                "reference_video_urls",
-                "audios",
-                "audio",
-                "audio_url",
-                "audio_urls",
-                "uploaded_audios",
-                "reference_audio",
-                "reference_audio_url",
-                "reference_audios",
-                "reference_audio_urls",
-            ),
-        )
+        _collect_reference_image_urls(extra)
+        or _collect_reference_video_urls(extra)
+        or _collect_reference_audio_urls(extra)
         or _collect_media_image_urls(extra, {"reference_image"}, allow_roleless=True)
         or _collect_media_urls(extra, "video_url", {"reference_video"})
         or _collect_media_urls(extra, "audio_url", {"reference_audio"})
@@ -847,9 +865,17 @@ def _drop_video_media_keys(extra: Dict[str, Any]) -> None:
         "audio_urls",
         "audios",
         "content",
+        "file",
+        "file_url",
+        "file_urls",
+        "fileUrl",
+        "fileUrls",
+        "files",
         "image",
         "image_url",
         "image_urls",
+        "imageUrl",
+        "imageUrls",
         "images",
         "last_frame_url",
         "last_frame",
@@ -863,20 +889,112 @@ def _drop_video_media_keys(extra: Dict[str, Any]) -> None:
         "reference_image_url",
         "reference_image_urls",
         "reference_images",
+        "referenceImage",
+        "referenceImageUrl",
+        "referenceImageUrls",
+        "referenceImages",
         "reference_video",
         "reference_video_url",
         "reference_video_urls",
         "reference_videos",
+        "referenceVideo",
+        "referenceVideoUrl",
+        "referenceVideoUrls",
+        "referenceVideos",
+        "upload",
+        "uploaded_file",
+        "uploaded_files",
+        "uploadedFile",
+        "uploadedFiles",
         "uploaded_audios",
         "uploaded_images",
+        "uploadedImages",
         "uploaded_videos",
+        "uploadedVideos",
+        "uploads",
+        "attachment",
+        "attachment_url",
+        "attachment_urls",
+        "attachmentUrl",
+        "attachmentUrls",
+        "attachments",
         "video",
         "video_url",
         "video_urls",
+        "videoUrl",
+        "videoUrls",
         "videos",
     ):
         extra.pop(key, None)
     _drop_frame_url_keys(extra)
+
+
+def _collect_reference_image_urls(extra: Dict[str, Any]) -> List[str]:
+    return [
+        *_collect_extra_urls(extra, REFERENCE_IMAGE_URL_KEYS),
+        *_collect_uploaded_media_urls(extra, "image"),
+    ]
+
+
+def _collect_reference_video_urls(extra: Dict[str, Any]) -> List[str]:
+    return [
+        *_collect_extra_urls(extra, REFERENCE_VIDEO_URL_KEYS),
+        *_collect_uploaded_media_urls(extra, "video"),
+    ]
+
+
+def _collect_reference_audio_urls(extra: Dict[str, Any]) -> List[str]:
+    return [
+        *_collect_extra_urls(extra, REFERENCE_AUDIO_URL_KEYS),
+        *_collect_uploaded_media_urls(extra, "audio"),
+    ]
+
+
+def _collect_uploaded_media_urls(extra: Dict[str, Any], media_type: str) -> List[str]:
+    urls: List[str] = []
+    for key in GENERIC_UPLOAD_MEDIA_KEYS:
+        for value in _as_list(extra.get(key)):
+            if _uploaded_media_type(value) != media_type:
+                continue
+            url = _extract_media_url(value)
+            if url:
+                urls.append(url)
+    return urls
+
+
+def _uploaded_media_type(value: Any) -> str:
+    raw_type = ""
+    if isinstance(value, dict):
+        raw_type = _extract_upload_media_type(value)
+    if raw_type.startswith("image/") or raw_type in {"image", "img", "image_url"}:
+        return "image"
+    if raw_type.startswith("video/") or raw_type in {"video", "video_url"}:
+        return "video"
+    if raw_type.startswith("audio/") or raw_type in {"audio", "audio_url"}:
+        return "audio"
+
+    url = _extract_media_url(value).lower().split("?", 1)[0]
+    if url.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".gif", ".heic", ".heif")):
+        return "image"
+    if url.endswith((".mp4", ".mov", ".webm", ".m4v", ".avi", ".mkv")):
+        return "video"
+    if url.endswith((".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")):
+        return "audio"
+    return ""
+
+
+def _extract_upload_media_type(value: Dict[str, Any]) -> str:
+    for key in ("file_type", "media_type", "content_type", "mime_type", "type"):
+        item = value.get(key)
+        if item not in (None, ""):
+            return str(item).strip().lower()
+    for key in ("data", "response", "file", "upload"):
+        nested = value.get(key)
+        if isinstance(nested, dict):
+            media_type = _extract_upload_media_type(nested)
+            if media_type:
+                return media_type
+    return ""
 
 
 def _collect_extra_urls(extra: Dict[str, Any], keys: Tuple[str, ...]) -> List[str]:
@@ -1109,6 +1227,12 @@ def _extract_media_url(value: Any) -> str:
                 return nested
             if isinstance(nested, dict) and isinstance(nested.get("url"), str):
                 return nested["url"]
+        for key in ("data", "response", "file", "upload"):
+            nested = value.get(key)
+            if isinstance(nested, dict):
+                url = _extract_media_url(nested)
+                if url:
+                    return url
     return ""
 
 

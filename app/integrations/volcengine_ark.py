@@ -31,25 +31,57 @@ VIDEO_HELPER_KEYS = {
     "audio_url",
     "audio_urls",
     "audios",
+    "attachment",
+    "attachment_url",
+    "attachment_urls",
+    "attachmentUrl",
+    "attachmentUrls",
+    "attachments",
+    "file",
+    "file_url",
+    "file_urls",
+    "fileUrl",
+    "fileUrls",
+    "files",
     "image",
     "image_url",
     "image_urls",
+    "imageUrl",
+    "imageUrls",
     "images",
+    "upload",
+    "uploaded_file",
+    "uploaded_files",
+    "uploadedFile",
+    "uploadedFiles",
     "uploaded_images",
+    "uploadedImages",
     "reference_audio",
     "reference_audio_url",
     "reference_audio_urls",
     "reference_audios",
+    "referenceAudio",
+    "referenceAudioUrl",
+    "referenceAudioUrls",
+    "referenceAudios",
     "reference_first_frame_url",
     "reference_image",
     "reference_image_url",
     "reference_image_urls",
     "reference_images",
+    "referenceImage",
+    "referenceImageUrl",
+    "referenceImageUrls",
+    "referenceImages",
     "reference_last_frame_url",
     "reference_video",
     "reference_video_url",
     "reference_video_urls",
     "reference_videos",
+    "referenceVideo",
+    "referenceVideoUrl",
+    "referenceVideoUrls",
+    "referenceVideos",
     "reference_start_frame_url",
     "reference_end_frame_url",
     "start_frame_reference_url",
@@ -84,7 +116,10 @@ VIDEO_HELPER_KEYS = {
     "video",
     "video_url",
     "video_urls",
+    "videoUrl",
+    "videoUrls",
     "videos",
+    "uploads",
     "video_mode",
     "ratio",
     "resolution",
@@ -98,6 +133,34 @@ DEFAULT_WATERMARK = False
 MAX_REFERENCE_IMAGES = 9
 MAX_REFERENCE_VIDEOS = 3
 MAX_REFERENCE_AUDIOS = 3
+GENERIC_UPLOAD_MEDIA_KEYS = (
+    "file",
+    "files",
+    "file_list",
+    "file_url",
+    "file_urls",
+    "fileList",
+    "fileUrl",
+    "fileUrls",
+    "upload",
+    "upload_file",
+    "upload_files",
+    "upload_list",
+    "uploadFile",
+    "uploadFiles",
+    "uploadList",
+    "uploads",
+    "uploaded_file",
+    "uploaded_files",
+    "uploadedFile",
+    "uploadedFiles",
+    "attachment",
+    "attachments",
+    "attachment_url",
+    "attachment_urls",
+    "attachmentUrl",
+    "attachmentUrls",
+)
 FIRST_FRAME_URL_KEYS = (
     "first_frame_url",
     "first_frame",
@@ -406,15 +469,22 @@ def _collect_image_urls(extra: Dict[str, Any]) -> List[str]:
         "image",
         "image_url",
         "image_urls",
+        "imageUrl",
+        "imageUrls",
         "uploaded_images",
+        "uploadedImages",
         "reference_image",
         "reference_image_url",
         "reference_images",
         "reference_image_urls",
+        "referenceImage",
+        "referenceImageUrl",
+        "referenceImages",
+        "referenceImageUrls",
     ):
         if key in extra:
             values.extend(_as_list(extra[key]))
-    return _collect_urls(values)
+    return _collect_urls(values) + _collect_uploaded_media_urls(extra, "image")
 
 
 def _collect_video_urls(extra: Dict[str, Any]) -> List[str]:
@@ -424,14 +494,22 @@ def _collect_video_urls(extra: Dict[str, Any]) -> List[str]:
         "video",
         "video_url",
         "video_urls",
+        "videoUrl",
+        "videoUrls",
+        "uploaded_videos",
+        "uploadedVideos",
         "reference_video",
         "reference_video_url",
         "reference_videos",
         "reference_video_urls",
+        "referenceVideo",
+        "referenceVideoUrl",
+        "referenceVideos",
+        "referenceVideoUrls",
     ):
         if key in extra:
             values.extend(_as_list(extra[key]))
-    return _collect_urls(values)
+    return _collect_urls(values) + _collect_uploaded_media_urls(extra, "video")
 
 
 def _collect_audio_urls(extra: Dict[str, Any]) -> List[str]:
@@ -441,14 +519,22 @@ def _collect_audio_urls(extra: Dict[str, Any]) -> List[str]:
         "audio",
         "audio_url",
         "audio_urls",
+        "audioUrl",
+        "audioUrls",
+        "uploaded_audios",
+        "uploadedAudios",
         "reference_audio",
         "reference_audio_url",
         "reference_audios",
         "reference_audio_urls",
+        "referenceAudio",
+        "referenceAudioUrl",
+        "referenceAudios",
+        "referenceAudioUrls",
     ):
         if key in extra:
             values.extend(_as_list(extra[key]))
-    return _collect_urls(values)
+    return _collect_urls(values) + _collect_uploaded_media_urls(extra, "audio")
 
 
 def _collect_urls(values: List[Any]) -> List[str]:
@@ -460,6 +546,55 @@ def _collect_urls(values: List[Any]) -> List[str]:
             seen.add(url)
             urls.append(url)
     return urls
+
+
+def _collect_uploaded_media_urls(extra: Dict[str, Any], media_type: str) -> List[str]:
+    urls: List[str] = []
+    seen = set()
+    for key in GENERIC_UPLOAD_MEDIA_KEYS:
+        for value in _as_list(extra.get(key)):
+            if _uploaded_media_type(value) != media_type:
+                continue
+            url = _extract_ark_media_url(value)
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+    return urls
+
+
+def _uploaded_media_type(value: Any) -> str:
+    raw_type = ""
+    if isinstance(value, dict):
+        raw_type = _extract_upload_media_type(value)
+    if raw_type.startswith("image/") or raw_type in {"image", "img", "image_url"}:
+        return "image"
+    if raw_type.startswith("video/") or raw_type in {"video", "video_url"}:
+        return "video"
+    if raw_type.startswith("audio/") or raw_type in {"audio", "audio_url"}:
+        return "audio"
+
+    url = (_extract_ark_media_url(value) or "").lower().split("?", 1)[0]
+    if url.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".gif", ".heic", ".heif")):
+        return "image"
+    if url.endswith((".mp4", ".mov", ".webm", ".m4v", ".avi", ".mkv")):
+        return "video"
+    if url.endswith((".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")):
+        return "audio"
+    return ""
+
+
+def _extract_upload_media_type(value: Dict[str, Any]) -> str:
+    for key in ("file_type", "media_type", "content_type", "mime_type", "type"):
+        item = value.get(key)
+        if item not in (None, ""):
+            return str(item).strip().lower()
+    for key in ("data", "response", "file", "upload"):
+        nested = value.get(key)
+        if isinstance(nested, dict):
+            media_type = _extract_upload_media_type(nested)
+            if media_type:
+                return media_type
+    return ""
 
 
 def _collect_media_items(extra: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -641,6 +776,12 @@ def _extract_ark_media_url(value: Any) -> Optional[str]:
                 return nested
             if isinstance(nested, dict) and isinstance(nested.get("url"), str):
                 return nested["url"]
+        for key in ("data", "response", "file", "upload"):
+            nested = value.get(key)
+            if isinstance(nested, dict):
+                url = _extract_ark_media_url(nested)
+                if url:
+                    return url
     return None
 
 

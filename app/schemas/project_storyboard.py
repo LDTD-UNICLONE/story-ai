@@ -313,6 +313,8 @@ class ProjectStoryboardVideoGenerateRequest(ProjectStoryboardRequestModel):
         data = dict(value)
         if "generation_mode" in data:
             data["generation_mode"] = _normalize_video_generation_mode(data.get("generation_mode"))
+        if "uploadedImages" in data and "uploaded_images" not in data:
+            data["uploaded_images"] = data.pop("uploadedImages")
         data["first_frame_url"] = (
             _extract_request_frame_url(data, FIRST_FRAME_URL_KEYS, FIRST_FRAME_ROLES)
             or data.get("first_frame_url")

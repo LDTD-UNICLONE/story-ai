@@ -533,25 +533,56 @@ def _clear_video_reference_media_extra(extra: Dict[str, Any]) -> None:
         "audio_urls",
         "audios",
         "content",
+        "file",
+        "file_url",
+        "file_urls",
+        "fileUrl",
+        "fileUrls",
+        "files",
         "image",
         "images",
         "image_url",
         "image_urls",
+        "imageUrl",
+        "imageUrls",
         "media",
         "media_items",
+        "referenceImage",
+        "referenceImageUrl",
+        "referenceImageUrls",
+        "referenceImages",
         "reference_image",
         "reference_images",
         "reference_image_url",
         "reference_image_urls",
+        "referenceVideo",
+        "referenceVideoUrl",
+        "referenceVideoUrls",
+        "referenceVideos",
         "reference_video",
         "reference_video_url",
         "reference_video_urls",
         "reference_videos",
+        "upload",
+        "uploaded_file",
+        "uploaded_files",
+        "uploadedFile",
+        "uploadedFiles",
         "uploaded_images",
+        "uploadedImages",
         "video",
         "video_url",
         "video_urls",
+        "videoUrl",
+        "videoUrls",
         "videos",
+        "uploads",
+        "attachment",
+        "attachment_url",
+        "attachment_urls",
+        "attachmentUrl",
+        "attachmentUrls",
+        "attachments",
     ):
         extra.pop(key, None)
 
@@ -599,23 +630,67 @@ def _has_reference_image_or_video_extra(extra: Dict[str, Any]) -> bool:
         "image",
         "image_url",
         "image_urls",
+        "imageUrl",
+        "imageUrls",
         "images",
         "reference_image",
         "reference_image_url",
         "reference_image_urls",
         "reference_images",
+        "referenceImage",
+        "referenceImageUrl",
+        "referenceImageUrls",
+        "referenceImages",
         "uploaded_images",
+        "uploadedImages",
         "video",
         "video_url",
         "video_urls",
+        "videoUrl",
+        "videoUrls",
         "videos",
         "reference_video",
         "reference_video_url",
         "reference_video_urls",
         "reference_videos",
+        "referenceVideo",
+        "referenceVideoUrl",
+        "referenceVideoUrls",
+        "referenceVideos",
     ):
         if _has_extra_value(extra.get(key)):
             return True
+    for key in (
+        "file",
+        "file_list",
+        "files",
+        "file_url",
+        "file_urls",
+        "fileList",
+        "fileUrl",
+        "fileUrls",
+        "upload",
+        "upload_file",
+        "upload_files",
+        "upload_list",
+        "uploadFile",
+        "uploadFiles",
+        "uploadList",
+        "uploads",
+        "uploaded_file",
+        "uploaded_files",
+        "uploadedFile",
+        "uploadedFiles",
+        "attachment",
+        "attachments",
+        "attachment_url",
+        "attachment_urls",
+        "attachmentUrl",
+        "attachmentUrls",
+    ):
+        for item in _as_list(extra.get(key)):
+            if _uploaded_media_type(item) in {"image", "video"}:
+                return True
     for key in ("media", "media_items", "content"):
         for item in _as_list(extra.get(key)):
             if not isinstance(item, dict):
@@ -627,6 +702,56 @@ def _has_reference_image_or_video_extra(extra: Dict[str, Any]) -> bool:
             if item_type == "image_url" and role in {"", "reference_image", "reference", "image", "ref_image", "referenceImage"}:
                 return True
     return False
+
+
+def _uploaded_media_type(value: Any) -> str:
+    raw_type = ""
+    if isinstance(value, dict):
+        raw_type = _extract_upload_media_type(value)
+    if raw_type.startswith("image/") or raw_type in {"image", "img", "image_url"}:
+        return "image"
+    if raw_type.startswith("video/") or raw_type in {"video", "video_url"}:
+        return "video"
+
+    url = _extract_extra_media_url(value).lower().split("?", 1)[0]
+    if url.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".gif", ".heic", ".heif")):
+        return "image"
+    if url.endswith((".mp4", ".mov", ".webm", ".m4v", ".avi", ".mkv")):
+        return "video"
+    return ""
+
+
+def _extract_upload_media_type(value: Dict[str, Any]) -> str:
+    for key in ("file_type", "media_type", "content_type", "mime_type", "type"):
+        item = value.get(key)
+        if item not in (None, ""):
+            return str(item).strip().lower()
+    for key in ("data", "response", "file", "upload"):
+        nested = value.get(key)
+        if isinstance(nested, dict):
+            media_type = _extract_upload_media_type(nested)
+            if media_type:
+                return media_type
+    return ""
+
+
+def _extract_extra_media_url(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("url", "image_url", "video_url", "audio_url", "file_url", "oss_url"):
+            nested = value.get(key)
+            if isinstance(nested, str):
+                return nested
+            if isinstance(nested, dict) and isinstance(nested.get("url"), str):
+                return nested["url"]
+        for key in ("data", "response", "file", "upload"):
+            nested = value.get(key)
+            if isinstance(nested, dict):
+                url = _extract_extra_media_url(nested)
+                if url:
+                    return url
+    return ""
 
 
 def _has_extra_value(value: Any) -> bool:
