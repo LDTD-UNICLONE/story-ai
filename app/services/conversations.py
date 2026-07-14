@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.timezone import beijing_datetime
 from app.core.exceptions import AppException
 from app.integrations import comfly
+from app.integrations.comfly_video_specs import merge_video_capabilities as merge_comfly_video_capabilities
 from app.integrations.volcengine_ark_video_specs import (
     is_known_video_resolution,
     is_video_resolution_supported,
@@ -28,6 +29,7 @@ from app.services.task_records import (
     expire_stale_task_records,
     interrupt_task_record,
 )
+from app.services.uploads import probe_media_url
 from app.tasks.model_generation import run_conversation_generation
 
 
@@ -38,6 +40,25 @@ CONVERSATION_VIDEO_MODE_TO_PROVIDER_MODE = {
     "reference": "image_to_video",
     "first_last_frame": "first_last_frame",
 }
+COMFLY_VIDEO_VENDORS = {"comfly", "模型服务"}
+ARK_REFERENCE_VIDEO_CONTENT_TYPES = {"video/mp4", "video/quicktime"}
+ARK_REFERENCE_VIDEO_CODECS = {"h264", "hevc", "h265"}
+ARK_REFERENCE_VIDEO_AUDIO_CODECS = {"aac", "mp3"}
+ARK_REFERENCE_VIDEO_MIN_DURATION_SECONDS = 2
+ARK_REFERENCE_VIDEO_MAX_DURATION_SECONDS = 15
+ARK_REFERENCE_VIDEO_MAX_TOTAL_DURATION_SECONDS = 15
+ARK_REFERENCE_VIDEO_MAX_ACCEPTED_DURATION_SECONDS = 15.2
+ARK_REFERENCE_VIDEO_MAX_ACCEPTED_TOTAL_DURATION_SECONDS = 15.2
+ARK_REFERENCE_VIDEO_DURATION_TOLERANCE_SECONDS = 0.2
+ARK_REFERENCE_VIDEO_MAX_SIZE_BYTES = 200 * 1024 * 1024
+ARK_REFERENCE_VIDEO_MIN_FPS = 24
+ARK_REFERENCE_VIDEO_MAX_FPS = 60
+ARK_REFERENCE_VIDEO_MIN_SIDE_PX = 300
+ARK_REFERENCE_VIDEO_MAX_SIDE_PX = 6000
+ARK_REFERENCE_VIDEO_MIN_PIXELS = 640 * 640
+ARK_REFERENCE_VIDEO_MAX_PIXELS = 3326 * 2494
+ARK_REFERENCE_VIDEO_MIN_RATIO = 0.4
+ARK_REFERENCE_VIDEO_MAX_RATIO = 2.5
 TEXT_MULTIMODAL_MEDIA_KEYS = (
     "images",
     "image",
@@ -693,13 +714,15 @@ def _build_video_message_extra(extra: Dict[str, Any], ai_model: Optional[AiModel
     payload = dict(extra)
     payload["generation_mode"] = generation_mode
     payload["resolution"] = _normalize_conversation_video_resolution(ai_model, payload.get("resolution"))
-    payload["video_mode"] = CONVERSATION_VIDEO_MODE_TO_PROVIDER_MODE[generation_mode]
-    payload["capability"] = CONVERSATION_VIDEO_MODE_TO_PROVIDER_MODE[generation_mode]
+    provider_mode = CONVERSATION_VIDEO_MODE_TO_PROVIDER_MODE[generation_mode]
+    payload["video_mode"] = provider_mode
+    payload["capability"] = provider_mode
 
     if generation_mode == "text_to_video":
         if _has_video_media_input(payload):
             raise AppException("文生视频不能传入参考图片、参考视频、参考音频或首尾帧图片", code=40012, status_code=400)
         _drop_video_media_keys(payload)
+        _validate_conversation_video_model_capability(ai_model, payload, generation_mode)
         return payload
 
     if generation_mode == "reference":
@@ -738,6 +761,11 @@ def _build_video_message_extra(extra: Dict[str, Any], ai_model: Optional[AiModel
                 code=40012,
                 status_code=400,
             )
+        provider_mode = _reference_video_provider_mode(reference_images, reference_videos, reference_audios)
+        payload["video_mode"] = provider_mode
+        payload["capability"] = provider_mode
+        _validate_conversation_video_model_capability(ai_model, payload, generation_mode)
+        _drop_reference_media_source_keys(payload)
         _drop_frame_url_keys(payload)
         payload.pop("media", None)
         payload.pop("media_items", None)
@@ -763,7 +791,337 @@ def _build_video_message_extra(extra: Dict[str, Any], ai_model: Optional[AiModel
     payload.pop("media", None)
     payload.pop("content", None)
     _drop_frame_url_keys(payload, keep={"first_frame_url", "last_frame_url"})
+    _validate_conversation_video_model_capability(ai_model, payload, generation_mode)
     return payload
+
+
+def _reference_video_provider_mode(
+    reference_images: List[str],
+    reference_videos: List[str],
+    reference_audios: List[str],
+) -> str:
+    if reference_videos:
+        return "video_to_video"
+    if reference_audios and reference_images:
+        return "audio_video"
+    return "image_to_video"
+
+
+def _validate_conversation_video_model_capability(
+    ai_model: Optional[AiModel],
+    payload: Dict[str, Any],
+    generation_mode: str,
+) -> None:
+    if ai_model is None:
+        return
+
+    capabilities = _conversation_video_capabilities(ai_model)
+    if not capabilities:
+        return
+
+    modes = _capability_set(capabilities, "modes")
+    allowed_keys = _capability_set(capabilities, "request_keys")
+    has_input_constraints = bool(modes or allowed_keys or (capabilities.get("media_limits") or {}))
+    has_images = _has_value(payload.get("images")) or _has_value(payload.get("image_urls"))
+    has_videos = _has_value(payload.get("videos")) or _has_value(payload.get("video_urls"))
+    has_audios = _has_value(payload.get("audios")) or _has_value(payload.get("audio_urls"))
+
+    if generation_mode == "text_to_video":
+        if modes and "text_to_video" not in modes:
+            raise AppException("当前模型不支持文生视频，请切换支持文生视频的模型", code=40012, status_code=400)
+        return
+
+    if generation_mode == "first_last_frame":
+        if modes and "first_last_frame" not in modes:
+            raise AppException("当前模型不支持首尾帧生成，请切换支持首尾帧的模型", code=40012, status_code=400)
+        if not _supports_image_reference(ai_model, capabilities, allowed_keys, modes):
+            raise AppException("当前模型不支持首尾帧图片输入，请切换支持图片输入的视频模型", code=40012, status_code=400)
+        return
+
+    if generation_mode != "reference":
+        return
+
+    if has_videos and has_input_constraints:
+        if not _supports_video_reference(ai_model, capabilities, allowed_keys, modes):
+            raise AppException("当前模型不支持参考视频生成，请切换支持参考视频的视频模型，或改用参考图/文生视频", code=40012, status_code=400)
+        if modes and not modes.intersection({"reference", "multimodal_reference", "video_to_video"}):
+            raise AppException("当前模型不支持参考视频生成，请切换支持参考视频的视频模型", code=40012, status_code=400)
+
+    if has_images and has_input_constraints:
+        if not _supports_image_reference(ai_model, capabilities, allowed_keys, modes):
+            raise AppException("当前模型不支持参考图生成，请切换支持图片输入的视频模型，或改用文生视频", code=40012, status_code=400)
+        if modes and not modes.intersection({"reference", "multimodal_reference", "image_to_video", "video_to_video", "audio_video"}):
+            raise AppException("当前模型不支持参考图生成，请切换支持图片输入的视频模型", code=40012, status_code=400)
+
+    if has_audios and has_input_constraints:
+        if not _supports_audio_reference(ai_model, capabilities, allowed_keys, modes):
+            raise AppException("当前模型不支持参考音频生成，请切换支持音频输入的视频模型", code=40012, status_code=400)
+        if modes and not modes.intersection({"reference", "multimodal_reference", "audio_video"}):
+            raise AppException("当前模型不支持参考音频生成，请切换支持音频输入的视频模型", code=40012, status_code=400)
+
+    _validate_conversation_video_media_limits(capabilities, has_images, has_videos, has_audios, payload)
+    if has_videos and _is_ark_conversation_video_model(ai_model):
+        _validate_ark_reference_video_metadata(payload)
+
+
+def _conversation_video_capabilities(ai_model: AiModel) -> Dict[str, Any]:
+    if ai_model.vendor == "volcengine_ark" or is_volcengine_ark_video_model(ai_model.model_id):
+        return merge_ark_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
+    if ai_model.vendor in COMFLY_VIDEO_VENDORS:
+        return merge_comfly_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
+    return ai_model.capabilities or {}
+
+
+def _capability_set(capabilities: Dict[str, Any], key: str) -> set[str]:
+    return {str(item).strip() for item in (capabilities.get(key) or []) if str(item).strip()}
+
+
+def _has_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        return any(_has_value(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_has_value(item) for item in value)
+    return True
+
+
+def _supports_image_reference(
+    ai_model: AiModel,
+    capabilities: Dict[str, Any],
+    allowed_keys: set[str],
+    modes: set[str],
+) -> bool:
+    if _is_ark_conversation_video_model(ai_model):
+        return _media_limit(capabilities, "images") != 0
+    return (
+        "images" in allowed_keys
+        or _media_limit(capabilities, "images") > 0
+        or bool(modes.intersection({"reference", "multimodal_reference", "image_to_video", "video_to_video", "audio_video"}))
+    )
+
+
+def _supports_video_reference(
+    ai_model: AiModel,
+    capabilities: Dict[str, Any],
+    allowed_keys: set[str],
+    modes: set[str],
+) -> bool:
+    if _is_ark_conversation_video_model(ai_model):
+        return _media_limit(capabilities, "videos") != 0
+    return (
+        "videos" in allowed_keys
+        or _media_limit(capabilities, "videos") > 0
+        or bool(modes.intersection({"reference", "multimodal_reference", "video_to_video"}))
+    )
+
+
+def _supports_audio_reference(
+    ai_model: AiModel,
+    capabilities: Dict[str, Any],
+    allowed_keys: set[str],
+    modes: set[str],
+) -> bool:
+    if _is_ark_conversation_video_model(ai_model):
+        return _media_limit(capabilities, "audios", "audio") != 0
+    return (
+        "audio_url" in allowed_keys
+        or _media_limit(capabilities, "audios", "audio") > 0
+        or bool(modes.intersection({"reference", "multimodal_reference", "audio_video"}))
+    )
+
+
+def _is_ark_conversation_video_model(ai_model: AiModel) -> bool:
+    return ai_model.vendor == "volcengine_ark" or is_volcengine_ark_video_model(ai_model.model_id)
+
+
+def _media_limit(capabilities: Dict[str, Any], *keys: str) -> int:
+    media_limits = capabilities.get("media_limits") or {}
+    for key in keys:
+        value = media_limits.get(key)
+        if isinstance(value, int):
+            return value
+    return -1
+
+
+def _validate_conversation_video_media_limits(
+    capabilities: Dict[str, Any],
+    has_images: bool,
+    has_videos: bool,
+    has_audios: bool,
+    payload: Dict[str, Any],
+) -> None:
+    checks = (
+        ("images", "参考图", has_images, payload.get("images") or payload.get("image_urls")),
+        ("videos", "参考视频", has_videos, payload.get("videos") or payload.get("video_urls")),
+        ("audios", "参考音频", has_audios, payload.get("audios") or payload.get("audio_urls")),
+    )
+    for key, label, enabled, values in checks:
+        if not enabled:
+            continue
+        limit = _media_limit(capabilities, key, key.rstrip("s"))
+        if limit > 0 and len(_as_list(values)) > limit:
+            raise AppException(f"当前模型{label}最多支持 {limit} 个", code=40012, status_code=400)
+
+
+def _validate_ark_reference_video_metadata(payload: Dict[str, Any]) -> None:
+    reference_urls = _reference_video_url_set(payload)
+    uploaded_items = _collect_uploaded_media_items(payload, "video")
+    existing_urls = {_extract_media_url(item) for item in uploaded_items}
+    for url in reference_urls:
+        if url and url not in existing_urls:
+            uploaded_items.append({"url": url})
+
+    if not uploaded_items:
+        return
+
+    total_duration = 0.0
+    checked_urls: set[str] = set()
+    for item in uploaded_items:
+        url = _extract_media_url(item)
+        if reference_urls and url not in reference_urls:
+            continue
+        if url in checked_urls:
+            continue
+        checked_urls.add(url)
+        duration = _validate_ark_reference_video_item(item)
+        if duration is not None:
+            total_duration += duration
+
+    if total_duration > ARK_REFERENCE_VIDEO_MAX_ACCEPTED_TOTAL_DURATION_SECONDS:
+        raise AppException(
+            f"火山方舟参考视频总时长不能超过 15.2 秒，当前检测为 {_format_seconds(total_duration)} 秒",
+            code=40012,
+            status_code=400,
+        )
+
+
+def _validate_ark_reference_video_item(item: Dict[str, Any]) -> Optional[float]:
+    url = _extract_media_url(item)
+    content_type = str(item.get("content_type") or item.get("mime_type") or "").strip().lower()
+    if content_type and content_type not in ARK_REFERENCE_VIDEO_CONTENT_TYPES:
+        raise AppException("火山方舟参考视频仅支持 mp4 或 mov 格式", code=40012, status_code=400)
+
+    size = _optional_float(item.get("size"))
+    if size is not None and size > ARK_REFERENCE_VIDEO_MAX_SIZE_BYTES:
+        raise AppException("火山方舟参考视频单个文件不能超过 200MB", code=40012, status_code=400)
+
+    media_info = _extract_media_info(item)
+    if not media_info and url:
+        media_info = probe_media_url(url, "video") or {}
+    if not media_info:
+        return None
+
+    duration = _optional_float(media_info.get("duration_seconds") or media_info.get("duration"))
+    if duration is not None and not _is_ark_reference_video_duration_supported(duration):
+        raise AppException(
+            f"火山方舟参考视频单个时长必须在 2-15.2 秒之间，当前检测为 {_format_seconds(duration)} 秒",
+            code=40012,
+            status_code=400,
+        )
+
+    video_codec = str(media_info.get("video_codec") or media_info.get("codec_name") or "").strip().lower()
+    if video_codec and video_codec not in ARK_REFERENCE_VIDEO_CODECS:
+        raise AppException("火山方舟参考视频编码仅支持 H.264/H.265", code=40012, status_code=400)
+
+    audio_codec = str(media_info.get("audio_codec") or "").strip().lower()
+    if audio_codec and audio_codec not in ARK_REFERENCE_VIDEO_AUDIO_CODECS:
+        raise AppException("火山方舟参考视频音频编码仅支持 AAC/MP3", code=40012, status_code=400)
+
+    fps = _optional_float(media_info.get("fps") or media_info.get("frame_rate"))
+    if fps is not None and not (ARK_REFERENCE_VIDEO_MIN_FPS <= fps <= ARK_REFERENCE_VIDEO_MAX_FPS):
+        raise AppException("火山方舟参考视频帧率必须在 24-60 FPS 之间", code=40012, status_code=400)
+
+    width = _optional_float(media_info.get("width"))
+    height = _optional_float(media_info.get("height"))
+    if width is not None and height is not None:
+        _validate_ark_reference_video_dimensions(width, height)
+
+    return duration
+
+
+def _reference_video_url_set(payload: Dict[str, Any]) -> set[str]:
+    urls: set[str] = set()
+    for key in ("videos", "video_urls"):
+        for value in _as_list(payload.get(key)):
+            url = _extract_media_url(value)
+            if url:
+                urls.add(url)
+    return urls
+
+
+def _validate_ark_reference_video_dimensions(width: float, height: float) -> None:
+    if width <= 0 or height <= 0:
+        return
+    if not (
+        ARK_REFERENCE_VIDEO_MIN_SIDE_PX <= width <= ARK_REFERENCE_VIDEO_MAX_SIDE_PX
+        and ARK_REFERENCE_VIDEO_MIN_SIDE_PX <= height <= ARK_REFERENCE_VIDEO_MAX_SIDE_PX
+    ):
+        raise AppException("火山方舟参考视频宽高长度必须在 300-6000px 之间", code=40012, status_code=400)
+
+    pixels = width * height
+    if not (ARK_REFERENCE_VIDEO_MIN_PIXELS <= pixels <= ARK_REFERENCE_VIDEO_MAX_PIXELS):
+        raise AppException("火山方舟参考视频总像素数不符合要求", code=40012, status_code=400)
+
+    ratio = width / height
+    if not (ARK_REFERENCE_VIDEO_MIN_RATIO <= ratio <= ARK_REFERENCE_VIDEO_MAX_RATIO):
+        raise AppException("火山方舟参考视频宽高比必须在 0.4-2.5 之间", code=40012, status_code=400)
+
+
+def _drop_reference_media_source_keys(payload: Dict[str, Any]) -> None:
+    keep = {"images", "image_urls", "videos", "video_urls", "audios", "audio_urls"}
+    for key in (
+        *REFERENCE_IMAGE_URL_KEYS,
+        *REFERENCE_VIDEO_URL_KEYS,
+        *REFERENCE_AUDIO_URL_KEYS,
+        *GENERIC_UPLOAD_MEDIA_KEYS,
+    ):
+        if key not in keep:
+            payload.pop(key, None)
+
+
+def _is_ark_reference_video_duration_supported(duration: float) -> bool:
+    return (
+        duration >= ARK_REFERENCE_VIDEO_MIN_DURATION_SECONDS - ARK_REFERENCE_VIDEO_DURATION_TOLERANCE_SECONDS
+        and duration <= ARK_REFERENCE_VIDEO_MAX_ACCEPTED_DURATION_SECONDS
+    )
+
+
+def _format_seconds(value: float) -> str:
+    return f"{value:.3f}".rstrip("0").rstrip(".")
+
+
+def _collect_uploaded_media_items(extra: Dict[str, Any], media_type: str) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for key in GENERIC_UPLOAD_MEDIA_KEYS:
+        for value in _as_list(extra.get(key)):
+            if not isinstance(value, dict) or _uploaded_media_type(value) != media_type:
+                continue
+            items.append(value)
+    return items
+
+
+def _extract_media_info(item: Dict[str, Any]) -> Dict[str, Any]:
+    for key in ("media_info", "metadata", "meta"):
+        value = item.get(key)
+        if isinstance(value, dict):
+            return value
+    for key in ("data", "response", "file", "upload"):
+        value = item.get(key)
+        if isinstance(value, dict):
+            media_info = _extract_media_info(value)
+            if media_info:
+                return media_info
+    return {}
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _normalize_conversation_video_resolution(ai_model: Optional[AiModel], value: Any) -> str:

@@ -88,7 +88,20 @@ def merge_video_capabilities(
     }
     capabilities["resolutions"] = resolutions
     capabilities["ratios"] = list(VOLCENGINE_ARK_VIDEO_RATIOS)
-    for key in ("defaults", "fields", "media_limits", "modes", "request_keys", "supports_async_task", "resolutions", "ratios"):
+    capabilities["media_limits"] = deepcopy(VOLCENGINE_ARK_VIDEO_CAPABILITIES["media_limits"])
+    capabilities["modes"] = deepcopy(VOLCENGINE_ARK_VIDEO_CAPABILITIES["modes"])
+    capabilities["request_keys"] = deepcopy(VOLCENGINE_ARK_VIDEO_CAPABILITIES["request_keys"])
+    capabilities["supports_async_task"] = VOLCENGINE_ARK_VIDEO_CAPABILITIES["supports_async_task"]
+    for key in (
+        "defaults",
+        "fields",
+        "media_limits",
+        "modes",
+        "request_keys",
+        "supports_async_task",
+        "resolutions",
+        "ratios",
+    ):
         if key in capabilities:
             capabilities[key] = deepcopy(capabilities[key])
     return capabilities

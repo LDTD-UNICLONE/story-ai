@@ -1,4 +1,5 @@
 import inspect
+import logging
 import re
 from typing import Any, Dict, List, Optional, Set
 
@@ -17,6 +18,7 @@ from app.integrations.volcengine_ark_video_specs import (
 
 
 _client: Optional[Any] = None
+logger = logging.getLogger(__name__)
 
 
 VIDEO_HELPER_KEYS = {
@@ -484,7 +486,7 @@ def _collect_image_urls(extra: Dict[str, Any]) -> List[str]:
     ):
         if key in extra:
             values.extend(_as_list(extra[key]))
-    return _collect_urls(values) + _collect_uploaded_media_urls(extra, "image")
+    return _dedupe_urls([*_collect_urls(values), *_collect_uploaded_media_urls(extra, "image")])
 
 
 def _collect_video_urls(extra: Dict[str, Any]) -> List[str]:
@@ -509,7 +511,7 @@ def _collect_video_urls(extra: Dict[str, Any]) -> List[str]:
     ):
         if key in extra:
             values.extend(_as_list(extra[key]))
-    return _collect_urls(values) + _collect_uploaded_media_urls(extra, "video")
+    return _dedupe_urls([*_collect_urls(values), *_collect_uploaded_media_urls(extra, "video")])
 
 
 def _collect_audio_urls(extra: Dict[str, Any]) -> List[str]:
@@ -534,7 +536,7 @@ def _collect_audio_urls(extra: Dict[str, Any]) -> List[str]:
     ):
         if key in extra:
             values.extend(_as_list(extra[key]))
-    return _collect_urls(values) + _collect_uploaded_media_urls(extra, "audio")
+    return _dedupe_urls([*_collect_urls(values), *_collect_uploaded_media_urls(extra, "audio")])
 
 
 def _collect_urls(values: List[Any]) -> List[str]:
@@ -545,6 +547,16 @@ def _collect_urls(values: List[Any]) -> List[str]:
         if url and url not in seen:
             seen.add(url)
             urls.append(url)
+    return urls
+
+
+def _dedupe_urls(values: List[str]) -> List[str]:
+    urls: List[str] = []
+    seen = set()
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            urls.append(value)
     return urls
 
 
@@ -1073,17 +1085,47 @@ def _raise_provider_error(prefix: str, exc: Exception) -> None:
     if isinstance(exc, AppException):
         raise exc
 
-    message = str(exc) or exc.__class__.__name__
+    message = _provider_error_message(exc)
     status_code = getattr(exc, "status_code", None) or getattr(exc, "status", None)
     if status_code:
         message = f"HTTP {status_code}: {message}"
     app_status_code = _provider_app_status_code(status_code, message)
     app_code = 40010 if app_status_code < 500 else 50220
     if app_status_code == 400:
+        logger.warning("%s：%s", prefix, message)
         if _is_safety_provider_error(message):
             raise AppException("输入内容未通过模型安全校验，请更换内容后重试", code=40017, status_code=400) from exc
+        video_public_message = _video_provider_400_public_message(prefix, message)
+        if video_public_message:
+            raise AppException(video_public_message, code=40016, status_code=400) from exc
         raise AppException("当前模型不支持所选参数组合，请调整参数后重试", code=40016, status_code=400) from exc
     raise AppException(f"{prefix}：{message}", code=app_code, status_code=app_status_code) from exc
+
+
+def _provider_error_message(exc: Exception) -> str:
+    message = str(exc) or exc.__class__.__name__
+    response = getattr(exc, "response", None)
+    response_text = getattr(response, "text", None)
+    if response_text:
+        return f"{message}; response={str(response_text)[:1000]}"
+    return message
+
+
+def _video_provider_400_public_message(prefix: str, message: str) -> str:
+    if "视频生成" not in prefix:
+        return ""
+    lower_message = message.lower()
+    if "fps" in lower_message or "帧率" in message:
+        return "参考视频帧率必须在 24-60 FPS 之间，请转码后重试"
+    if "codec" in lower_message or "编码" in message:
+        return "参考视频编码仅支持 H.264/H.265，音频编码仅支持 AAC/MP3，请转码后重试"
+    if "duration" in lower_message or "时长" in message:
+        return "参考视频单个时长必须在 2-15.2 秒之间，总时长不能超过 15.2 秒"
+    if "resolution" in lower_message or "width" in lower_message or "height" in lower_message or "分辨率" in message:
+        return "参考视频尺寸不符合模型要求，请检查宽高、宽高比和总像素数"
+    if "video" in lower_message or "reference" in lower_message or "视频" in message:
+        return "参考视频不符合模型要求，请检查格式、时长、帧率、编码和尺寸后重试"
+    return "视频参数不符合模型要求，请调整参数后重试"
 
 
 def _provider_app_status_code(status_code: Any, message: str) -> int:

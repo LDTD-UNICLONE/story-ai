@@ -1,4 +1,5 @@
 
+from typing import Any, Dict, Optional
 
 from app.schemas.base import SchemaBaseModel
 
@@ -10,3 +11,4 @@ class UploadFileOut(SchemaBaseModel):
     content_type: str
     size: int
     file_type: str
+    media_info: Optional[Dict[str, Any]] = None
