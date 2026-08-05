@@ -16,11 +16,9 @@
 ```bash
 cp .env.example .env
 docker compose up -d postgres redis
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements-dev.txt
-alembic upgrade head
-python -m uvicorn app.main:app --reload
+uv sync --extra dev --frozen
+uv run --frozen alembic upgrade head
+uv run --frozen uvicorn app.main:app --reload
 ```
 
 对话生成已经走 Celery 异步任务，另开一个终端启动 worker：
@@ -30,6 +28,12 @@ source .venv/bin/activate
 ./scripts/celery_workers.sh
 ```
 
+`celery_workers.sh`会同时启动 Celery Beat，用于恢复丢失的第三方任务结果回收消息。如果只启动单个 Worker，还需要在独立终端启动：
+
+```bash
+./scripts/celery_beat.sh
+```
+
 也可以按队列分别启动 worker：
 
 ```bash
@@ -37,6 +41,7 @@ python -m celery -A app.worker.celery_app worker -l info -E --concurrency=2 --qu
 python -m celery -A app.worker.celery_app worker -l info -E --concurrency=16 --queues=story_ai_text --hostname=story-ai-text@%h
 python -m celery -A app.worker.celery_app worker -l info -E --concurrency=16 --queues=story_ai_image --hostname=story-ai-image@%h
 python -m celery -A app.worker.celery_app worker -l info -E --concurrency=10 --queues=story_ai_video --hostname=story-ai-video@%h
+python -m celery -A app.worker.celery_app worker -l info -E --concurrency=1 --queues=story_ai_delivery --hostname=story-ai-delivery@%h
 ```
 
 查看 Celery 队列可以启动 Flower：
@@ -58,7 +63,7 @@ chmod +x scripts/celery_flower.sh
 也可以直接使用脚本创建虚拟环境、安装依赖并启动开发服务：
 
 ```bash
-chmod +x scripts/dev.sh scripts/celery_worker.sh scripts/celery_flower.sh
+chmod +x scripts/dev.sh scripts/celery_worker.sh scripts/celery_beat.sh scripts/celery_flower.sh
 ./scripts/dev.sh
 ```
 
@@ -66,6 +71,13 @@ chmod +x scripts/dev.sh scripts/celery_worker.sh scripts/celery_flower.sh
 
 - API: `http://127.0.0.1:8000/api/v1/health`
 - Docs: `http://127.0.0.1:8000/docs`
+
+## 依赖管理
+
+- `pyproject.toml` 是直接依赖及可选依赖的唯一契约。
+- `uv.lock` 锁定实际安装版本，本地和生产启动统一使用 `uv --frozen`。
+- `requirements*.txt` 仅用于兼容仍使用 `pip` 的环境，修改依赖时必须与
+  `pyproject.toml` 同步；测试会自动检查两者是否一致。
 
 ## 稳定性配置
 
@@ -80,6 +92,7 @@ chmod +x scripts/dev.sh scripts/celery_worker.sh scripts/celery_flower.sh
 
 ```env
 RATE_LIMIT_ENABLED=true
+TRUSTED_PROXY_IPS=["127.0.0.1","::1"]
 RATE_LIMIT_GLOBAL_REQUESTS=300
 RATE_LIMIT_AUTH_REQUESTS=30
 RATE_LIMIT_UPLOAD_REQUESTS=30
@@ -105,6 +118,8 @@ GENERATED_MEDIA_TRANSFER_CONCURRENCY=3
 GENERATED_MEDIA_CONNECT_TIMEOUT_SECONDS=30
 GENERATED_MEDIA_READ_TIMEOUT_SECONDS=300
 GENERATED_MEDIA_UPLOAD_TIMEOUT_SECONDS=120
+USER_WORK_STORAGE_LIMIT_MB=2048
+UNUSED_WORK_UPLOAD_TTL_HOURS=24
 ALIYUN_SMS_ACCESS_KEY_ID=
 ALIYUN_SMS_ACCESS_KEY_SECRET=
 ALIYUN_SMS_REGION_ID=cn-hangzhou
@@ -137,7 +152,7 @@ python scripts/download_wechatpay_platform_cert.py
 
 图像/视频生成属于长耗时任务。Worker 默认只短轮询厂商任务 `3 * 5` 秒，如果厂商还未完成，会把任务保持为 `running` 并释放 Celery 进程；前端继续通过任务记录接口轮询，后端会按 `PROVIDER_TASK_POLL_INTERVAL_SECONDS` 节流查询厂商结果，避免长视频持续占用 Worker。
 
-任务从创建时间开始超过 `TASK_STALE_TIMEOUT_MINUTES` 分钟仍处于 `pending/running` 时，会在任务列表、任务详情或业务详情查询时自动判定为失败，并同步更新对话消息、项目章节、资产或分镜状态，已扣积分会自动退回。
+未取得第三方 `task_id` 的本地任务，从创建时间开始超过 `TASK_STALE_TIMEOUT_MINUTES` 分钟仍处于 `pending/running` 时，会自动判定为失败并退回积分。已取得第三方 `task_id` 的任务不使用通用超时退款，由 Celery reconcile 和 Beat 持续回收结果。
 
 为避免单个用户连续提交大量长耗时任务，后端会限制同一用户待处理任务数量：全部待处理任务默认最多 20 个，媒体类任务（图像、视频、资产图、分镜视频）默认最多 5 个。
 
@@ -544,6 +559,7 @@ python -m celery -A app.worker.celery_app worker -l info -E --concurrency=2 --qu
 python -m celery -A app.worker.celery_app worker -l info -E --concurrency=16 --queues=story_ai_text --hostname=story-ai-text@%h
 python -m celery -A app.worker.celery_app worker -l info -E --concurrency=16 --queues=story_ai_image --hostname=story-ai-image@%h
 python -m celery -A app.worker.celery_app worker -l info -E --concurrency=10 --queues=story_ai_video --hostname=story-ai-video@%h
+python -m celery -A app.worker.celery_app worker -l info -E --concurrency=1 --queues=story_ai_delivery --hostname=story-ai-delivery@%h
 ```
 
 或使用脚本：

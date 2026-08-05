@@ -23,6 +23,7 @@ from app.services.model_runner import run_model
 from app.services.points import change_user_points
 from app.services.prompts import render_system_prompt
 from app.services.task_records import refresh_task_record_interrupted
+from app.services.task_execution import TaskExecutionDeferred, prepare_task_execution
 from app.worker import celery_app
 
 
@@ -41,9 +42,17 @@ def run_project_chapter_processing(self, task_record_id: str, chapter_id: str) -
     try:
         asyncio.run(_run_project_chapter_processing(UUID(task_record_id), UUID(chapter_id)))
     except (SoftTimeLimitExceeded, asyncio.TimeoutError):
-        asyncio.run(_fail_processing(UUID(task_record_id), UUID(chapter_id), "任务执行超时", raw_reason="任务执行超时"))
+        asyncio.run(
+            _fail_processing(
+                UUID(task_record_id), UUID(chapter_id), "任务执行超时", raw_reason="任务执行超时"
+            )
+        )
+    except TaskExecutionDeferred as exc:
+        raise self.retry(countdown=exc.retry_after_seconds) from exc
     except Exception as exc:
-        if self.request.retries < settings.celery_task_max_retries and _is_retryable_provider_error(exc):
+        if self.request.retries < settings.celery_task_max_retries and _is_retryable_provider_error(
+            exc
+        ):
             raise self.retry(exc=exc, countdown=_retry_countdown(self.request.retries)) from exc
         asyncio.run(
             _fail_processing(
@@ -77,15 +86,13 @@ def _chapter_processing_timeout_seconds() -> int:
 async def _execute_processing(task_record_id: UUID, chapter_id: UUID) -> None:
     async with WorkerSessionLocal() as db:
         result = await db.execute(
-            select(UserTaskRecord)
-            .where(UserTaskRecord.id == task_record_id)
-            .with_for_update(skip_locked=True)
+            select(UserTaskRecord).where(UserTaskRecord.id == task_record_id).with_for_update()
         )
         task_record = result.scalar_one_or_none()
         chapter = await db.get(ProjectChapter, chapter_id)
         if task_record is None or chapter is None:
             return
-        if task_record.status != "pending":
+        if not prepare_task_execution(task_record):
             return
 
         task_record.status = "running"
@@ -137,6 +144,7 @@ async def _execute_processing(task_record_id: UUID, chapter_id: UUID) -> None:
                 "text",
                 model_prompt,
                 (task_record.extra or {}).get("model_extra") or {},
+                idempotency_key=str(task_record.id),
             )
             task_record.extra = {
                 **(task_record.extra or {}),

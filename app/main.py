@@ -6,6 +6,8 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.router import api_router
 from app.core.config import settings
@@ -14,14 +16,17 @@ from app.core.logging import configure_logging
 from app.core.rate_limit import RedisRateLimitMiddleware
 from app.core.request_logging import RequestLoggingMiddleware
 from app.core.startup import validate_runtime_config
-from app.db.session import AsyncSessionLocal
+from app.db.session import engine
 from app.integrations.comfly import close_comfly_client, init_comfly_client
 from app.integrations.redis import close_redis, init_redis
 from app.integrations.volcengine_ark import close_volcengine_ark_client, init_volcengine_ark_client
+from app.services.oss_deletions import process_oss_deletion_outbox
 from app.services.recharges import purge_expired_pending_recharge_orders
+from app.services.works import purge_unused_work_uploads
 
 configure_logging()
 logger = logging.getLogger(__name__)
+MAINTENANCE_ADVISORY_LOCK_ID = 9_178_240_601
 
 
 @asynccontextmanager
@@ -31,26 +36,50 @@ async def lifespan(app: FastAPI):
     await init_comfly_client()
     if settings.volcengine_ark_api_key:
         await init_volcengine_ark_client()
-    recharge_cleanup_task = asyncio.create_task(_recharge_cleanup_loop())
+    maintenance_cleanup_task = asyncio.create_task(_maintenance_cleanup_loop())
     yield
-    recharge_cleanup_task.cancel()
+    maintenance_cleanup_task.cancel()
     with suppress(asyncio.CancelledError):
-        await recharge_cleanup_task
+        await maintenance_cleanup_task
     await close_comfly_client()
     await close_volcengine_ark_client()
     await close_redis()
 
 
-async def _recharge_cleanup_loop() -> None:
+async def _maintenance_cleanup_loop() -> None:
     while True:
         try:
-            async with AsyncSessionLocal() as db:
-                await purge_expired_pending_recharge_orders(db, limit=200)
+            await _run_maintenance_cleanup_once()
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Failed to purge expired pending recharge orders")
+            logger.exception("Failed to run periodic maintenance cleanup")
         await asyncio.sleep(60)
+
+
+async def _run_maintenance_cleanup_once() -> bool:
+    async with engine.connect() as connection:
+        lock_result = await connection.execute(
+            text("SELECT pg_try_advisory_lock(CAST(:lock_id AS bigint))"),
+            {"lock_id": MAINTENANCE_ADVISORY_LOCK_ID},
+        )
+        acquired = bool(lock_result.scalar_one())
+        await connection.commit()
+        if not acquired:
+            return False
+
+        try:
+            async with AsyncSession(bind=connection, expire_on_commit=False) as db:
+                await purge_expired_pending_recharge_orders(db, limit=200)
+                await purge_unused_work_uploads(db, limit=100)
+                await process_oss_deletion_outbox(db, limit=100)
+            return True
+        finally:
+            await connection.execute(
+                text("SELECT pg_advisory_unlock(CAST(:lock_id AS bigint))"),
+                {"lock_id": MAINTENANCE_ADVISORY_LOCK_ID},
+            )
+            await connection.commit()
 
 
 def create_app() -> FastAPI:

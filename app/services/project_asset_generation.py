@@ -11,28 +11,66 @@ from app.core.exceptions import AppException
 from app.core.timezone import beijing_datetime
 from app.integrations import comfly
 from app.models.ai_model import AiModel
+from app.models.agent_story_bible import AgentAssetVariant
 from app.models.project import Project
 from app.models.project_asset import ProjectCharacter, ProjectProp, ProjectScene
 from app.models.task_record import UserTaskRecord
 from app.models.user import User
 from app.schemas.project_asset import ProjectAssetImageGenerateRequest
 from app.services.generated_media import persist_generated_media_to_oss
+from app.services.core_asset_change_tracking import track_core_asset_reference_change
 from app.core.config import settings
 from app.services.model_points import calculate_submission_points_cost
 from app.services.model_runner import ModelRunResult, query_model_task, run_model
 from app.services.points import change_user_points, consume_user_points
 from app.services.prompts import load_constant_prompt
-from app.services.project_generated_assets import create_project_generated_asset_history, extract_result_urls
+from app.services.project_generated_assets import (
+    create_project_generated_asset_history,
+    extract_result_urls,
+)
 from app.services.project_assets import get_project_asset_or_404
 from app.services.provider_polling import provider_poll_interval_seconds
-from app.services.projects import get_project_or_404
-from app.services.task_records import create_user_task_record, refresh_task_record_interrupted
+from app.services.task_records import (
+    create_user_task_record,
+    record_provider_task_state,
+    refresh_task_record_interrupted,
+)
 
 
 ASSET_IMAGE_CONFIG: Dict[str, Dict[str, Any]] = {
     "character": {"model": ProjectCharacter, "title": "人物资产图像生成"},
     "scene": {"model": ProjectScene, "title": "场景资产图像生成"},
     "prop": {"model": ProjectProp, "title": "道具资产图像生成"},
+}
+ASSET_IMAGE_PROMPT_FIELDS = {
+    "character": (
+        ("名称", "name"),
+        ("身份", "identity"),
+        ("性别", "gender"),
+        ("年龄", "age"),
+        ("外貌", "appearance"),
+        ("服装", "costume"),
+        ("性格气质", "personality"),
+        ("描述", "description"),
+        ("补充提示", "prompt"),
+    ),
+    "scene": (
+        ("名称", "name"),
+        ("地点", "location"),
+        ("时间", "time_of_day"),
+        ("空间环境", "environment"),
+        ("氛围", "atmosphere"),
+        ("描述", "description"),
+        ("补充提示", "prompt"),
+    ),
+    "prop": (
+        ("名称", "name"),
+        ("类别", "category"),
+        ("外观", "appearance"),
+        ("功能", "function"),
+        ("描述", "description"),
+        ("补充提示", "prompt"),
+    ),
 }
 
 
@@ -43,6 +81,8 @@ async def submit_asset_image_generation(
     asset_id: UUID,
     user: User,
     payload: ProjectAssetImageGenerateRequest,
+    *,
+    aspect_ratio: Optional[str] = None,
 ) -> Tuple[Any, UserTaskRecord, int]:
     config = _asset_image_config(asset_type)
     project = await get_project_with_style_or_404(db, project_id, user.id)
@@ -51,9 +91,10 @@ async def submit_asset_image_generation(
     generation_mode = normalize_generation_mode(payload.generation_mode)
 
     prompt = build_asset_image_prompt(project, asset, asset_type, generation_mode, payload.prompt)
+    generation_ratio = aspect_ratio or project.generation_ratio
     extra = {
         **(payload.extra or {}),
-        "aspect_ratio": project.generation_ratio,
+        "aspect_ratio": generation_ratio,
         "generation_mode": generation_mode,
     }
     _validate_comfly_asset_image_request(ai_model, prompt, extra)
@@ -88,7 +129,7 @@ async def submit_asset_image_generation(
             "asset_id": str(asset_id),
             "asset_name": asset.name,
             "generation_mode": generation_mode,
-            "generation_ratio": project.generation_ratio,
+            "generation_ratio": generation_ratio,
             "style_id": str(project.style_id),
             "style_name": project.style.name if project.style else "",
             "model_extra": extra,
@@ -116,7 +157,9 @@ async def submit_asset_image_generation(
     return asset, task_record, points_cost
 
 
-def _validate_comfly_asset_image_request(ai_model: AiModel, prompt: str, extra: Dict[str, Any]) -> None:
+def _validate_comfly_asset_image_request(
+    ai_model: AiModel, prompt: str, extra: Dict[str, Any]
+) -> None:
     if ai_model.vendor not in {"comfly", "模型服务"}:
         return
     comfly.validate_image_request(ai_model.model_id, prompt, extra)
@@ -132,6 +175,7 @@ async def run_asset_image_generation_in_worker(
     asset = await db.get(config["model"], asset_id)
     if asset is None or not asset.is_enabled:
         raise AppException("项目资源不存在", code=40409, status_code=404)
+    variant = await _task_asset_variant(db, task_record)
 
     result = await db.execute(
         select(AiModel).where(
@@ -157,20 +201,28 @@ async def run_asset_image_generation_in_worker(
         "image",
         task_record.prompt,
         (task_record.extra or {}).get("model_extra") or {},
+        idempotency_key=str(task_record.id),
     )
+    if record_provider_task_state(task_record, model_result.extra, ai_model.vendor):
+        task_record.extra = {
+            **(task_record.extra or {}),
+            "model_result_extra": model_result.extra,
+        }
+        await db.commit()
     model_result = await _resolve_image_provider_task(model_snapshot, model_result)
     model_result = await persist_generated_media_to_oss("image", model_result)
     if await refresh_task_record_interrupted(db, task_record):
         return
+    record_provider_task_state(task_record, model_result.extra, ai_model.vendor)
 
     if model_result.extra.get("platform_task_status") == "running":
-        asset.extra = {
-            **(asset.extra or {}),
-            "image_generation_status": "running",
-            "image_generation_task_record_id": str(task_record.id),
-            "image_generation_extra": model_result.extra,
-        }
-        asset.updated_at = beijing_datetime()
+        _set_image_generation_state(
+            asset,
+            variant,
+            status="running",
+            task_record_id=task_record.id,
+            generation_extra=model_result.extra,
+        )
         task_record.status = "running"
         task_record.result = model_result.content
         task_record.extra = {
@@ -186,27 +238,61 @@ async def run_asset_image_generation_in_worker(
     history = await create_project_generated_asset_history(
         db,
         task_record=task_record,
-        target_type=asset_type,
-        target_id=asset_id,
+        target_type="asset_variant" if variant is not None else asset_type,
+        target_id=variant.id if variant is not None else asset_id,
         media_type="image",
         result_urls=extract_result_urls(model_result.content) or [image_url],
         result_url=image_url,
         generation_mode=(task_record.extra or {}).get("generation_mode"),
         extra={
             "asset_name": asset.name,
+            **({"variant_name": variant.canonical_name} if variant is not None else {}),
             "generation_ratio": (task_record.extra or {}).get("generation_ratio"),
             "model_result_extra": model_result.extra,
         },
     )
-    asset.reference_image = image_url
-    asset.updated_at = beijing_datetime()
-    asset.extra = {
-        **(asset.extra or {}),
-        "image_generation_status": "success",
-        "image_generation_history_id": str(history.id),
-        "image_generation_task_record_id": str(task_record.id),
-        "image_generation_extra": model_result.extra,
-    }
+    if variant is not None:
+        await track_core_asset_reference_change(
+            db,
+            project_id=asset.project_id,
+            user_id=asset.user_id,
+            asset_type=asset_type,
+            asset_id=asset.id,
+            variant_id=variant.id,
+            previous_reference_image=variant.reference_image,
+            new_reference_image=image_url,
+            source="worker",
+        )
+        variant.reference_image = image_url
+        variant.lock_version += 1
+        variant.extra = {
+            **(variant.extra or {}),
+            "image_generation_status": "success",
+            "image_generation_history_id": str(history.id),
+            "image_generation_task_record_id": str(task_record.id),
+            "image_generation_extra": model_result.extra,
+        }
+        variant.updated_at = beijing_datetime()
+    else:
+        await track_core_asset_reference_change(
+            db,
+            project_id=asset.project_id,
+            user_id=asset.user_id,
+            asset_type=asset_type,
+            asset_id=asset.id,
+            previous_reference_image=asset.reference_image,
+            new_reference_image=image_url,
+            source="worker",
+        )
+        asset.reference_image = image_url
+        asset.updated_at = beijing_datetime()
+        asset.extra = {
+            **(asset.extra or {}),
+            "image_generation_status": "success",
+            "image_generation_history_id": str(history.id),
+            "image_generation_task_record_id": str(task_record.id),
+            "image_generation_extra": model_result.extra,
+        }
     task_record.status = "success"
     task_record.result = image_url
     task_record.extra = {
@@ -217,8 +303,53 @@ async def run_asset_image_generation_in_worker(
     }
 
 
-async def get_project_with_style_or_404(db: AsyncSession, project_id: UUID, user_id: UUID) -> Project:
-    await get_project_or_404(db, project_id, user_id)
+async def _task_asset_variant(
+    db: AsyncSession,
+    task_record: UserTaskRecord,
+) -> Optional[AgentAssetVariant]:
+    raw_variant_id = (task_record.extra or {}).get("agent_asset_variant_id")
+    if not raw_variant_id:
+        return None
+    try:
+        variant_id = UUID(str(raw_variant_id))
+    except ValueError as exc:
+        raise AppException("资产变体任务数据无效", code=50043, status_code=500) from exc
+    variant = await db.get(AgentAssetVariant, variant_id)
+    if variant is None or variant.review_status == "rejected":
+        raise AppException("资产变体不存在", code=40440, status_code=404)
+    return variant
+
+
+def _set_image_generation_state(
+    asset: Any,
+    variant: Optional[AgentAssetVariant],
+    *,
+    status: str,
+    task_record_id: UUID,
+    generation_extra: Optional[Dict[str, Any]] = None,
+    failed_reason: Optional[str] = None,
+) -> None:
+    target = variant if variant is not None else asset
+    state = variant.extra if variant is not None else asset.extra
+    updated = {
+        **(state or {}),
+        "image_generation_status": status,
+        "image_generation_task_record_id": str(task_record_id),
+    }
+    if generation_extra is not None:
+        updated["image_generation_extra"] = generation_extra
+    if failed_reason is not None:
+        updated["image_generation_failed_reason"] = failed_reason
+    if variant is not None:
+        variant.extra = updated
+    else:
+        asset.extra = updated
+    target.updated_at = beijing_datetime()
+
+
+async def get_project_with_style_or_404(
+    db: AsyncSession, project_id: UUID, user_id: UUID
+) -> Project:
     result = await db.execute(
         select(Project)
         .options(selectinload(Project.style))
@@ -259,25 +390,29 @@ def build_asset_image_prompt(
 ) -> str:
     style_prompt = project.style.prompt if project.style else ""
     constant_prompt = load_asset_image_constant_prompt(asset_type, generation_mode)
-    asset_prompt = _build_asset_image_prompt_text(asset)
+    asset_prompt = _build_asset_image_prompt_text(asset, asset_type)
     return "\n".join(
         item
         for item in (
             f"画面风格：{style_prompt}",
             f"模式提示词：{constant_prompt}",
             f"资产提示词：{asset_prompt}",
+            f"用户补充要求：{custom_prompt.strip()}"
+            if custom_prompt and custom_prompt.strip()
+            else "",
             "请严格围绕该资产生成图像，不要添加与资产无关的主体内容。",
         )
         if item
     )
 
 
-def _build_asset_image_prompt_text(asset: Any) -> str:
-    return (
-        _clean_optional_text(getattr(asset, "prompt", None))
-        or _clean_optional_text(getattr(asset, "description", None))
-        or _clean_optional_text(getattr(asset, "name", None))
-    )
+def _build_asset_image_prompt_text(asset: Any, asset_type: str) -> str:
+    values = []
+    for label, field in ASSET_IMAGE_PROMPT_FIELDS[asset_type]:
+        value = _clean_optional_text(getattr(asset, field, None))
+        if value:
+            values.append(f"{label}：{value}")
+    return "；".join(values)
 
 
 def _clean_optional_text(value: Any) -> str:
@@ -326,7 +461,9 @@ def _first_result_url(content: str) -> str:
     return content.split(",", 1)[0].strip()
 
 
-async def _resolve_image_provider_task(model_snapshot: SimpleNamespace, model_result: ModelRunResult) -> ModelRunResult:
+async def _resolve_image_provider_task(
+    model_snapshot: SimpleNamespace, model_result: ModelRunResult
+) -> ModelRunResult:
     task_id = model_result.extra.get("task_id")
     if not task_id:
         return model_result
@@ -365,7 +502,9 @@ async def _resolve_image_provider_task(model_snapshot: SimpleNamespace, model_re
     return latest_result
 
 
-async def _mark_asset_image_enqueue_failed(db: AsyncSession, task_record: UserTaskRecord, asset: Any) -> None:
+async def _mark_asset_image_enqueue_failed(
+    db: AsyncSession, task_record: UserTaskRecord, asset: Any
+) -> None:
     refund_transaction_id = None
     if task_record.points_cost > 0:
         refund_transaction = await change_user_points(

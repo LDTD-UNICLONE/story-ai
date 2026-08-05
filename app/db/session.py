@@ -3,7 +3,9 @@ from collections.abc import AsyncGenerator
 from typing import Optional
 
 from sqlalchemy import NullPool
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import ( AsyncEngine, AsyncSession, async_sessionmaker,
+    create_async_engine,
+)
 
 from app.core.config import settings
 
@@ -32,7 +34,9 @@ def create_worker_sessionmaker() -> async_sessionmaker[AsyncSession]:
             echo=settings.log_sql_enabled,
             connect_args={"server_settings": {"timezone": settings.timezone}},
         )
-        _worker_sessionmaker = async_sessionmaker(_worker_engine, expire_on_commit=False, class_=AsyncSession)
+        _worker_sessionmaker = async_sessionmaker(
+            _worker_engine, expire_on_commit=False, class_=AsyncSession
+        )
     return _worker_sessionmaker
 
 

@@ -159,7 +159,12 @@ async def handle_wechat_pay_notify(db: AsyncSession, request: Request) -> None:
     headers = {key.lower(): value for key, value in request.headers.items()}
     wechat_pay_client.verify_notify_signature(headers=headers, body=body)
     payload = json.loads(body.decode("utf-8"))
-    resource_data = wechat_pay_client.decrypt_notify_resource(payload["resource"])
+    if payload.get("event_type") != "TRANSACTION.SUCCESS":
+        raise AppException("不支持的微信支付回调事件", code=40042, status_code=400)
+    resource = payload.get("resource")
+    if not isinstance(resource, dict):
+        raise AppException("微信支付回调资源缺失", code=40042, status_code=400)
+    resource_data = wechat_pay_client.decrypt_notify_resource(resource)
     await mark_recharge_paid(db, resource_data)
 
 
@@ -308,7 +313,9 @@ async def sync_refund_order_from_wechat(
     locked_order.extra = {**(locked_order.extra or {}), "wechat_refund_query_response": data}
     if refund_status == "SUCCESS":
         locked_order.status = "refunded"
-        locked_order.refunded_at = _parse_wechat_time(data.get("success_time")) or beijing_datetime()
+        locked_order.refunded_at = (
+            _parse_wechat_time(data.get("success_time")) or beijing_datetime()
+        )
     elif refund_status in {"ABNORMAL", "CLOSED"}:
         restore_transaction_id = (locked_order.extra or {}).get("refund_restore_transaction_id")
         if locked_order.refund_points_transaction_id and not restore_transaction_id:
@@ -338,7 +345,9 @@ async def mark_recharge_paid(db: AsyncSession, data: dict) -> UserRechargeOrder:
         raise AppException("支付回调缺少订单号", code=40040, status_code=400)
 
     result = await db.execute(
-        select(UserRechargeOrder).where(UserRechargeOrder.out_trade_no == out_trade_no).with_for_update()
+        select(UserRechargeOrder)
+        .where(UserRechargeOrder.out_trade_no == out_trade_no)
+        .with_for_update()
     )
     order = result.scalar_one_or_none()
     if order is None:
@@ -353,6 +362,7 @@ async def mark_recharge_paid(db: AsyncSession, data: dict) -> UserRechargeOrder:
         await db.refresh(order)
         return order
 
+    _validate_wechat_paid_transaction(data)
     paid_amount = int((data.get("amount") or {}).get("total") or 0)
     if paid_amount != order.amount_cents:
         raise AppException("支付金额不一致", code=40041, status_code=400)
@@ -375,13 +385,26 @@ async def mark_recharge_paid(db: AsyncSession, data: dict) -> UserRechargeOrder:
     return order
 
 
+def _validate_wechat_paid_transaction(data: dict) -> None:
+    if settings.wechat_pay_mock_enabled:
+        return
+    if data.get("appid") != settings.wechat_pay_appid:
+        raise AppException("支付回调应用号不一致", code=40042, status_code=400)
+    if data.get("mchid") != settings.wechat_pay_mchid:
+        raise AppException("支付回调商户号不一致", code=40042, status_code=400)
+    if (data.get("amount") or {}).get("currency") != "CNY":
+        raise AppException("支付币种不一致", code=40042, status_code=400)
+
+
 async def refund_recharge_order(
     db: AsyncSession,
     *,
     order_id: UUID,
     reason: Optional[str],
 ) -> UserRechargeOrder:
-    result = await db.execute(select(UserRechargeOrder).where(UserRechargeOrder.id == order_id).with_for_update())
+    result = await db.execute(
+        select(UserRechargeOrder).where(UserRechargeOrder.id == order_id).with_for_update()
+    )
     order = result.scalar_one_or_none()
     if order is None:
         raise AppException("充值订单不存在", code=40440, status_code=404)

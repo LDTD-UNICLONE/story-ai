@@ -12,6 +12,7 @@ from app.integrations.redis import get_redis, init_redis
 MAINLAND_PHONE_PATTERN = re.compile(r"^1[3-9]\d{9}$")
 REGISTER_CODE_KEY_PREFIX = "sms:register:code"
 REGISTER_COOLDOWN_KEY_PREFIX = "sms:register:cooldown"
+REGISTER_ATTEMPTS_KEY_PREFIX = "sms:register:attempts"
 
 
 def validate_mainland_phone(phone: str) -> str:
@@ -31,12 +32,15 @@ async def send_register_sms_code(phone: str) -> None:
     if not acquired:
         ttl = await redis.ttl(cooldown_key)
         retry_after = max(1, ttl)
-        raise AppException(f"验证码发送过于频繁，请 {retry_after} 秒后再试", code=42910, status_code=429)
+        raise AppException(
+            f"验证码发送过于频繁，请 {retry_after} 秒后再试", code=42910, status_code=429
+        )
 
     code = _generate_code()
     try:
         await aliyun_sms_client.send_register_code(phone, code)
         await redis.set(_code_key(phone), code, ex=max(60, settings.aliyun_sms_code_ttl_seconds))
+        await redis.delete(_attempts_key(phone))
     except Exception:
         await redis.delete(cooldown_key)
         raise
@@ -46,15 +50,26 @@ async def assert_register_sms_code(phone: str, code: str) -> None:
     phone = validate_mainland_phone(phone)
     code = code.strip()
     redis = await _redis()
+    attempts_key = _attempts_key(phone)
+    max_attempts = max(1, settings.aliyun_sms_max_verify_attempts)
+    attempts = int(await redis.get(attempts_key) or 0)
+    if attempts >= max_attempts:
+        raise AppException("验证码尝试次数过多，请重新获取", code=42911, status_code=429)
     cached_code = await redis.get(_code_key(phone))
     if not cached_code or not compare_digest(str(cached_code), code):
+        attempts = await redis.incr(attempts_key)
+        if attempts == 1:
+            await redis.expire(attempts_key, max(60, settings.aliyun_sms_code_ttl_seconds))
+        if attempts >= max_attempts:
+            await redis.delete(_code_key(phone))
+            raise AppException("验证码尝试次数过多，请重新获取", code=42911, status_code=429)
         raise AppException("手机验证码错误或已过期", code=40010, status_code=400)
 
 
 async def consume_register_sms_code(phone: str) -> None:
     phone = validate_mainland_phone(phone)
     redis = await _redis()
-    await redis.delete(_code_key(phone))
+    await redis.delete(_code_key(phone), _attempts_key(phone))
 
 
 async def _redis() -> Redis:
@@ -74,3 +89,7 @@ def _code_key(phone: str) -> str:
 
 def _cooldown_key(phone: str) -> str:
     return f"{REGISTER_COOLDOWN_KEY_PREFIX}:{phone}"
+
+
+def _attempts_key(phone: str) -> str:
+    return f"{REGISTER_ATTEMPTS_KEY_PREFIX}:{phone}"

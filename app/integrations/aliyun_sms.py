@@ -28,7 +28,9 @@ class AliyunSmsClient:
         template_param = {
             settings.aliyun_sms_register_template_param_key: code,
         }
-        await asyncio.to_thread(self._send_sms, phone, template_param, access_key_id, access_key_secret)
+        await asyncio.to_thread(
+            self._send_sms, phone, template_param, access_key_id, access_key_secret
+        )
 
     def _send_sms(
         self,
@@ -63,7 +65,9 @@ class AliyunSmsClient:
 
         try:
             raw_response = client.do_action_with_exception(request)
-            response = json.loads(raw_response.decode("utf-8") if isinstance(raw_response, bytes) else raw_response)
+            response = json.loads(
+                raw_response.decode("utf-8") if isinstance(raw_response, bytes) else raw_response
+            )
         except Exception as exc:
             logger.exception("Aliyun SMS send failed")
             raise AppException("短信发送失败，请稍后再试", code=50021, status_code=502) from exc

@@ -2,7 +2,12 @@ from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, model_validator
+
+from app.core.announcement_security import (
+    safe_announcement_url,
+    sanitize_announcement_content,
+)
 from app.schemas.base import SchemaBaseModel
 
 
@@ -21,6 +26,17 @@ class AnnouncementBaseOut(SchemaBaseModel):
     sort_order: int
     start_at: Optional[datetime] = None
     end_at: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def sanitize_public_content(self) -> "AnnouncementBaseOut":
+        self.content = sanitize_announcement_content(
+            self.content,
+            self.content_format,
+            strict=False,
+        )
+        self.image_url = safe_announcement_url(self.image_url)
+        self.link_url = safe_announcement_url(self.link_url)
+        return self
 
 
 class AnnouncementOut(AnnouncementBaseOut):

@@ -5,12 +5,15 @@ import subprocess
 import tempfile
 from pathlib import PurePosixPath
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
+import httpx
 from fastapi import UploadFile
 from starlette.concurrency import run_in_threadpool
 
 from app.core.exceptions import AppException
 from app.core.config import settings
+from app.core.outbound_url import open_safe_http_response, trusted_oss_hosts
 from app.integrations.oss import OssClient
 from app.schemas.upload import UploadFileOut
 
@@ -69,7 +72,9 @@ def detect_content_type(filename: str, content_type: str = "") -> str:
     normalized = (content_type or "").strip().lower()
     guessed_type = _guess_content_type(filename)
     if normalized not in GENERIC_CONTENT_TYPES:
-        if guessed_type and normalized.startswith("application/") and _is_media_content_type(guessed_type):
+        if (
+            guessed_type and normalized.startswith("application/") and _is_media_content_type(guessed_type)
+        ):
             return guessed_type
         return normalized
     return guessed_type or "application/octet-stream"
@@ -90,6 +95,66 @@ def detect_file_type(content_type: str) -> str:
     return "file"
 
 
+def matches_media_signature(file_obj: Any, content_type: str) -> bool:
+    current_pos = file_obj.tell()
+    try:
+        file_obj.seek(0)
+        header = file_obj.read(32)
+    finally:
+        file_obj.seek(current_pos)
+
+    normalized = (content_type or "").strip().lower()
+    if normalized == "image/jpeg":
+        return header.startswith(b"\xff\xd8\xff")
+    if normalized == "image/png":
+        return header.startswith(b"\x89PNG\r\n\x1a\n")
+    if normalized == "image/webp":
+        return header.startswith(b"RIFF") and header[8:12] == b"WEBP"
+    if normalized == "image/gif":
+        return header.startswith((b"GIF87a", b"GIF89a"))
+    if normalized == "image/bmp":
+        return header.startswith(b"BM")
+    if normalized == "image/tiff":
+        return header.startswith((b"II*\x00", b"MM\x00*"))
+    if normalized in {"image/heic", "image/heif"}:
+        return header[4:8] == b"ftyp" and header[8:12] in {
+            b"heic",
+            b"heix",
+            b"hevc",
+            b"hevx",
+            b"mif1",
+            b"msf1",
+        }
+    if normalized in {
+        "video/mp4",
+        "video/quicktime",
+        "video/x-m4v",
+        "video/3gpp",
+        "application/mp4",
+        "audio/mp4",
+    }:
+        return header[4:8] == b"ftyp"
+    if normalized in {"video/webm", "video/x-matroska", "application/x-matroska"}:
+        return header.startswith(b"\x1aE\xdf\xa3")
+    if normalized == "video/x-msvideo":
+        return header.startswith(b"RIFF") and header[8:12] == b"AVI "
+    if normalized == "video/mpeg":
+        return header.startswith((b"\x00\x00\x01\xba", b"\x00\x00\x01\xb3"))
+    if normalized == "audio/wav":
+        return header.startswith(b"RIFF") and header[8:12] == b"WAVE"
+    if normalized == "audio/mpeg":
+        return header.startswith(b"ID3") or (
+            len(header) >= 2 and header[0] == 0xFF and header[1] & 0xE0 == 0xE0
+        )
+    if normalized == "audio/aac":
+        return len(header) >= 2 and header[0] == 0xFF and header[1] & 0xF6 == 0xF0
+    if normalized in {"audio/ogg", "application/ogg"}:
+        return header.startswith(b"OggS")
+    if normalized == "audio/flac":
+        return header.startswith(b"fLaC")
+    return False
+
+
 def _guess_content_type(filename: str) -> str:
     suffix = PurePosixPath(filename or "").suffix.lower()
     if suffix in EXTENSION_CONTENT_TYPES:
@@ -102,7 +167,9 @@ def _is_media_content_type(content_type: str) -> bool:
     return content_type.startswith(("image/", "video/", "audio/"))
 
 
-def extract_media_info(file_obj: Any, file_type: str, filename: str = "") -> Optional[Dict[str, Any]]:
+def extract_media_info(
+    file_obj: Any, file_type: str, filename: str = ""
+) -> Optional[Dict[str, Any]]:
     if file_type not in {"video", "audio"}:
         return None
 
@@ -118,13 +185,54 @@ def extract_media_info(file_obj: Any, file_type: str, filename: str = "") -> Opt
         file_obj.seek(current_pos)
 
 
-def probe_media_url(url: str, file_type: str) -> Optional[Dict[str, Any]]:
+async def probe_media_url(url: str, file_type: str) -> Optional[Dict[str, Any]]:
     if file_type not in {"video", "audio"}:
         return None
-    normalized = str(url or "").strip()
-    if not normalized.startswith(("http://", "https://")):
-        return None
-    return _probe_media_file(normalized, file_type)
+    timeout = httpx.Timeout(
+        settings.generated_media_connect_timeout_seconds,
+        read=settings.generated_media_read_timeout_seconds,
+    )
+    max_size = max(1, settings.max_upload_size_mb) * 1024 * 1024
+    suffix = PurePosixPath(urlparse(url).path).suffix
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=False,
+        trust_env=False,
+    ) as client:
+        response = await open_safe_http_response(
+            client,
+            url,
+            allowed_hosts=trusted_oss_hosts(),
+        )
+        try:
+            response.raise_for_status()
+            try:
+                content_length = int(response.headers.get("content-length") or 0)
+            except ValueError:
+                content_length = 0
+            if content_length > max_size:
+                raise AppException(
+                    f"参考媒体不能超过 {settings.max_upload_size_mb}MB",
+                    code=41300,
+                    status_code=413,
+                )
+            with tempfile.NamedTemporaryFile(suffix=suffix) as temp_file:
+                downloaded_size = 0
+                async for chunk in response.aiter_bytes():
+                    downloaded_size += len(chunk)
+                    if downloaded_size > max_size:
+                        raise AppException(
+                            f"参考媒体不能超过 {settings.max_upload_size_mb}MB",
+                            code=41300,
+                            status_code=413,
+                        )
+                    temp_file.write(chunk)
+                temp_file.flush()
+                return await run_in_threadpool(_probe_media_file, temp_file.name, file_type)
+        except httpx.HTTPError:
+            return None
+        finally:
+            await response.aclose()
 
 
 def _probe_media_file(path: str, file_type: str) -> Optional[Dict[str, Any]]:
@@ -247,7 +355,12 @@ def build_story_directory(category: str) -> str:
     return f"{root_directory}/{'/'.join(parts)}"
 
 
-async def upload_story_file(file: UploadFile, category: str = "") -> UploadFileOut:
+async def upload_story_file(
+    file: UploadFile,
+    category: str = "",
+    *,
+    media_only: bool = False,
+) -> UploadFileOut:
     filename = file.filename or "file"
     content_type = detect_content_type(filename, file.content_type or "")
     if not content_type:
@@ -260,9 +373,15 @@ async def upload_story_file(file: UploadFile, category: str = "") -> UploadFileO
     if size <= 0:
         raise AppException("上传文件不能为空", code=40007, status_code=400)
     if size > max_size:
-        raise AppException(f"上传文件不能超过 {settings.max_upload_size_mb}MB", code=41300, status_code=413)
+        raise AppException(
+            f"上传文件不能超过 {settings.max_upload_size_mb}MB", code=41300, status_code=413
+        )
 
     file_type = detect_file_type(content_type)
+    if media_only and file_type not in {"image", "video", "audio"}:
+        raise AppException("仅支持上传图片、视频或音频", code=40049, status_code=400)
+    if media_only and not matches_media_signature(file.file, content_type):
+        raise AppException("上传文件内容与媒体类型不匹配", code=40050, status_code=400)
     media_info = await run_in_threadpool(extract_media_info, file.file, file_type, filename)
     file.file.seek(0)
 

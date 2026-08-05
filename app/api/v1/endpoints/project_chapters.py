@@ -56,7 +56,9 @@ async def create_my_project_chapter(
     current_user: User = Depends(get_current_user),
 ):
     chapter = await create_project_chapter(db, project_id, current_user, payload)
-    return success(data=ProjectChapterOut.model_validate(chapter).model_dump(mode="json"), message="创建成功")
+    return success(
+        data=ProjectChapterOut.model_validate(chapter).model_dump(mode="json"), message="创建成功"
+    )
 
 
 @router.get("/{chapter_id}")
@@ -79,7 +81,9 @@ async def update_my_project_chapter(
     current_user: User = Depends(get_current_user),
 ):
     chapter = await update_project_chapter(db, project_id, chapter_id, current_user.id, payload)
-    return success(data=ProjectChapterOut.model_validate(chapter).model_dump(mode="json"), message="更新成功")
+    return success(
+        data=ProjectChapterOut.model_validate(chapter).model_dump(mode="json"), message="更新成功"
+    )
 
 
 @router.delete("/{chapter_id}")
@@ -90,4 +94,6 @@ async def delete_my_project_chapter(
     current_user: User = Depends(get_current_user),
 ):
     chapter = await delete_project_chapter(db, project_id, chapter_id, current_user.id)
-    return success(data=ProjectChapterOut.model_validate(chapter).model_dump(mode="json"), message="删除成功")
+    return success(
+        data=ProjectChapterOut.model_validate(chapter).model_dump(mode="json"), message="删除成功"
+    )

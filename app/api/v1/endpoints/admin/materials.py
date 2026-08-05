@@ -140,6 +140,7 @@ async def admin_material_image(
     current_admin: User = Depends(get_current_admin_user),
 ):
     material = await get_material_or_404(db, material_id)
+    await db.close()
     return await stream_material_image(material)
 
 

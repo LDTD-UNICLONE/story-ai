@@ -1,15 +1,17 @@
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, get_optional_current_user
 from app.core.responses import success
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.work import WorkCreateRequest, WorkListOut, WorkUpdateRequest
-from app.services.work_streaming import stream_work_media, stream_work_media_thumbnail, stream_work_upload_preview
+from app.services.work_streaming import ( stream_work_media, stream_work_media_thumbnail,
+    stream_work_upload_preview,
+)
 from app.services.works import (
     create_work,
     delete_work,
@@ -40,12 +42,12 @@ async def upload_my_work_file(
 @router.get("/uploads/{upload_id}/preview")
 async def preview_my_work_upload(
     upload_id: UUID,
-    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     upload = await get_upload_for_preview(db, upload_id, current_user)
-    return await stream_work_upload_preview(upload, request)
+    await db.close()
+    return await stream_work_upload_preview(upload)
 
 
 @router.get("")
@@ -53,7 +55,7 @@ async def public_works(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: Optional[User] = Depends(get_optional_current_user),
 ):
     works, total = await list_public_works(db, current_user, page, page_size)
     data = WorkListOut(items=works, total=total, page=page, page_size=page_size)
@@ -89,7 +91,7 @@ async def create_my_work(
 async def work_detail(
     work_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: Optional[User] = Depends(get_optional_current_user),
 ):
     work = await get_work_detail(db, work_id, current_user)
     return success(data=work.model_dump(mode="json"))
@@ -140,21 +142,21 @@ async def unlike_my_work(
 async def work_media_stream(
     work_id: UUID,
     media_id: UUID,
-    request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: Optional[User] = Depends(get_optional_current_user),
 ):
     media = await get_work_media_for_stream(db, work_id, media_id, current_user)
-    return await stream_work_media(media, request)
+    await db.close()
+    return await stream_work_media(media)
 
 
 @router.get("/{work_id}/media/{media_id}/thumbnail")
 async def work_media_thumbnail(
     work_id: UUID,
     media_id: UUID,
-    request: Request,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: Optional[User] = Depends(get_optional_current_user),
 ):
     media = await get_work_media_for_stream(db, work_id, media_id, current_user)
-    return await stream_work_media_thumbnail(media, request)
+    await db.close()
+    return await stream_work_media_thumbnail(media)

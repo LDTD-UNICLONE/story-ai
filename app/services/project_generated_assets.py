@@ -11,6 +11,7 @@ from app.models.project_generated_asset import ProjectGeneratedAsset
 from app.models.project_storyboard import ProjectStoryboard
 from app.models.task_record import UserTaskRecord
 from app.services.projects import get_project_or_404
+from app.services.core_asset_change_tracking import track_core_asset_reference_change
 
 
 PROJECT_GENERATED_ASSET_TARGETS = {
@@ -72,6 +73,126 @@ async def create_project_generated_asset_history(
     return history
 
 
+async def record_storyboard_video_generation_success(
+    db: AsyncSession,
+    *,
+    task_record: UserTaskRecord,
+    storyboard: ProjectStoryboard,
+    content: str,
+    result_extra: Dict[str, Any],
+    last_frame_url: Optional[str],
+) -> ProjectGeneratedAsset:
+    """Record one immutable video candidate and apply Agent selection policy."""
+
+    task_extra = dict(task_record.extra or {})
+    is_agent = bool(task_extra.get("agent_production_id"))
+    selected_history = None
+    if is_agent:
+        selected_history = (
+            await db.execute(
+                select(ProjectGeneratedAsset)
+                .where(
+                    ProjectGeneratedAsset.project_id == task_record.business_id,
+                    ProjectGeneratedAsset.user_id == task_record.user_id,
+                    ProjectGeneratedAsset.target_type == "storyboard",
+                    ProjectGeneratedAsset.target_id == storyboard.id,
+                    ProjectGeneratedAsset.media_type == "video",
+                    ProjectGeneratedAsset.is_selected.is_(True),
+                    ProjectGeneratedAsset.is_enabled.is_(True),
+                )
+                .order_by(
+                    ProjectGeneratedAsset.updated_at.desc(),
+                    ProjectGeneratedAsset.id.desc(),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    result_urls = extract_result_urls(content)
+    model_extra = dict(task_extra.get("model_extra") or {})
+    history = await create_project_generated_asset_history(
+        db,
+        task_record=task_record,
+        target_type="storyboard",
+        target_id=storyboard.id,
+        media_type="video",
+        result_urls=result_urls or [content],
+        result_url=result_urls[0] if result_urls else content,
+        last_frame_url=last_frame_url,
+        chapter_id=storyboard.chapter_id,
+        generation_mode=task_extra.get("generation_mode"),
+        extra={
+            "storyboard_title": storyboard.title,
+            "shot_number": storyboard.shot_number,
+            "resolution": task_extra.get("resolution"),
+            "requested_duration_seconds": model_extra.get("duration_seconds"),
+            "return_last_frame": task_extra.get("return_last_frame"),
+            "model_result_extra": result_extra,
+            "validity_status": "current",
+            "storyboard_revision": task_extra.get("agent_storyboard_revision"),
+            "episode_revision": task_extra.get("agent_episode_revision"),
+            "core_asset_lock_version": task_extra.get("agent_core_asset_lock_version"),
+            "video_config_version": task_extra.get("agent_video_config_version"),
+            "asset_bindings": task_extra.get("agent_asset_bindings_snapshot") or [],
+            "reference_images": task_extra.get("reference_images") or [],
+            "reference_manifest": task_extra.get("agent_reference_manifest") or [],
+            "provider_parameters": task_extra.get("agent_provider_parameters") or {},
+        },
+        select_current=not is_agent or selected_history is None,
+    )
+    extra = dict(storyboard.extra or {})
+    extra.update(
+        {
+            "video_latest_history_id": str(history.id),
+            "video_latest_result": history.result_url or content,
+            "video_generation_extra": result_extra,
+        }
+    )
+    if is_agent and selected_history is not None:
+        extra.update(
+            {
+                "video_generation_status": "selection_required",
+                "video_generation_history_id": str(selected_history.id),
+                "video_generation_task_record_id": (
+                    str(selected_history.task_record_id)
+                    if selected_history.task_record_id
+                    else ""
+                ),
+                "video_generation_result": selected_history.result_url or "",
+                "video_selection_required": True,
+            }
+        )
+        if selected_history.last_frame_url:
+            extra["video_generation_last_frame_url"] = selected_history.last_frame_url
+    else:
+        extra.update(
+            {
+                "video_generation_status": "selected" if is_agent else "success",
+                "video_generation_history_id": str(history.id),
+                "video_generation_task_record_id": str(task_record.id),
+                "video_generation_result": history.result_url or content,
+                "video_selection_required": False,
+            }
+        )
+        if is_agent:
+            extra["video_selection_revision"] = (
+                int(extra.get("video_selection_revision") or 0) + 1
+            )
+        if last_frame_url:
+            extra["video_generation_last_frame_url"] = last_frame_url
+    storyboard.extra = extra
+    storyboard.updated_at = beijing_datetime()
+    task_record.status = "success"
+    task_record.result = content
+    task_record.extra = {
+        **task_extra,
+        "model_result_extra": result_extra,
+        "storyboard_video_result": content,
+        **({"storyboard_video_last_frame_url": last_frame_url} if last_frame_url else {}),
+        "generated_asset_history_id": str(history.id),
+    }
+    return history
+
+
 async def list_project_generated_asset_history(
     db: AsyncSession,
     *,
@@ -84,7 +205,9 @@ async def list_project_generated_asset_history(
     page_size: int,
 ) -> Tuple[List[ProjectGeneratedAsset], int]:
     await get_project_or_404(db, project_id, user_id)
-    resolved_media_type = await _ensure_target_access(db, project_id, user_id, target_type, target_id, media_type)
+    resolved_media_type = await _ensure_target_access(
+        db, project_id, user_id, target_type, target_id, media_type
+    )
     conditions = [
         ProjectGeneratedAsset.project_id == project_id,
         ProjectGeneratedAsset.user_id == user_id,
@@ -93,7 +216,9 @@ async def list_project_generated_asset_history(
         ProjectGeneratedAsset.media_type == resolved_media_type,
         ProjectGeneratedAsset.is_enabled.is_(True),
     ]
-    count_result = await db.execute(select(func.count()).select_from(ProjectGeneratedAsset).where(*conditions))
+    count_result = await db.execute(
+        select(func.count()).select_from(ProjectGeneratedAsset).where(*conditions)
+    )
     total = int(count_result.scalar_one())
     result = await db.execute(
         select(ProjectGeneratedAsset)
@@ -150,6 +275,16 @@ async def select_project_generated_asset_history(
     history.result_url = selected_url
     history.is_selected = True
     history.updated_at = beijing_datetime()
+    if history.target_type in {"character", "scene", "prop"} and history.media_type == "image":
+        await track_core_asset_reference_change(
+            db,
+            project_id=project_id,
+            user_id=user_id,
+            asset_type=history.target_type,
+            asset_id=history.target_id,
+            previous_reference_image=getattr(target, "reference_image", None),
+            new_reference_image=selected_url,
+        )
     _apply_selected_history_to_target(target, history, selected_url)
     await db.commit()
     await db.refresh(history)
@@ -197,14 +332,15 @@ async def _ensure_target_access(
     if not media_type and len(expected_media_types) != 1:
         raise AppException("请选择生成历史媒体类型", code=40035, status_code=400)
     model = config["model"]
-    result = await db.execute(
-        select(model).where(
+    statement = select(model).where(
             model.id == target_id,
             model.project_id == project_id,
             model.user_id == user_id,
             model.is_enabled.is_(True),
         )
-    )
+    if return_target:
+        statement = statement.with_for_update()
+    result = await db.execute(statement)
     target = result.scalar_one_or_none()
     if target is None:
         raise AppException("目标资产不存在", code=40413, status_code=404)
@@ -212,14 +348,18 @@ async def _ensure_target_access(
     return target if return_target else resolved_media_type
 
 
-def _apply_selected_history_to_target(target: Any, history: ProjectGeneratedAsset, selected_url: Optional[str]) -> None:
+def _apply_selected_history_to_target(
+    target: Any, history: ProjectGeneratedAsset, selected_url: Optional[str]
+) -> None:
     now = beijing_datetime()
     if history.media_type == "image":
         target.extra = {
             **(target.extra or {}),
             "image_generation_status": "selected",
             "image_generation_history_id": str(history.id),
-            "image_generation_task_record_id": str(history.task_record_id) if history.task_record_id else "",
+            "image_generation_task_record_id": str(history.task_record_id)
+            if history.task_record_id
+            else "",
             "image_generation_result": selected_url or "",
         }
         if hasattr(target, "reference_image"):
@@ -229,9 +369,15 @@ def _apply_selected_history_to_target(target: Any, history: ProjectGeneratedAsse
             **(target.extra or {}),
             "video_generation_status": "selected",
             "video_generation_history_id": str(history.id),
-            "video_generation_task_record_id": str(history.task_record_id) if history.task_record_id else "",
+            "video_generation_task_record_id": str(history.task_record_id)
+            if history.task_record_id
+            else "",
             "video_generation_result": selected_url or "",
-            **({"video_generation_last_frame_url": history.last_frame_url} if history.last_frame_url else {}),
+            **(
+                {"video_generation_last_frame_url": history.last_frame_url}
+                if history.last_frame_url
+                else {}
+            ),
         }
     target.updated_at = now
 

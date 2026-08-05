@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -100,7 +100,10 @@ async def update_project_chapter(
     for field, value in update_data.items():
         setattr(chapter, field, value)
     changed_fields = set(update_data.keys())
-    if {"content", "processing_prompt"} & changed_fields and "processed_content" not in changed_fields:
+    if {
+        "content",
+        "processing_prompt",
+    } & changed_fields and "processed_content" not in changed_fields:
         chapter.process_status = "draft"
         chapter.processed_content = None
     elif "processed_content" in changed_fields:

@@ -6,7 +6,11 @@ import httpx
 
 from app.core.config import settings
 from app.core.exceptions import AppException
-from app.integrations.comfly_dimensions import adapt_image_dimensions, adapt_video_dimensions, normalize_ratio
+from app.core.outbound_url import open_safe_http_response, trusted_oss_hosts
+from app.integrations.comfly_dimensions import (
+    adapt_image_dimensions, adapt_video_dimensions,
+    normalize_ratio,
+)
 from app.integrations.comfly_video_specs import allowed_video_request_keys, merge_video_capabilities
 
 
@@ -259,19 +263,25 @@ def _url(path: str) -> str:
     return f"{base_url}{normalized_path}"
 
 
-def _headers() -> Dict[str, str]:
-    return {
+def _headers(idempotency_key: Optional[str] = None) -> Dict[str, str]:
+    headers = {
         "Authorization": f"Bearer {_api_key()}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
+    return headers
 
 
-def _auth_headers() -> Dict[str, str]:
-    return {
+def _auth_headers(idempotency_key: Optional[str] = None) -> Dict[str, str]:
+    headers = {
         "Authorization": f"Bearer {_api_key()}",
         "Accept": "application/json",
     }
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
+    return headers
 
 
 def _timeout() -> httpx.Timeout:
@@ -288,7 +298,7 @@ def _limits() -> httpx.Limits:
 async def init_comfly_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
-        _client = httpx.AsyncClient(timeout=_timeout(), limits=_limits())
+        _client = httpx.AsyncClient(timeout=_timeout(), limits=_limits(), trust_env=False)
     return _client
 
 
@@ -341,10 +351,16 @@ async def _post_json(
     path: str,
     payload: Dict[str, Any],
     params: Optional[Dict[str, Any]] = None,
+    idempotency_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     try:
         client = await _get_client()
-        response = await client.post(_url(path), headers=_headers(), json=payload, params=params)
+        response = await client.post(
+            _url(path),
+            headers=_headers(idempotency_key),
+            json=payload,
+            params=params,
+        )
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         _raise_model_service_http_error(exc, "模型调用失败")
@@ -361,10 +377,16 @@ async def _post_multipart(
     data: Dict[str, Any],
     files: List[tuple[str, tuple[str, bytes, str]]],
     params: Optional[Dict[str, Any]] = None,
+    idempotency_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     try:
         client = await _get_client()
-        response = await client.post(_url(path), headers=_auth_headers(), data=data, files=files, params=params)
+        response = await client.post(
+            _url(path),
+            headers=_auth_headers(idempotency_key),
+            data=data, files=files,
+            params=params,
+        )
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         _raise_model_service_http_error(exc, "图像编辑调用失败")
@@ -430,7 +452,9 @@ def _extract_stream_chunk_content(payload: Dict[str, Any]) -> str:
     message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
     content = delta.get("content") or message.get("content") or ""
     if isinstance(content, list):
-        return "".join(str(item.get("text") or "") if isinstance(item, dict) else str(item) for item in content)
+        return "".join(
+            str(item.get("text") or "") if isinstance(item, dict) else str(item) for item in content
+        )
     return str(content) if content else ""
 
 
@@ -459,17 +483,29 @@ def _raise_model_service_http_error(exc: httpx.HTTPStatusError, fallback: str) -
     if status_code in {401, 403}:
         raise AppException("模型服务认证失败，请检查服务配置", code=50231, status_code=502) from exc
     if status_code == 451:
-        raise AppException("输入内容未通过模型安全校验，请更换内容后重试", code=40017, status_code=400) from exc
+        raise AppException(
+            "输入内容未通过模型安全校验，请更换内容后重试", code=40017, status_code=400
+        ) from exc
     if status_code == 400:
-        if any(token in response_text.lower() for token in ("sensitive", "privacy", "real person", "content policy", "敏感")):
-            raise AppException("输入内容未通过模型安全校验，请更换内容后重试", code=40017, status_code=400) from exc
-        raise AppException("当前模型不支持所选参数组合，请调整参数后重试", code=40016, status_code=400) from exc
+        if any(
+            token in response_text.lower() for token in ("sensitive", "privacy", "real person", "content policy", "敏感")
+        ):
+            raise AppException(
+                "输入内容未通过模型安全校验，请更换内容后重试", code=40017, status_code=400
+            ) from exc
+        raise AppException(
+            "当前模型不支持所选参数组合，请调整参数后重试", code=40016, status_code=400
+        ) from exc
     raise AppException(fallback, code=50204, status_code=502) from exc
 
 
-async def create_chat_completion(model: str, prompt: str, extra: Dict[str, Any]) -> Dict[str, Any]:
+async def create_chat_completion(
+    model: str, prompt: str, extra: Dict[str, Any],
+    *,
+    idempotency_key: Optional[str] = None,
+) -> Dict[str, Any]:
     payload = build_chat_completion_payload(model, prompt, extra)
-    return await _post_json("/v1/chat/completions", payload)
+    return await _post_json("/v1/chat/completions", payload, idempotency_key=idempotency_key)
 
 
 def validate_chat_completion_request(model: str, prompt: str, extra: Dict[str, Any]) -> None:
@@ -482,7 +518,9 @@ def build_chat_completion_payload(model: str, prompt: str, extra: Dict[str, Any]
         raise AppException("Chat model 不能为空", code=40019, status_code=400)
     payload: Dict[str, Any] = {
         "model": model_id,
-        "messages": _normalize_chat_messages(extra.get("messages") or _build_chat_messages(prompt, extra)),
+        "messages": _normalize_chat_messages(
+            extra.get("messages") or _build_chat_messages(prompt, extra)
+        ),
         "stream": False,
     }
     _merge_chat_extra(payload, extra)
@@ -583,7 +621,9 @@ def _normalize_chat_messages(value: Any) -> List[Dict[str, Any]]:
         if unknown_keys:
             raise AppException("Chat message 包含不支持的字段", code=40019, status_code=400)
         if role == "tool" and item.get("tool_call_id") in (None, ""):
-            raise AppException("Chat tool message 必须包含 tool_call_id", code=40019, status_code=400)
+            raise AppException(
+                "Chat tool message 必须包含 tool_call_id", code=40019, status_code=400
+            )
         if item.get("content") is None and item.get("tool_calls") is not None:
             content = ""
         else:
@@ -606,7 +646,9 @@ def _normalize_chat_content(value: Any) -> Any:
         content: List[Dict[str, Any]] = []
         for item in value:
             if not isinstance(item, dict):
-                raise AppException("Chat message content 数组项必须是对象", code=40019, status_code=400)
+                raise AppException(
+                    "Chat message content 数组项必须是对象", code=40019, status_code=400
+                )
             content_type = str(item.get("type") or "").strip()
             if content_type not in CHAT_CONTENT_PART_TYPES:
                 raise AppException("Chat message content 类型不支持", code=40019, status_code=400)
@@ -675,10 +717,16 @@ def _normalize_chat_response_format(value: Any) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise AppException("Chat 参数 response_format 必须是对象", code=40019, status_code=400)
     response_type = value.get("type")
-    if response_type is not None and str(response_type) not in {"text", "json_object", "json_schema"}:
+    if response_type is not None and str(response_type) not in {
+        "text",
+        "json_object",
+        "json_schema",
+    }:
         raise AppException("Chat 参数 response_format.type 不支持", code=40019, status_code=400)
     if response_type == "json_schema" and not isinstance(value.get("json_schema"), dict):
-        raise AppException("Chat 参数 response_format.json_schema 必须是对象", code=40019, status_code=400)
+        raise AppException(
+            "Chat 参数 response_format.json_schema 必须是对象", code=40019, status_code=400
+        )
     return value
 
 
@@ -689,16 +737,22 @@ def _normalize_chat_tools(value: Any) -> List[Any]:
         if isinstance(tool, str):
             continue
         if not isinstance(tool, dict):
-            raise AppException("Chat 参数 tools 数组项必须是字符串或对象", code=40019, status_code=400)
+            raise AppException(
+                "Chat 参数 tools 数组项必须是字符串或对象", code=40019, status_code=400
+            )
         tool_type = tool.get("type")
         if tool_type is not None and str(tool_type) != "function":
             raise AppException("Chat 参数 tools.type 仅支持 function", code=40019, status_code=400)
         function = tool.get("function")
         if function is not None:
             if not isinstance(function, dict):
-                raise AppException("Chat 参数 tools.function 必须是对象", code=40019, status_code=400)
+                raise AppException(
+                    "Chat 参数 tools.function 必须是对象", code=40019, status_code=400
+                )
             if not str(function.get("name") or "").strip():
-                raise AppException("Chat 参数 tools.function.name 不能为空", code=40019, status_code=400)
+                raise AppException(
+                    "Chat 参数 tools.function.name 不能为空", code=40019, status_code=400
+                )
     return value
 
 
@@ -717,7 +771,9 @@ def _normalize_chat_tool_calls(value: Any) -> List[Dict[str, Any]]:
         raise AppException("Chat message tool_calls 必须是数组", code=40019, status_code=400)
     for item in value:
         if not isinstance(item, dict):
-            raise AppException("Chat message tool_calls 数组项必须是对象", code=40019, status_code=400)
+            raise AppException(
+                "Chat message tool_calls 数组项必须是对象", code=40019, status_code=400
+            )
     return value
 
 
@@ -765,12 +821,25 @@ def _extract_media_url(value: Any) -> Optional[str]:
     return None
 
 
-async def create_image_generation(model: str, prompt: str, extra: Dict[str, Any]) -> Dict[str, Any]:
+async def create_image_generation(
+    model: str, prompt: str, extra: Dict[str, Any],
+    *,
+    idempotency_key: Optional[str] = None,
+) -> Dict[str, Any]:
     if _is_image_edit_request(extra):
-        return await create_image_edit(model, prompt, extra)
+        return await create_image_edit(
+            model,
+            prompt,
+            extra,
+            idempotency_key=idempotency_key,
+        )
 
     payload, params = build_image_generation_payload(model, prompt, extra)
-    return await _post_json("/v1/images/generations", payload, params=params or None)
+    return await _post_json(
+        "/v1/images/generations",
+        payload, params=params or None,
+        idempotency_key=idempotency_key,
+    )
 
 
 def validate_image_request(model: str, prompt: str, extra: Dict[str, Any]) -> None:
@@ -802,7 +871,9 @@ def build_image_generation_payload(
     return payload, params
 
 
-async def create_image_conversation(model: str, prompt: str, extra: Dict[str, Any]) -> Dict[str, Any]:
+async def create_image_conversation(
+    model: str, prompt: str, extra: Dict[str, Any]
+) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "model": model,
         "messages": extra.get("messages") or _build_image_chat_messages(prompt, extra),
@@ -852,7 +923,11 @@ def _collect_image_media_urls(extra: Dict[str, Any]) -> List[str]:
     return urls
 
 
-async def create_image_edit(model: str, prompt: str, extra: Dict[str, Any]) -> Dict[str, Any]:
+async def create_image_edit(
+    model: str, prompt: str, extra: Dict[str, Any],
+    *,
+    idempotency_key: Optional[str] = None,
+) -> Dict[str, Any]:
     data, params, image_urls, mask_url = build_image_edit_data(model, prompt, extra)
 
     files: List[tuple[str, tuple[str, bytes, str]]] = []
@@ -862,7 +937,11 @@ async def create_image_edit(model: str, prompt: str, extra: Dict[str, Any]) -> D
     if mask_url:
         files.append(("mask", await _download_upload_file(mask_url, "mask.png")))
 
-    return await _post_multipart("/v1/images/edits", data=data, files=files, params=params or None)
+    return await _post_multipart(
+        "/v1/images/edits",
+        data=data, files=files, params=params or None,
+        idempotency_key=idempotency_key,
+    )
 
 
 def build_image_edit_data(
@@ -889,7 +968,11 @@ async def query_image_generation(task_id: str) -> Dict[str, Any]:
     return await _get_json(f"/v1/images/tasks/{task_id}")
 
 
-async def create_video_generation(model: str, prompt: str, extra: Dict[str, Any]) -> Dict[str, Any]:
+async def create_video_generation(
+    model: str, prompt: str, extra: Dict[str, Any],
+    *,
+    idempotency_key: Optional[str] = None,
+) -> Dict[str, Any]:
     model_id = _normalize_model_id(model, "视频 model 不能为空")
     capabilities = merge_video_capabilities(model_id, extra.get("_model_capabilities") or {})
     capabilities["model_id"] = model_id
@@ -897,7 +980,11 @@ async def create_video_generation(model: str, prompt: str, extra: Dict[str, Any]
     payload: Dict[str, Any] = {"model": model_id, "prompt": _normalize_video_prompt(prompt)}
     _normalize_video_media(payload, extra, allowed_keys, capabilities)
     _merge_video_extra(payload, model_id, extra, VIDEO_GENERATION_HELPER_KEYS, capabilities)
-    return await _post_json("/v2/videos/generations", payload)
+    return await _post_json(
+        "/v2/videos/generations",
+        payload,
+        idempotency_key=idempotency_key,
+    )
 
 
 async def query_video_generation(task_id: str) -> Dict[str, Any]:
@@ -972,7 +1059,9 @@ def _normalize_image_request_value(key: str, value: Any) -> Any:
         if not text:
             return None
         if text not in IMAGE_RESPONSE_FORMAT_VALUES:
-            raise AppException("绘图 response_format 只支持 url 或 b64_json", code=40020, status_code=400)
+            raise AppException(
+                "绘图 response_format 只支持 url 或 b64_json", code=40020, status_code=400
+            )
         return text
     if key == "quality":
         text = str(value).strip().lower()
@@ -1033,7 +1122,9 @@ def _normalize_bounded_int(key: str, value: Any, lower: int, upper: int) -> int:
     except (TypeError, ValueError) as exc:
         raise AppException(f"绘图参数 {key} 必须是整数", code=40020, status_code=400) from exc
     if number < lower or number > upper:
-        raise AppException(f"绘图参数 {key} 必须在 {lower}-{upper} 之间", code=40020, status_code=400)
+        raise AppException(
+            f"绘图参数 {key} 必须在 {lower}-{upper} 之间", code=40020, status_code=400
+        )
     return number
 
 
@@ -1089,8 +1180,12 @@ def _merge_video_extra(
         if normalized is None:
             continue
         payload[key] = normalized
-    if "camerafixed" in allowed_keys and "camerafixed" not in payload and extra.get("camera_fixed") is not None:
-        payload["camerafixed"] = _normalize_video_request_value("camerafixed", extra["camera_fixed"], capabilities)
+    if (
+        "camerafixed" in allowed_keys and "camerafixed" not in payload and extra.get("camera_fixed") is not None
+    ):
+        payload["camerafixed"] = _normalize_video_request_value(
+            "camerafixed", extra["camera_fixed"], capabilities
+        )
     adapt_video_dimensions(payload, extra, allowed_keys)
     _apply_video_ratio_alias(payload, extra, allowed_keys, capabilities)
     _normalize_video_payload(payload, capabilities)
@@ -1127,7 +1222,11 @@ def _collect_video_image_urls(extra: Dict[str, Any]) -> List[str]:
         return _collect_first_last_frame_urls(extra)
 
     values: List[Any] = []
-    for key in ("images", "image", "image_url", "image_urls", "reference_images", "reference_image_urls"):
+    for key in (
+        "images",
+        "image", "image_url", "image_urls", "reference_images",
+        "reference_image_urls",
+    ):
         if key in extra:
             values.extend(_as_list(extra[key]))
     return _collect_urls(values)
@@ -1167,7 +1266,11 @@ def _normalize_frame_role(value: Any) -> str:
 
 def _collect_video_urls(extra: Dict[str, Any]) -> List[str]:
     values: List[Any] = []
-    for key in ("videos", "video", "video_url", "video_urls", "reference_video", "reference_video_urls", "reference_videos"):
+    for key in (
+        "videos",
+        "video", "video_url", "video_urls", "reference_video", "reference_video_urls",
+        "reference_videos",
+    ):
         if key in extra:
             values.extend(_as_list(extra[key]))
     return _collect_urls(values)
@@ -1255,7 +1358,10 @@ def _normalize_video_duration(value: Any, capabilities: Dict[str, Any]) -> Any:
     if allowed:
         allowed_text = {str(item) for item in allowed}
         if text not in allowed_text:
-            raise AppException(f"视频 duration 仅支持 {', '.join(sorted(allowed_text))}", code=40021, status_code=400)
+            raise AppException(
+                f"视频 duration 仅支持 {', '.join(sorted(allowed_text))}", code=40021,
+                status_code=400,
+            )
     try:
         number = int(text)
     except ValueError:
@@ -1271,19 +1377,27 @@ def _normalize_video_resolution_value(value: Any, capabilities: Dict[str, Any]) 
     if allowed:
         normalized = {str(item).lower(): str(item) for item in allowed}
         if text.lower() not in normalized:
-            raise AppException(f"视频 resolution 仅支持 {', '.join(str(item) for item in allowed)}", code=40021, status_code=400)
+            raise AppException(
+                f"视频 resolution 仅支持 {', '.join(str(item) for item in allowed)}", code=40021,
+                status_code=400,
+            )
         return normalized[text.lower()]
     return text
 
 
-def _normalize_video_choice(key: str, value: str, capabilities: Dict[str, Any], *, value_key: str) -> str:
+def _normalize_video_choice(
+    key: str, value: str, capabilities: Dict[str, Any], *, value_key: str
+) -> str:
     allowed = capabilities.get(value_key)
     if not allowed:
         return value
     normalized = {str(item).lower(): str(item) for item in allowed}
     lowered = str(value).strip().lower()
     if lowered not in normalized:
-        raise AppException(f"视频参数 {key} 仅支持 {', '.join(str(item) for item in allowed)}", code=40021, status_code=400)
+        raise AppException(
+            f"视频参数 {key} 仅支持 {', '.join(str(item) for item in allowed)}", code=40021,
+            status_code=400,
+        )
     return normalized[lowered]
 
 
@@ -1295,7 +1409,9 @@ def _normalize_video_int(key: str, value: Any, lower: int, upper: int) -> int:
     except (TypeError, ValueError) as exc:
         raise AppException(f"视频参数 {key} 必须是整数", code=40021, status_code=400) from exc
     if number < lower or number > upper:
-        raise AppException(f"视频参数 {key} 必须在 {lower}-{upper} 之间", code=40021, status_code=400)
+        raise AppException(
+            f"视频参数 {key} 必须在 {lower}-{upper} 之间", code=40021, status_code=400
+        )
     return number
 
 
@@ -1353,13 +1469,41 @@ def _collect_urls(values: List[Any]) -> List[str]:
 async def _download_upload_file(url: str, fallback_name: str) -> tuple[str, bytes, str]:
     try:
         client = await _get_client()
-        response = await client.get(url)
-        response.raise_for_status()
+        response = await _open_safe_upload_response(client, url)
+        try:
+            response.raise_for_status()
+            max_size = settings.max_upload_size_mb * 1024 * 1024
+            try:
+                content_length = int(response.headers.get("content-length") or 0)
+            except ValueError:
+                content_length = 0
+            if content_length > max_size:
+                raise AppException("待编辑图片超过上传大小限制", code=41300, status_code=413)
+            content = bytearray()
+            async for chunk in response.aiter_bytes():
+                content.extend(chunk)
+                if len(content) > max_size:
+                    raise AppException("待编辑图片超过上传大小限制", code=41300, status_code=413)
+            content_type = response.headers.get("content-type") or "application/octet-stream"
+        finally:
+            await response.aclose()
     except httpx.TimeoutException as exc:
         raise AppException("下载待编辑图片超时", code=50207, status_code=502) from exc
     except httpx.HTTPError as exc:
         raise AppException("下载待编辑图片失败", code=50208, status_code=502) from exc
 
-    content_type = response.headers.get("content-type") or "application/octet-stream"
     filename = url.rstrip("/").split("/")[-1].split("?")[0] or fallback_name
-    return filename, response.content, content_type
+    return filename, bytes(content), content_type
+
+
+async def _open_safe_upload_response(
+    client: httpx.AsyncClient,
+    source_url: str,
+    max_redirects: int = 5,
+) -> httpx.Response:
+    return await open_safe_http_response(
+        client,
+        source_url,
+        allowed_hosts=trusted_oss_hosts(),
+        max_redirects=max_redirects,
+    )

@@ -18,9 +18,12 @@ from app.models.project_storyboard import ProjectStoryboard
 from app.models.task_record import UserTaskRecord
 from app.services.points import change_user_points
 from app.services.project_storyboards import (
+    mark_storyboard_analysis_task_superseded,
     run_storyboard_analysis_in_worker,
     run_storyboard_stage_in_worker,
+    storyboard_analysis_task_is_current,
 )
+from app.services.task_execution import TaskExecutionDeferred, prepare_task_execution
 from app.worker import celery_app
 
 
@@ -38,11 +41,17 @@ logger = logging.getLogger(__name__)
 def run_project_storyboard_analysis(self, task_record_id: str, chapter_id: str) -> None:
     retry_delay = _retry_countdown(self.request.retries)
     try:
-        asyncio.run(_run_project_storyboard_analysis(UUID(task_record_id), UUID(chapter_id), retry_delay))
+        asyncio.run(
+            _run_project_storyboard_analysis(UUID(task_record_id), UUID(chapter_id), retry_delay)
+        )
     except SoftTimeLimitExceeded:
         asyncio.run(_fail_analysis(UUID(task_record_id), UUID(chapter_id), "任务执行超时"))
+    except TaskExecutionDeferred as exc:
+        raise self.retry(countdown=exc.retry_after_seconds) from exc
     except Exception as exc:
-        if self.request.retries < settings.celery_task_max_retries and _is_retryable_provider_error(exc):
+        if self.request.retries < settings.celery_task_max_retries and _is_retryable_provider_error(
+            exc
+        ):
             raise self.retry(exc=exc, countdown=retry_delay) from exc
         asyncio.run(
             _fail_analysis(
@@ -64,11 +73,17 @@ def run_project_storyboard_analysis(self, task_record_id: str, chapter_id: str) 
 def run_project_storyboard_stage(self, task_record_id: str, chapter_id: str) -> None:
     retry_delay = _retry_countdown(self.request.retries)
     try:
-        asyncio.run(_run_project_storyboard_stage(UUID(task_record_id), UUID(chapter_id), retry_delay))
+        asyncio.run(
+            _run_project_storyboard_stage(UUID(task_record_id), UUID(chapter_id), retry_delay)
+        )
     except SoftTimeLimitExceeded:
         asyncio.run(_fail_analysis(UUID(task_record_id), UUID(chapter_id), "任务执行超时"))
+    except TaskExecutionDeferred as exc:
+        raise self.retry(countdown=exc.retry_after_seconds) from exc
     except Exception as exc:
-        if self.request.retries < settings.celery_task_max_retries and _is_retryable_provider_error(exc):
+        if self.request.retries < settings.celery_task_max_retries and _is_retryable_provider_error(
+            exc
+        ):
             raise self.retry(exc=exc, countdown=retry_delay) from exc
         asyncio.run(
             _fail_analysis(
@@ -80,7 +95,9 @@ def run_project_storyboard_stage(self, task_record_id: str, chapter_id: str) -> 
         )
 
 
-async def _run_project_storyboard_analysis(task_record_id: UUID, chapter_id: UUID, retry_delay: int) -> None:
+async def _run_project_storyboard_analysis(
+    task_record_id: UUID, chapter_id: UUID, retry_delay: int
+) -> None:
     try:
         await _execute_analysis(task_record_id, chapter_id, retry_delay)
     finally:
@@ -88,7 +105,9 @@ async def _run_project_storyboard_analysis(task_record_id: UUID, chapter_id: UUI
         await close_volcengine_ark_client()
 
 
-async def _run_project_storyboard_stage(task_record_id: UUID, chapter_id: UUID, retry_delay: int) -> None:
+async def _run_project_storyboard_stage(
+    task_record_id: UUID, chapter_id: UUID, retry_delay: int
+) -> None:
     try:
         await _execute_stage(task_record_id, chapter_id, retry_delay)
     finally:
@@ -99,12 +118,10 @@ async def _run_project_storyboard_stage(task_record_id: UUID, chapter_id: UUID, 
 async def _execute_analysis(task_record_id: UUID, chapter_id: UUID, retry_delay: int) -> None:
     async with WorkerSessionLocal() as db:
         result = await db.execute(
-            select(UserTaskRecord)
-            .where(UserTaskRecord.id == task_record_id)
-            .with_for_update(skip_locked=True)
+            select(UserTaskRecord).where(UserTaskRecord.id == task_record_id).with_for_update()
         )
         task_record = result.scalar_one_or_none()
-        chapter = await db.get(ProjectChapter, chapter_id)
+        chapter = await db.get(ProjectChapter, chapter_id, with_for_update=True)
         if task_record is None or chapter is None:
             logger.warning(
                 "Storyboard analysis skipped: task_record or chapter missing",
@@ -116,7 +133,7 @@ async def _execute_analysis(task_record_id: UUID, chapter_id: UUID, retry_delay:
                 ),
             )
             return
-        if task_record.status != "pending":
+        if not prepare_task_execution(task_record):
             logger.info(
                 "Storyboard analysis skipped: task_record is not pending",
                 extra=log_extra(
@@ -124,9 +141,13 @@ async def _execute_analysis(task_record_id: UUID, chapter_id: UUID, retry_delay:
                     task_record_id=task_record.id,
                     chapter_id=chapter.id,
                     status=task_record.status,
-                    reason="not_pending",
+                    reason="not_executable",
                 ),
             )
+            return
+        if not storyboard_analysis_task_is_current(task_record, chapter):
+            await mark_storyboard_analysis_task_superseded(db, task_record)
+            await db.commit()
             return
 
         task_record.status = "running"
@@ -140,6 +161,11 @@ async def _execute_analysis(task_record_id: UUID, chapter_id: UUID, retry_delay:
         try:
             await run_storyboard_analysis_in_worker(db, task_record, chapter)
         except Exception as exc:
+            await db.refresh(chapter, with_for_update=True)
+            if not storyboard_analysis_task_is_current(task_record, chapter):
+                await mark_storyboard_analysis_task_superseded(db, task_record)
+                await db.commit()
+                return
             if _is_retryable_provider_error(exc):
                 await _mark_retrying(
                     db,
@@ -175,9 +201,7 @@ async def _execute_analysis(task_record_id: UUID, chapter_id: UUID, retry_delay:
 async def _execute_stage(task_record_id: UUID, chapter_id: UUID, retry_delay: int) -> None:
     async with WorkerSessionLocal() as db:
         result = await db.execute(
-            select(UserTaskRecord)
-            .where(UserTaskRecord.id == task_record_id)
-            .with_for_update(skip_locked=True)
+            select(UserTaskRecord).where(UserTaskRecord.id == task_record_id).with_for_update()
         )
         task_record = result.scalar_one_or_none()
         chapter = await db.get(ProjectChapter, chapter_id)
@@ -192,7 +216,7 @@ async def _execute_stage(task_record_id: UUID, chapter_id: UUID, retry_delay: in
                 ),
             )
             return
-        if task_record.status != "pending":
+        if not prepare_task_execution(task_record):
             logger.info(
                 "Storyboard stage skipped: task_record is not pending",
                 extra=log_extra(
@@ -200,7 +224,7 @@ async def _execute_stage(task_record_id: UUID, chapter_id: UUID, retry_delay: in
                     task_record_id=task_record.id,
                     chapter_id=chapter.id,
                     status=task_record.status,
-                    reason="not_pending",
+                    reason="not_executable",
                 ),
             )
             return
@@ -265,10 +289,14 @@ async def _fail_analysis(
 ) -> None:
     async with WorkerSessionLocal() as db:
         task_record = await db.get(UserTaskRecord, task_record_id)
-        chapter = await db.get(ProjectChapter, chapter_id)
+        chapter = await db.get(ProjectChapter, chapter_id, with_for_update=True)
         if task_record is None or chapter is None:
             return
         if task_record.status in {"success", "failed"}:
+            return
+        if not storyboard_analysis_task_is_current(task_record, chapter):
+            await mark_storyboard_analysis_task_superseded(db, task_record)
+            await db.commit()
             return
         await _mark_failed(db, task_record, chapter, reason, refund=True, raw_reason=raw_reason)
 
@@ -428,7 +456,10 @@ def _stage_keys(generation_type: str) -> tuple[str, str]:
     if generation_type == "storyboard_refinement":
         return "storyboard_refinement_status", "storyboard_refinement_task_record_id"
     if generation_type in {"storyboard_image_prompt", "storyboard_image_prompt_generation"}:
-        return "storyboard_image_prompt_generation_status", "storyboard_image_prompt_generation_task_record_id"
+        return (
+            "storyboard_image_prompt_generation_status",
+            "storyboard_image_prompt_generation_task_record_id",
+        )
     if generation_type == "storyboard_prompt_generation":
         return "storyboard_prompt_generation_status", "storyboard_prompt_generation_task_record_id"
     return "storyboard_analysis_status", "storyboard_analysis_task_record_id"

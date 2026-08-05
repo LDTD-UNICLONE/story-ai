@@ -16,11 +16,12 @@ class ProjectOut(SchemaBaseModel):
 
     id: UUID
     user_id: UUID
-    style_id: UUID
+    style_id: Optional[UUID] = None
     name: str
     cover: str
     description: str
-    generation_ratio: str
+    generation_ratio: Optional[str] = None
+    project_kind: Literal["standard", "agent"]
     is_enabled: bool
     style: Optional[StyleBaseOut] = None
     created_at: datetime

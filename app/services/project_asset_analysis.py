@@ -168,6 +168,7 @@ async def run_asset_analysis_in_worker(
         "text",
         model_prompt,
         (task_record.extra or {}).get("model_extra") or {},
+        idempotency_key=str(task_record.id),
     )
     if await refresh_task_record_interrupted(db, task_record):
         return
@@ -226,7 +227,9 @@ def parse_asset_items(content: str) -> List[Dict[str, Any]]:
     return [item for item in items if isinstance(item, dict)]
 
 
-def _build_asset(model: Type[Any], item: Dict[str, Any], task_record: UserTaskRecord, chapter: ProjectChapter) -> Any:
+def _build_asset(
+    model: Type[Any], item: Dict[str, Any], task_record: UserTaskRecord, chapter: ProjectChapter
+) -> Any:
     common = {
         "project_id": task_record.business_id,
         "user_id": task_record.user_id,
@@ -267,9 +270,13 @@ def _build_asset(model: Type[Any], item: Dict[str, Any], task_record: UserTaskRe
     )
 
 
-def _resolve_model_prompt(task_record: UserTaskRecord, chapter: ProjectChapter, config: Dict[str, Any]) -> str:
+def _resolve_model_prompt(
+    task_record: UserTaskRecord, chapter: ProjectChapter, config: Dict[str, Any]
+) -> str:
     if (task_record.extra or {}).get("prompt_source") == "system":
-        return render_system_prompt(config["prompt_file"], processed_content=chapter.processed_content or "")
+        return render_system_prompt(
+            config["prompt_file"], processed_content=chapter.processed_content or ""
+        )
     return task_record.prompt
 
 
@@ -286,9 +293,7 @@ async def _lock_project_assets_for_merge(db: AsyncSession, task_record: UserTask
     if task_record.business_id is None:
         return
     await db.execute(
-        select(Project.id)
-        .where(Project.id == task_record.business_id)
-        .with_for_update()
+        select(Project.id).where(Project.id == task_record.business_id).with_for_update()
     )
 
 
@@ -353,16 +358,22 @@ def _normalize_asset_key(value: Any) -> str:
 
 def _merge_asset(target: Any, source: Any, task_record: UserTaskRecord) -> None:
     if isinstance(target, ProjectCharacter):
-        target.aliases = _merge_string_list(target.aliases or [], [source.name, *(source.aliases or [])])
+        target.aliases = _merge_string_list(
+            target.aliases or [], [source.name, *(source.aliases or [])]
+        )
         target_name_key = _normalize_asset_key(target.name)
-        target.aliases = [alias for alias in target.aliases if _normalize_asset_key(alias) != target_name_key]
+        target.aliases = [
+            alias for alias in target.aliases if _normalize_asset_key(alias) != target_name_key
+        ]
         _merge_scalar_fields(
             target,
             source,
             ("identity", "gender", "age", "appearance", "personality", "relationship", "costume"),
         )
     elif isinstance(target, ProjectScene):
-        _merge_scalar_fields(target, source, ("location", "time_of_day", "environment", "atmosphere"))
+        _merge_scalar_fields(
+            target, source, ("location", "time_of_day", "environment", "atmosphere")
+        )
     elif isinstance(target, ProjectProp):
         _merge_scalar_fields(target, source, ("category", "appearance", "function"))
 

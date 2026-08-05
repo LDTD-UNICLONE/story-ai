@@ -410,7 +410,9 @@ def _build_text_to_video_content(prompt: str, extra: Dict[str, Any]) -> List[Dic
         content = _normalize_content_items(raw_content)
         media_items = [item for item in content if item.get("type") != "text"]
         if media_items:
-            raise AppException("文生视频不能传入图片、视频或音频参考素材", code=40010, status_code=400)
+            raise AppException(
+                "文生视频不能传入图片、视频或音频参考素材", code=40010, status_code=400
+            )
         return content
 
     text = str(prompt or "").strip()
@@ -420,7 +422,9 @@ def _build_text_to_video_content(prompt: str, extra: Dict[str, Any]) -> List[Dic
 
 
 def _build_first_last_frame_content(prompt: str, extra: Dict[str, Any]) -> List[Dict[str, Any]]:
-    first_frame_url = _extract_frame_url(extra, FIRST_FRAME_URL_KEYS, {"first_frame"}, allow_roleless=True)
+    first_frame_url = _extract_frame_url(
+        extra, FIRST_FRAME_URL_KEYS, {"first_frame"}, allow_roleless=True
+    )
     last_frame_url = _extract_frame_url(extra, LAST_FRAME_URL_KEYS, {"last_frame"})
 
     content: List[Dict[str, Any]] = []
@@ -428,9 +432,13 @@ def _build_first_last_frame_content(prompt: str, extra: Dict[str, Any]) -> List[
     if text:
         content.append({"type": "text", "text": text})
     if first_frame_url:
-        content.append({"type": "image_url", "image_url": {"url": first_frame_url}, "role": "first_frame"})
+        content.append(
+            {"type": "image_url", "image_url": {"url": first_frame_url}, "role": "first_frame"}
+        )
     if last_frame_url:
-        content.append({"type": "image_url", "image_url": {"url": last_frame_url}, "role": "last_frame"})
+        content.append(
+            {"type": "image_url", "image_url": {"url": last_frame_url}, "role": "last_frame"}
+        )
     return content
 
 
@@ -651,7 +659,9 @@ def _normalize_media_role(value: Any) -> str:
 
 
 def _normalize_video_generation_mode(extra: Dict[str, Any]) -> str:
-    raw_mode = _first_non_empty(extra.get("generation_mode"), extra.get("video_mode"), extra.get("capability"))
+    raw_mode = _first_non_empty(
+        extra.get("generation_mode"), extra.get("video_mode"), extra.get("capability")
+    )
     if raw_mode not in (None, ""):
         mode = str(raw_mode).strip().replace("-", "_")
         aliases = {
@@ -781,7 +791,9 @@ def _extract_frame_url(
 def _normalize_video_task_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(payload)
     normalized["content"] = _normalize_content_items(normalized.get("content") or [])
-    _validate_multimodal_content(normalized["content"], _normalize_video_generation_mode(normalized))
+    _validate_multimodal_content(
+        normalized["content"], _normalize_video_generation_mode(normalized)
+    )
     return normalized
 
 
@@ -829,23 +841,35 @@ def _validate_multimodal_content(content: List[Dict[str, Any]], generation_mode:
     if audio_count > MAX_REFERENCE_AUDIOS:
         raise AppException("火山方舟多模态参考最多支持 3 个音频", code=40010, status_code=400)
     if audio_count and not image_count and not video_count:
-        raise AppException("火山方舟多模态参考不支持仅文本加音频或纯音频输入", code=40010, status_code=400)
+        raise AppException(
+            "火山方舟多模态参考不支持仅文本加音频或纯音频输入", code=40010, status_code=400
+        )
 
     if generation_mode == "text_to_video":
         if media_count:
-            raise AppException("文生视频不能传入图片、视频或音频参考素材", code=40010, status_code=400)
-        if not any(item.get("type") == "text" and str(item.get("text") or "").strip() for item in content):
+            raise AppException(
+                "文生视频不能传入图片、视频或音频参考素材", code=40010, status_code=400
+            )
+        if not any(
+            item.get("type") == "text" and str(item.get("text") or "").strip() for item in content
+        ):
             raise AppException("文生视频需要传入文本提示词", code=40010, status_code=400)
         return
 
     if not media_count:
         if generation_mode == "reference":
-            raise AppException("参考生成需要至少传入参考图片或参考视频", code=40010, status_code=400)
-        if not any(item.get("type") == "text" and str(item.get("text") or "").strip() for item in content):
+            raise AppException(
+                "参考生成需要至少传入参考图片或参考视频", code=40010, status_code=400
+            )
+        if not any(
+            item.get("type") == "text" and str(item.get("text") or "").strip() for item in content
+        ):
             raise AppException("文生视频需要传入文本提示词", code=40010, status_code=400)
         return
 
-    image_roles = [str(item.get("role") or "") for item in content if item.get("type") == "image_url"]
+    image_roles = [
+        str(item.get("role") or "") for item in content if item.get("type") == "image_url"
+    ]
     has_first_frame = "first_frame" in image_roles
     has_last_frame = "last_frame" in image_roles
     has_reference_image = "reference_image" in image_roles
@@ -853,32 +877,49 @@ def _validate_multimodal_content(content: List[Dict[str, Any]], generation_mode:
     has_reference_video_or_audio = video_count > 0 or audio_count > 0
 
     if generation_mode == "reference" and (has_first_frame or has_last_frame or has_roleless_image):
-        raise AppException("参考生成图片必须设置 role=reference_image，不能混用首帧或尾帧", code=40010, status_code=400)
+        raise AppException(
+            "参考生成图片必须设置 role=reference_image，不能混用首帧或尾帧", code=40010,
+            status_code=400,
+        )
 
     if generation_mode == "first_last_frame" and not has_first_frame:
         raise AppException("首帧/首尾帧生成需要传入 first_frame", code=40010, status_code=400)
 
     if has_last_frame:
         if not has_first_frame:
-            raise AppException("首尾帧生成必须同时传入 first_frame 和 last_frame", code=40010, status_code=400)
-        if image_count != 2 or has_reference_image or has_roleless_image or has_reference_video_or_audio:
-            raise AppException("首尾帧生成只允许 1 张首帧图和 1 张尾帧图", code=40010, status_code=400)
+            raise AppException(
+                "首尾帧生成必须同时传入 first_frame 和 last_frame", code=40010, status_code=400
+            )
+        if (
+            image_count != 2 or has_reference_image or has_roleless_image or has_reference_video_or_audio
+        ):
+            raise AppException(
+                "首尾帧生成只允许 1 张首帧图和 1 张尾帧图", code=40010, status_code=400
+            )
         return
 
     if has_first_frame:
         if image_count != 1 or has_reference_image or has_reference_video_or_audio:
-            raise AppException("首帧生成只允许 1 张首帧图，不可混入参考图、视频或音频", code=40010, status_code=400)
+            raise AppException(
+                "首帧生成只允许 1 张首帧图，不可混入参考图、视频或音频", code=40010, status_code=400
+            )
         return
 
     if has_roleless_image and image_count == 1 and not has_reference_video_or_audio:
         return
 
     if image_count and (has_roleless_image or not has_reference_image):
-        raise AppException("多模态参考图片必须设置 role=reference_image", code=40010, status_code=400)
+        raise AppException(
+            "多模态参考图片必须设置 role=reference_image", code=40010, status_code=400
+        )
     if video_count and not _all_content_role(content, "video_url", "reference_video"):
-        raise AppException("多模态参考视频必须设置 role=reference_video", code=40010, status_code=400)
+        raise AppException(
+            "多模态参考视频必须设置 role=reference_video", code=40010, status_code=400
+        )
     if audio_count and not _all_content_role(content, "audio_url", "reference_audio"):
-        raise AppException("多模态参考音频必须设置 role=reference_audio", code=40010, status_code=400)
+        raise AppException(
+            "多模态参考音频必须设置 role=reference_audio", code=40010, status_code=400
+        )
 
 
 def _count_content_type(content: List[Dict[str, Any]], item_type: str) -> int:
@@ -886,7 +927,9 @@ def _count_content_type(content: List[Dict[str, Any]], item_type: str) -> int:
 
 
 def _all_content_role(content: List[Dict[str, Any]], item_type: str, role: str) -> bool:
-    return all(str(item.get("role") or "") == role for item in content if item.get("type") == item_type)
+    return all(
+        str(item.get("role") or "") == role for item in content if item.get("type") == item_type
+    )
 
 
 def _merge_video_extra(payload: Dict[str, Any], extra: Dict[str, Any]) -> None:
@@ -905,10 +948,16 @@ def _merge_video_extra(payload: Dict[str, Any], extra: Dict[str, Any]) -> None:
     if ratio and "ratio" in allowed_keys and "ratio" not in payload:
         payload["ratio"] = ratio
     if "resolution" in allowed_keys:
-        if extra.get("resolution") not in (None, "") and not is_known_video_resolution(extra.get("resolution")):
+        if extra.get("resolution") not in (None, "") and not is_known_video_resolution(
+            extra.get("resolution")
+        ):
             raise AppException("火山方舟视频 resolution 参数不支持", code=40010, status_code=400)
-        if extra.get("resolution") not in (None, "") and not is_video_resolution_supported(extra.get("resolution"), capabilities):
-            raise AppException("当前火山方舟视频模型不支持该 resolution 参数", code=40010, status_code=400)
+        if extra.get("resolution") not in (None, "") and not is_video_resolution_supported(
+            extra.get("resolution"), capabilities
+        ):
+            raise AppException(
+                "当前火山方舟视频模型不支持该 resolution 参数", code=40010, status_code=400
+            )
         payload["resolution"] = normalize_video_resolution(extra.get("resolution"), capabilities)
     _apply_video_defaults(payload, extra, allowed_keys, capabilities)
 
@@ -980,7 +1029,9 @@ def _normalize_duration(value: Any) -> int:
     if duration == -1:
         return duration
     if duration < 4 or duration > 15:
-        raise AppException("Seedance 2.0 视频 duration 仅支持 4-15 秒或 -1", code=40010, status_code=400)
+        raise AppException(
+            "Seedance 2.0 视频 duration 仅支持 4-15 秒或 -1", code=40010, status_code=400
+        )
     return duration
 
 
@@ -998,21 +1049,27 @@ def _normalize_int_range(key: str, value: Any, lower: int, upper: int) -> int:
     except (TypeError, ValueError) as exc:
         raise AppException(f"火山方舟视频 {key} 必须是整数", code=40010, status_code=400) from exc
     if number < lower or number > upper:
-        raise AppException(f"火山方舟视频 {key} 必须在 {lower}-{upper} 之间", code=40010, status_code=400)
+        raise AppException(
+            f"火山方舟视频 {key} 必须在 {lower}-{upper} 之间", code=40010, status_code=400
+        )
     return number
 
 
 def _normalize_callback_url(value: Any) -> str:
     url = str(value or "").strip()
     if not url.startswith(("http://", "https://")):
-        raise AppException("火山方舟视频 callback_url 必须是 http(s) URL", code=40010, status_code=400)
+        raise AppException(
+            "火山方舟视频 callback_url 必须是 http(s) URL", code=40010, status_code=400
+        )
     return url
 
 
 def _normalize_safety_identifier(value: Any) -> str:
     text = str(value or "").strip()
     if not text or len(text) > 64 or not re.fullmatch(r"[A-Za-z0-9._:-]+", text):
-        raise AppException("火山方舟视频 safety_identifier 必须是 1-64 位英文字符串", code=40010, status_code=400)
+        raise AppException(
+            "火山方舟视频 safety_identifier 必须是 1-64 位英文字符串", code=40010, status_code=400
+        )
     return text
 
 
@@ -1022,7 +1079,9 @@ def _normalize_tools(value: Any) -> List[Dict[str, Any]]:
     tools: List[Dict[str, Any]] = []
     for item in value:
         if not isinstance(item, dict) or item.get("type") != "web_search":
-            raise AppException("火山方舟视频 tools 仅支持 type=web_search", code=40010, status_code=400)
+            raise AppException(
+                "火山方舟视频 tools 仅支持 type=web_search", code=40010, status_code=400
+            )
         tools.append({"type": "web_search"})
     return tools
 
@@ -1038,7 +1097,11 @@ def _has_reference_media(payload: Dict[str, Any], extra: Dict[str, Any]) -> bool
     content = payload.get("content")
     if isinstance(content, list):
         for item in content:
-            if isinstance(item, dict) and item.get("type") in {"image_url", "video_url", "audio_url"}:
+            if isinstance(item, dict) and item.get("type") in {
+                "image_url",
+                "video_url",
+                "audio_url",
+            }:
                 return True
     return bool(
         _collect_image_urls(extra)
@@ -1073,11 +1136,9 @@ def _convert(value: Any) -> Any:
     if hasattr(value, "dict"):
         return _convert(value.dict())
     if hasattr(value, "__dict__") and not isinstance(value, type):
-        return {
-            key: _convert(item)
+        return {key: _convert(item)
             for key, item in vars(value).items()
-            if not key.startswith("_")
-        }
+            if not key.startswith("_")}
     return value
 
 
@@ -1094,11 +1155,15 @@ def _raise_provider_error(prefix: str, exc: Exception) -> None:
     if app_status_code == 400:
         logger.warning("%s：%s", prefix, message)
         if _is_safety_provider_error(message):
-            raise AppException("输入内容未通过模型安全校验，请更换内容后重试", code=40017, status_code=400) from exc
+            raise AppException(
+                "输入内容未通过模型安全校验，请更换内容后重试", code=40017, status_code=400
+            ) from exc
         video_public_message = _video_provider_400_public_message(prefix, message)
         if video_public_message:
             raise AppException(video_public_message, code=40016, status_code=400) from exc
-        raise AppException("当前模型不支持所选参数组合，请调整参数后重试", code=40016, status_code=400) from exc
+        raise AppException(
+            "当前模型不支持所选参数组合，请调整参数后重试", code=40016, status_code=400
+        ) from exc
     raise AppException(f"{prefix}：{message}", code=app_code, status_code=app_status_code) from exc
 
 
@@ -1121,7 +1186,9 @@ def _video_provider_400_public_message(prefix: str, message: str) -> str:
         return "参考视频编码仅支持 H.264/H.265，音频编码仅支持 AAC/MP3，请转码后重试"
     if "duration" in lower_message or "时长" in message:
         return "参考视频单个时长必须在 2-15.2 秒之间，总时长不能超过 15.2 秒"
-    if "resolution" in lower_message or "width" in lower_message or "height" in lower_message or "分辨率" in message:
+    if (
+        "resolution" in lower_message or "width" in lower_message or "height" in lower_message or "分辨率" in message
+    ):
         return "参考视频尺寸不符合模型要求，请检查宽高、宽高比和总像素数"
     if "video" in lower_message or "reference" in lower_message or "视频" in message:
         return "参考视频不符合模型要求，请检查格式、时长、帧率、编码和尺寸后重试"
@@ -1154,5 +1221,9 @@ def _is_safety_provider_error(message: str) -> bool:
     normalized = message.lower()
     return any(
         token in normalized
-        for token in ("sensitivecontentdetected", "privacyinformation", "real person", "content policy", "sensitive")
+        for token in (
+            "sensitivecontentdetected",
+            "privacyinformation", "real person", "content policy",
+            "sensitive",
+        )
     )

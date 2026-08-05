@@ -30,6 +30,7 @@ from app.services.conversations import (
     list_conversation_messages,
     list_conversations,
     query_conversation_generation_task,
+    retry_text_conversation_turn,
     send_conversation_message,
     update_conversation,
 )
@@ -66,7 +67,10 @@ async def create_my_conversation(
     current_user: User = Depends(get_current_user),
 ):
     conversation = await create_conversation(db, current_user, payload)
-    return success(data=ConversationOut.model_validate(conversation).model_dump(mode="json"), message="创建成功")
+    return success(
+        data=ConversationOut.model_validate(conversation).model_dump(mode="json"),
+        message="创建成功",
+    )
 
 
 @router.get("/{conversation_id}")
@@ -86,7 +90,10 @@ async def delete_my_conversation(
     current_user: User = Depends(get_current_user),
 ):
     conversation = await delete_conversation(db, conversation_id, current_user.id)
-    return success(data=ConversationOut.model_validate(conversation).model_dump(mode="json"), message="删除成功")
+    return success(
+        data=ConversationOut.model_validate(conversation).model_dump(mode="json"),
+        message="删除成功",
+    )
 
 
 @router.patch("/{conversation_id}")
@@ -97,7 +104,10 @@ async def update_my_conversation(
     current_user: User = Depends(get_current_user),
 ):
     conversation = await update_conversation(db, conversation_id, current_user.id, payload)
-    return success(data=ConversationOut.model_validate(conversation).model_dump(mode="json"), message="更新成功")
+    return success(
+        data=ConversationOut.model_validate(conversation).model_dump(mode="json"),
+        message="更新成功",
+    )
 
 
 @router.get("/{conversation_id}/messages")
@@ -141,7 +151,10 @@ async def delete_my_conversation_message(
         message_id=message_id,
         user_id=current_user.id,
     )
-    return success(data=ConversationMessageOut.model_validate(message).model_dump(mode="json"), message="删除成功")
+    return success(
+        data=ConversationMessageOut.model_validate(message).model_dump(mode="json"),
+        message="删除成功",
+    )
 
 
 @router.get("/{conversation_id}/generation-tasks/{task_record_id}")
@@ -216,6 +229,29 @@ async def send_my_conversation_message(
         task_status=(assistant_message.extra or {}).get("task_status") or "pending",
     )
     return success(data=data.model_dump(mode="json"), message="发送成功")
+
+
+@router.post("/{conversation_id}/messages/{user_message_id}/retry")
+async def retry_my_text_conversation_turn(
+    conversation_id: UUID,
+    user_message_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    user_message, assistant_message, points_cost = await retry_text_conversation_turn(
+        db,
+        conversation_id=conversation_id,
+        user_message_id=user_message_id,
+        user=current_user,
+    )
+    data = ConversationSendMessageOut(
+        user_message=ConversationMessageOut.model_validate(user_message),
+        assistant_message=ConversationMessageOut.model_validate(assistant_message),
+        points_cost=points_cost,
+        task_record_id=_parse_uuid((assistant_message.extra or {}).get("task_record_id")),
+        task_status=(assistant_message.extra or {}).get("task_status") or "pending",
+    )
+    return success(data=data.model_dump(mode="json"), message="重试已提交")
 
 
 @router.get("/{conversation_id}/tasks/{task_id}")

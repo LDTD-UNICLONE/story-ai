@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
-from pydantic import ConfigDict, Field, field_serializer, model_validator
+from pydantic import ConfigDict, Field, field_serializer, field_validator, model_validator
 
 from app.core.public_messages import sanitize_public_data, sanitize_public_message
 from app.schemas.base import SchemaBaseModel
@@ -49,6 +49,10 @@ class ConversationMessageOut(SchemaBaseModel):
     message_type: str
     extra: Dict[str, Any]
     ai_model_id: UUID
+    turn_id: Optional[UUID] = None
+    sequence_no: Optional[int] = None
+    status: Optional[str] = None
+    client_message_id: Optional[str] = None
     created_at: datetime
 
     @field_serializer("content")
@@ -168,7 +172,18 @@ _MESSAGE_EXTRA_COMPAT_FIELDS = {
 class ConversationSendMessageRequest(SchemaBaseModel):
     content: str = Field(..., min_length=1)
     ai_model_id: Optional[UUID] = None
+    client_message_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
     extra: Optional[Dict[str, Any]] = None
+
+    @field_validator("client_message_id")
+    @classmethod
+    def normalize_client_message_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("client_message_id 不能为空")
+        return normalized
 
     @model_validator(mode="before")
     @classmethod

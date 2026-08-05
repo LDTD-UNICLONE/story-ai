@@ -15,6 +15,7 @@ from app.models.project_chapter import ProjectChapter
 from app.models.task_record import UserTaskRecord
 from app.services.points import change_user_points
 from app.services.project_asset_analysis import _asset_config, run_asset_analysis_in_worker
+from app.services.task_execution import TaskExecutionDeferred, prepare_task_execution
 from app.worker import celery_app
 
 
@@ -32,9 +33,15 @@ def run_project_asset_analysis(self, task_record_id: str, chapter_id: str, asset
     try:
         asyncio.run(_run_project_asset_analysis(UUID(task_record_id), UUID(chapter_id), asset_type))
     except SoftTimeLimitExceeded:
-        asyncio.run(_fail_analysis(UUID(task_record_id), UUID(chapter_id), asset_type, "任务执行超时"))
+        asyncio.run(
+            _fail_analysis(UUID(task_record_id), UUID(chapter_id), asset_type, "任务执行超时")
+        )
+    except TaskExecutionDeferred as exc:
+        raise self.retry(countdown=exc.retry_after_seconds) from exc
     except Exception as exc:
-        if self.request.retries < settings.celery_task_max_retries and _is_retryable_provider_error(exc):
+        if self.request.retries < settings.celery_task_max_retries and _is_retryable_provider_error(
+            exc
+        ):
             raise self.retry(exc=exc, countdown=_retry_countdown(self.request.retries)) from exc
         asyncio.run(
             _fail_analysis(
@@ -47,7 +54,9 @@ def run_project_asset_analysis(self, task_record_id: str, chapter_id: str, asset
         )
 
 
-async def _run_project_asset_analysis(task_record_id: UUID, chapter_id: UUID, asset_type: str) -> None:
+async def _run_project_asset_analysis(
+    task_record_id: UUID, chapter_id: UUID, asset_type: str
+) -> None:
     try:
         await _execute_analysis(task_record_id, chapter_id, asset_type)
     finally:
@@ -59,15 +68,13 @@ async def _execute_analysis(task_record_id: UUID, chapter_id: UUID, asset_type: 
     config = _asset_config(asset_type)
     async with WorkerSessionLocal() as db:
         result = await db.execute(
-            select(UserTaskRecord)
-            .where(UserTaskRecord.id == task_record_id)
-            .with_for_update(skip_locked=True)
+            select(UserTaskRecord).where(UserTaskRecord.id == task_record_id).with_for_update()
         )
         task_record = result.scalar_one_or_none()
         chapter = await db.get(ProjectChapter, chapter_id)
         if task_record is None or chapter is None:
             return
-        if task_record.status != "pending":
+        if not prepare_task_execution(task_record):
             return
 
         task_record.status = "running"
@@ -118,7 +125,9 @@ async def _fail_analysis(
             return
         if task_record.status in {"success", "failed"}:
             return
-        await _mark_failed(db, task_record, chapter, config, reason, refund=True, raw_reason=raw_reason)
+        await _mark_failed(
+            db, task_record, chapter, config, reason, refund=True, raw_reason=raw_reason
+        )
 
 
 async def _mark_failed(
@@ -162,7 +171,9 @@ async def _mark_failed(
     await db.commit()
 
 
-async def _mark_retrying(db, task_record: UserTaskRecord, chapter: ProjectChapter, config: dict, reason: str) -> None:
+async def _mark_retrying(
+    db, task_record: UserTaskRecord, chapter: ProjectChapter, config: dict, reason: str
+) -> None:
     reason = sanitize_public_message(reason, fallback="模型服务繁忙，正在重试")
     task_record.status = "pending"
     task_record.result = reason

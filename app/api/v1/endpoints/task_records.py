@@ -136,7 +136,9 @@ def _clean_terminal_retry_extra(data: dict) -> dict:
 
 def _parse_task_record_id(value: str) -> UUID:
     if value in {"", "None", "none", "null", "undefined"}:
-        raise AppException("任务ID不能为空，请确认提交任务接口返回了 task_record_id", code=40018, status_code=400)
+        raise AppException(
+            "任务ID不能为空，请确认提交任务接口返回了 task_record_id", code=40018, status_code=400
+        )
     try:
         return UUID(str(value))
     except (TypeError, ValueError, AttributeError) as exc:

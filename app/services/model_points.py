@@ -116,7 +116,9 @@ def calculate_text_model_points_cost(
         + Decimal(cached_tokens) * Decimal("2") * model_multiplier * cache_multiplier / Decimal("1000000")
         + Decimal(output_tokens) * Decimal("5") * completion_multiplier / Decimal("1000000")
     )
-    points_cost = int((real_cost * platform_multiplier).quantize(Decimal("1"), rounding=ROUND_CEILING))
+    points_cost = int(
+        (real_cost * platform_multiplier).quantize(Decimal("1"), rounding=ROUND_CEILING)
+    )
     detail = {
         "normal_input_tokens": normal_input_tokens,
         "cached_tokens": cached_tokens,
@@ -261,7 +263,9 @@ def _extract_usage(response_extra: Dict[str, Any]) -> Dict[str, Any]:
         response_extra.get("usage"),
         (response_extra.get("provider_response") or {}).get("usage"),
         (response_extra.get("model_result_extra") or {}).get("usage"),
-        ((response_extra.get("model_result_extra") or {}).get("provider_response") or {}).get("usage"),
+        ((response_extra.get("model_result_extra") or {}).get("provider_response") or {}).get(
+            "usage"
+        ),
     ]
     for candidate in candidates:
         if isinstance(candidate, dict):
@@ -296,7 +300,9 @@ def _video_unit_points(ai_model: AiModel, extra: Dict[str, Any]) -> int:
 def _seedance_billing_model_id(model_id: str) -> Optional[str]:
     normalized = model_id.strip().lower()
     for supported_model_id in SEEDANCE_VIDEO_UNIT_POINTS:
-        if normalized == supported_model_id or normalized.endswith(supported_model_id) or supported_model_id in normalized:
+        if (
+            normalized == supported_model_id or normalized.endswith(supported_model_id) or supported_model_id in normalized
+        ):
             return supported_model_id
     if is_volcengine_ark_video_model(normalized):
         return None
@@ -346,7 +352,11 @@ def _looks_like_video_media(value: Any) -> bool:
             or _has_value(value.get("video"))
         )
     if isinstance(value, str):
-        return value.lower().split("?", 1)[0].endswith((".mp4", ".mov", ".webm", ".m4v", ".avi", ".mkv"))
+        return (
+            value.lower()
+            .split("?", 1)[0]
+            .endswith((".mp4", ".mov", ".webm", ".m4v", ".avi", ".mkv"))
+        )
     return False
 
 

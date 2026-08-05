@@ -177,9 +177,7 @@ class ProjectStoryboardUpdateRequest(ProjectStoryboardRequestModel):
         if not isinstance(value, dict):
             return value
         return {
-            key: item
-            for key, item in value.items()
-            if key not in _IGNORED_STORYBOARD_UPDATE_FIELDS
+            key: item for key, item in value.items() if key not in _IGNORED_STORYBOARD_UPDATE_FIELDS
         }
 
 
@@ -230,6 +228,7 @@ class ProjectStoryboardPromptRequest(ProjectStoryboardRequestModel):
 
 
 class ProjectStoryboardImageGenerateRequest(ProjectStoryboardRequestModel):
+    ai_model_id: Optional[UUID] = None
     aspect_ratio: Literal["16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3", "21:9"] = "16:9"
     prompt: Optional[str] = Field(default=None, min_length=1)
     character_ids: List[UUID] = Field(default_factory=list)
@@ -247,7 +246,10 @@ class ProjectStoryboardImageGenerateRequest(ProjectStoryboardRequestModel):
         if "uploaded_images" in data:
             data["uploaded_images"] = [
                 url
-                for url in (_extract_request_media_url(item) for item in _as_request_list(data.get("uploaded_images")))
+                for url in (
+                    _extract_request_media_url(item)
+                    for item in _as_request_list(data.get("uploaded_images"))
+                )
                 if url
             ]
         return data
@@ -293,7 +295,9 @@ class ProjectStoryboardSplitRequest(ProjectStoryboardRequestModel):
 
 class ProjectStoryboardVideoGenerateRequest(ProjectStoryboardRequestModel):
     ai_model_id: UUID
-    generation_mode: Literal["text_to_video", "reference", "first_last_frame", "storyboard"] = "reference"
+    generation_mode: Literal["text_to_video", "reference", "first_last_frame", "storyboard"] = (
+        "reference"
+    )
     resolution: Literal["480p", "720p", "1080p", "4k"] = "720p"
     return_last_frame: bool = False
     prompt: Optional[str] = Field(default=None, min_length=1)
@@ -315,19 +319,20 @@ class ProjectStoryboardVideoGenerateRequest(ProjectStoryboardRequestModel):
             data["generation_mode"] = _normalize_video_generation_mode(data.get("generation_mode"))
         if "uploadedImages" in data and "uploaded_images" not in data:
             data["uploaded_images"] = data.pop("uploadedImages")
-        data["first_frame_url"] = (
-            _extract_request_frame_url(data, FIRST_FRAME_URL_KEYS, FIRST_FRAME_ROLES)
-            or data.get("first_frame_url")
-        )
-        data["last_frame_url"] = (
-            _extract_request_frame_url(data, LAST_FRAME_URL_KEYS, LAST_FRAME_ROLES)
-            or data.get("last_frame_url")
-        )
+        data["first_frame_url"] = _extract_request_frame_url(
+            data, FIRST_FRAME_URL_KEYS, FIRST_FRAME_ROLES
+        ) or data.get("first_frame_url")
+        data["last_frame_url"] = _extract_request_frame_url(
+            data, LAST_FRAME_URL_KEYS, LAST_FRAME_ROLES
+        ) or data.get("last_frame_url")
         _drop_request_frame_aliases(data)
         if "uploaded_images" in data:
             data["uploaded_images"] = [
                 url
-                for url in (_extract_request_media_url(item) for item in _as_request_list(data.get("uploaded_images")))
+                for url in (
+                    _extract_request_media_url(item)
+                    for item in _as_request_list(data.get("uploaded_images"))
+                )
                 if url
             ]
         return data

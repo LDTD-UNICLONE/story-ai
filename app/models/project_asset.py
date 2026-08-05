@@ -1,7 +1,7 @@
 import uuid
 from typing import Optional
 
-from sqlalchemy import Boolean, ForeignKey, JSON, String, Text, text
+from sqlalchemy import Boolean, ForeignKey, Index, JSON, String, Text, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship as orm_relationship
 
@@ -12,6 +12,14 @@ from app.models.project_chapter import ProjectChapter
 
 class ProjectCharacter(Base, TimestampMixin):
     __tablename__ = "project_characters"
+    __table_args__ = (
+        Index(
+            "ix_project_characters_owner_enabled",
+            "project_id",
+            "user_id",
+            "is_enabled",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -59,6 +67,14 @@ class ProjectCharacter(Base, TimestampMixin):
 
 class ProjectScene(Base, TimestampMixin):
     __tablename__ = "project_scenes"
+    __table_args__ = (
+        Index(
+            "ix_project_scenes_owner_enabled",
+            "project_id",
+            "user_id",
+            "is_enabled",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -102,6 +118,14 @@ class ProjectScene(Base, TimestampMixin):
 
 class ProjectProp(Base, TimestampMixin):
     __tablename__ = "project_props"
+    __table_args__ = (
+        Index(
+            "ix_project_props_owner_enabled",
+            "project_id",
+            "user_id",
+            "is_enabled",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),

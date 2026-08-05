@@ -1,7 +1,7 @@
 from typing import List, Optional, Tuple
 from uuid import UUID
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -116,11 +116,20 @@ async def get_ai_model_or_404(
 
 async def create_ai_model(db: AsyncSession, payload: AiModelCreateRequest) -> AiModel:
     data = payload.model_dump()
-    data["vendor"] = _normalize_ai_model_vendor(data["vendor"], data["model_type"], data["model_id"])
-    if _is_ark_video_model(data["vendor"], data["model_type"], data["model_id"]) and not data.get("capabilities"):
+    _validate_agent_default(data["model_type"], data["is_enabled"], data["is_agent_default"])
+    data["vendor"] = _normalize_ai_model_vendor(
+        data["vendor"], data["model_type"], data["model_id"]
+    )
+    if _is_ark_video_model(data["vendor"], data["model_type"], data["model_id"]) and not data.get(
+        "capabilities"
+    ):
         data["capabilities"] = merge_ark_video_capabilities(data["model_id"], {})
-    if _is_comfly_model(data["vendor"], data["model_id"]) and data["model_type"] == "video" and not data.get("capabilities"):
+    if (
+        _is_comfly_model(data["vendor"], data["model_id"]) and data["model_type"] == "video" and not data.get("capabilities")
+    ):
         data["capabilities"] = merge_video_capabilities(data["model_id"], {})
+    if data["is_agent_default"]:
+        await _clear_agent_default(db, data["model_type"])
     ai_model = AiModel(**data)
     db.add(ai_model)
     try:
@@ -142,7 +151,9 @@ async def import_provider_models(
     skipped: List[str] = []
 
     for item in models:
-        vendor = _normalize_ai_model_vendor(item.vendor or default_vendor, item.model_type, item.model_id)
+        vendor = _normalize_ai_model_vendor(
+            item.vendor or default_vendor, item.model_type, item.model_id
+        )
         exists = await db.execute(select(AiModel).where(AiModel.model_id == item.model_id))
         if exists.scalar_one_or_none() is not None:
             skipped.append(item.model_id)
@@ -160,6 +171,7 @@ async def import_provider_models(
             completion_multiplier=item.completion_multiplier,
             platform_multiplier=item.platform_multiplier,
             is_enabled=item.is_enabled,
+            is_agent_default=item.is_agent_default,
             capabilities=(
                 item.capabilities
                 or (
@@ -174,6 +186,13 @@ async def import_provider_models(
                 )
             ),
         )
+        _validate_agent_default(
+            ai_model.model_type,
+            ai_model.is_enabled,
+            ai_model.is_agent_default,
+        )
+        if ai_model.is_agent_default:
+            await _clear_agent_default(db, ai_model.model_type)
         db.add(ai_model)
         created.append(ai_model)
 
@@ -199,7 +218,9 @@ async def update_ai_model(
 
     if "model_id" in update_data and update_data["model_id"] != ai_model.model_id:
         exists = await db.execute(
-            select(AiModel).where(AiModel.model_id == update_data["model_id"], AiModel.id != ai_model_id)
+            select(AiModel).where(
+                AiModel.model_id == update_data["model_id"], AiModel.id != ai_model_id
+            )
         )
         if exists.scalar_one_or_none() is not None:
             raise AppException("模型 ID 已存在", code=40902, status_code=409)
@@ -207,14 +228,26 @@ async def update_ai_model(
     vendor = update_data.get("vendor", ai_model.vendor)
     model_type = update_data.get("model_type", ai_model.model_type)
     model_id = update_data.get("model_id", ai_model.model_id)
+    is_enabled = update_data.get("is_enabled", ai_model.is_enabled)
+    is_agent_default = update_data.get("is_agent_default", ai_model.is_agent_default)
+    if not is_enabled:
+        is_agent_default = False
+        update_data["is_agent_default"] = False
+    _validate_agent_default(model_type, is_enabled, is_agent_default)
+    if is_agent_default:
+        await _clear_agent_default(db, model_type, exclude_id=ai_model.id)
     update_data["vendor"] = _normalize_ai_model_vendor(vendor, model_type, model_id)
 
     for field, value in update_data.items():
         setattr(ai_model, field, value)
 
-    if _is_ark_video_model(ai_model.vendor, ai_model.model_type, ai_model.model_id) and not ai_model.capabilities:
+    if (
+        _is_ark_video_model(ai_model.vendor, ai_model.model_type, ai_model.model_id) and not ai_model.capabilities
+    ):
         ai_model.capabilities = merge_ark_video_capabilities(ai_model.model_id, {})
-    if _is_comfly_model(ai_model.vendor, ai_model.model_id) and ai_model.model_type == "video" and not ai_model.capabilities:
+    if (
+        _is_comfly_model(ai_model.vendor, ai_model.model_id) and ai_model.model_type == "video" and not ai_model.capabilities
+    ):
         ai_model.capabilities = merge_video_capabilities(ai_model.model_id, {})
 
     try:
@@ -230,6 +263,7 @@ async def update_ai_model(
 async def delete_ai_model(db: AsyncSession, ai_model_id: UUID) -> AiModel:
     ai_model = await get_ai_model_or_404(db, ai_model_id)
     ai_model.is_enabled = False
+    ai_model.is_agent_default = False
     await db.commit()
     await db.refresh(ai_model)
     return ai_model
@@ -241,3 +275,40 @@ def _normalize_ai_model_vendor(vendor: str, model_type: str, model_id: str) -> s
     if model_type == "video" and is_volcengine_ark_video_model(model_id):
         return VOLCENGINE_ARK_VENDOR
     return "comfly"
+
+
+def _validate_agent_default(
+    model_type: str,
+    is_enabled: bool,
+    is_agent_default: bool,
+) -> None:
+    if not is_agent_default:
+        return
+    if model_type not in {"text", "image", "video"}:
+        raise AppException(
+            "Agent 默认模型类型必须是 text、image 或 video",
+            code=40061,
+            status_code=400,
+        )
+    if not is_enabled:
+        raise AppException(
+            "未启用的模型不能设为 Agent 默认模型",
+            code=40061,
+            status_code=400,
+        )
+
+
+async def _clear_agent_default(
+    db: AsyncSession,
+    model_type: str,
+    exclude_id: Optional[UUID] = None,
+) -> None:
+    conditions = [
+        AiModel.model_type == model_type,
+        AiModel.is_agent_default.is_(True),
+    ]
+    if exclude_id is not None:
+        conditions.append(AiModel.id != exclude_id)
+    await db.execute(
+        update(AiModel).where(*conditions).values(is_agent_default=False)
+    )

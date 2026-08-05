@@ -142,7 +142,11 @@ async def create_material_from_upload(
     if not content_type.startswith("image/"):
         raise AppException("素材库仅支持上传图像文件", code=40020, status_code=400)
 
-    uploaded = await upload_story_file(file, category=MATERIAL_UPLOAD_CATEGORY)
+    uploaded = await upload_story_file(
+        file,
+        category=MATERIAL_UPLOAD_CATEGORY,
+        media_only=True,
+    )
     material = Material(
         name=_clean_required_text(name, "图像名", 128),
         category=_clean_required_text(category, "分类", 64),
@@ -188,7 +192,11 @@ async def update_material(
         content_type = detect_content_type(file.filename, file.content_type or "")
         if not content_type.startswith("image/"):
             raise AppException("素材库仅支持上传图像文件", code=40020, status_code=400)
-        uploaded = await upload_story_file(file, category=MATERIAL_UPLOAD_CATEGORY)
+        uploaded = await upload_story_file(
+            file,
+            category=MATERIAL_UPLOAD_CATEGORY,
+            media_only=True,
+        )
         material.image_url = uploaded.url
         material.image_object_key = uploaded.object_key
         material.filename = uploaded.filename

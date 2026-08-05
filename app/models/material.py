@@ -1,7 +1,7 @@
 import uuid
 from typing import Optional
 
-from sqlalchemy import Boolean, Integer, String, Text, text
+from sqlalchemy import Boolean, Index, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -10,6 +10,9 @@ from app.db.base import Base, TimestampMixin
 
 class Material(Base, TimestampMixin):
     __tablename__ = "materials"
+    __table_args__ = (
+        Index("ix_materials_is_enabled_sort_order", "is_enabled", "sort_order"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),

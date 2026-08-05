@@ -184,7 +184,9 @@ def _build_summary(items: List[Dict[str, Any]]) -> Dict[str, Any]:
         status_code = item.get("status_code")
         if status_code not in (None, ""):
             status_key = str(status_code)
-            summary["status_code_counts"][status_key] = summary["status_code_counts"].get(status_key, 0) + 1
+            summary["status_code_counts"][status_key] = (
+                summary["status_code_counts"].get(status_key, 0) + 1
+            )
             try:
                 if int(status_code) >= 400:
                     summary["error_count"] += 1

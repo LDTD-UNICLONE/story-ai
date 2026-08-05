@@ -9,7 +9,9 @@ from app.core.responses import success
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.style import StyleCreateRequest, StyleListOut, StyleOut, StyleUpdateRequest
-from app.services.styles import create_style, delete_style, get_style_or_404, list_styles, update_style
+from app.services.styles import ( create_style, delete_style, get_style_or_404, list_styles,
+    update_style,
+)
 
 router = APIRouter(prefix="/admin/styles")
 

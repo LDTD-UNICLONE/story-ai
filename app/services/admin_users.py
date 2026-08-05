@@ -132,6 +132,7 @@ async def update_user(db: AsyncSession, user_id: UUID, payload: AdminUserUpdateR
 async def reset_user_password(db: AsyncSession, user_id: UUID, password: str) -> User:
     user = await get_user_or_404(db, user_id)
     user.password_hash = hash_password(password)
+    user.token_version += 1
     await db.commit()
     await db.refresh(user)
     return user

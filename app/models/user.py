@@ -22,10 +22,18 @@ class User(Base, TimestampMixin):
     nickname: Mapped[str] = mapped_column(String(64), nullable=False)
     avatar: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     phone: Mapped[Optional[str]] = mapped_column(String(32), unique=True, index=True, nullable=True)
-    email: Mapped[Optional[str]] = mapped_column(String(255), unique=True, index=True, nullable=True)
+    email: Mapped[Optional[str]] = mapped_column(
+        String(255), unique=True, index=True, nullable=True
+    )
     is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     points_balance: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
+    token_version: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
         default=0,

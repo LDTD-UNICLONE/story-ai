@@ -319,7 +319,9 @@ async def build_report(
         extra_numeric_fields=[field for field, _title in model_field_titles],
     )
     totals["recharge_amount_yuan"] = _format_cents_yuan(totals["recharge_amount_cents"])
-    totals["recharge_refund_amount_yuan"] = _format_cents_yuan(totals["recharge_refund_amount_cents"])
+    totals["recharge_refund_amount_yuan"] = _format_cents_yuan(
+        totals["recharge_refund_amount_cents"]
+    )
 
     field_titles = _field_titles(detail, model_field_titles)
     report: dict[str, Any] = {
@@ -606,7 +608,9 @@ async def _merge_recharge_orders(
         row["recharge_order_points"] += int(item["recharge_order_points"] or 0)
         row["recharge_amount_cents"] += int(item["recharge_amount_cents"] or 0)
 
-    refund_where_sql, refund_params = _time_where("refunded_at", "refund_order", start_at, end_before)
+    refund_where_sql, refund_params = _time_where(
+        "refunded_at", "refund_order", start_at, end_before
+    )
     refund_where_sql += " AND refunded_at IS NOT NULL AND status = 'refunded'"
     if user_id:
         refund_where_sql += " AND user_id = :user_id"
@@ -874,7 +878,9 @@ def _localize_row(row: dict[str, Any], field_titles: tuple[tuple[str, str], ...]
     return {title: row.get(field) for field, title in field_titles}
 
 
-def _localize_totals(totals: dict[str, Any], field_titles: tuple[tuple[str, str], ...]) -> dict[str, Any]:
+def _localize_totals(
+    totals: dict[str, Any], field_titles: tuple[tuple[str, str], ...]
+) -> dict[str, Any]:
     localized = {"用户数": totals["user_count"]}
     for field, title in field_titles:
         if field in totals:
@@ -938,7 +944,9 @@ def _date_range_to_datetimes(
 ) -> tuple[Optional[datetime], Optional[datetime]]:
     timezone = ZoneInfo(settings.timezone)
     start_at = datetime.combine(start_date, time.min, timezone) if start_date else None
-    end_before = datetime.combine(end_date + timedelta(days=1), time.min, timezone) if end_date else None
+    end_before = (
+        datetime.combine(end_date + timedelta(days=1), time.min, timezone) if end_date else None
+    )
     return start_at, end_before
 
 
@@ -984,7 +992,9 @@ def _write_report(
 
     if output_format == "csv":
         rows = report["用户"]
-        fieldnames = list(rows[0].keys()) if rows else [title for _field, title in _field_titles(detail)]
+        fieldnames = (
+            list(rows[0].keys()) if rows else [title for _field, title in _field_titles(detail)]
+        )
         if output_path:
             with Path(output_path).open("w", encoding="utf-8-sig", newline="") as file:
                 writer = csv.DictWriter(file, fieldnames=fieldnames)
@@ -1021,7 +1031,9 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="统计每个用户的积分消耗、文本/图像/视频任务成本、充值、退款和分配记录。",
     )
-    parser.add_argument("--start-date", help="统计开始日期，格式 YYYY-MM-DD，按配置时区的自然日过滤。")
+    parser.add_argument(
+        "--start-date", help="统计开始日期，格式 YYYY-MM-DD，按配置时区的自然日过滤。"
+    )
     parser.add_argument("--end-date", help="统计结束日期，格式 YYYY-MM-DD，包含当天。")
     parser.add_argument("--user-id", help="只统计指定用户 UUID。")
     parser.add_argument(

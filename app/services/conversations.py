@@ -1,5 +1,5 @@
 from typing import Any, Dict, List, Optional, Tuple
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,7 +7,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.timezone import beijing_datetime
 from app.core.exceptions import AppException
 from app.integrations import comfly
-from app.integrations.comfly_video_specs import merge_video_capabilities as merge_comfly_video_capabilities
+from app.integrations.comfly_video_specs import (
+    merge_video_capabilities as merge_comfly_video_capabilities,
+)
 from app.integrations.volcengine_ark_video_specs import (
     is_known_video_resolution,
     is_video_resolution_supported,
@@ -19,7 +21,10 @@ from app.models.ai_model import AiModel
 from app.models.conversation import Conversation, ConversationMessage
 from app.models.task_record import UserTaskRecord
 from app.models.user import User
-from app.schemas.conversation import ConversationCreateRequest, ConversationSendMessageRequest, ConversationUpdateRequest
+from app.schemas.conversation import (
+    ConversationCreateRequest, ConversationSendMessageRequest,
+    ConversationUpdateRequest,
+)
 from app.services.model_runner import ModelRunResult
 from app.services.model_points import calculate_submission_points_cost
 from app.services.points import change_user_points, consume_user_points
@@ -35,6 +40,7 @@ from app.tasks.model_generation import run_conversation_generation
 
 SUPPORTED_CONVERSATION_TYPES = {"text", "image", "video"}
 DEFAULT_TEXT_CONTEXT_MESSAGE_LIMIT = 20
+DEFAULT_TEXT_CONTEXT_MESSAGE_SCAN_LIMIT = 60
 CONVERSATION_VIDEO_MODE_TO_PROVIDER_MODE = {
     "text_to_video": "text_to_video",
     "reference": "image_to_video",
@@ -380,7 +386,7 @@ async def list_conversation_messages(
     page_size: int,
     order: str = "desc",
 ) -> Tuple[List[ConversationMessage], int]:
-    await get_conversation_or_404(db, conversation_id, user_id)
+    conversation = await get_conversation_or_404(db, conversation_id, user_id)
 
     count_result = await db.execute(
         select(func.count())
@@ -389,11 +395,26 @@ async def list_conversation_messages(
     )
     total = count_result.scalar_one()
 
-    order_by = (
-        (ConversationMessage.created_at.desc(), ConversationMessage.id.desc())
-        if order == "desc"
-        else (ConversationMessage.created_at.asc(), ConversationMessage.id.asc())
-    )
+    if conversation.conversation_type == "text":
+        order_by = (
+            (
+                ConversationMessage.sequence_no.desc().nullslast(),
+                ConversationMessage.created_at.desc(),
+                ConversationMessage.id.desc(),
+            )
+            if order == "desc"
+            else (
+                ConversationMessage.sequence_no.asc().nullsfirst(),
+                ConversationMessage.created_at.asc(),
+                ConversationMessage.id.asc(),
+            )
+        )
+    else:
+        order_by = (
+            (ConversationMessage.created_at.desc(), ConversationMessage.id.desc())
+            if order == "desc"
+            else (ConversationMessage.created_at.asc(), ConversationMessage.id.asc())
+        )
     result = await db.execute(
         select(ConversationMessage)
         .where(ConversationMessage.conversation_id == conversation_id)
@@ -507,7 +528,10 @@ async def _sync_assistant_message_from_task_record(
     current_status = (assistant_message.extra or {}).get("task_status")
     expected_content = _terminal_assistant_content(task_record)
     should_sync_content = bool(expected_content and assistant_message.content != expected_content)
-    if current_status == expected_status and not should_sync_content:
+    status_is_synced = (
+        assistant_message.message_type != "text" or assistant_message.status == expected_status
+    )
+    if current_status == expected_status and status_is_synced and not should_sync_content:
         return
 
     assistant_message.extra = {
@@ -525,6 +549,8 @@ async def _sync_assistant_message_from_task_record(
         }
     if expected_content:
         assistant_message.content = expected_content
+    if assistant_message.message_type == "text":
+        assistant_message.status = expected_status
     await db.commit()
     await db.refresh(task_record)
     await db.refresh(assistant_message)
@@ -537,6 +563,21 @@ async def send_conversation_message(
     payload: ConversationSendMessageRequest,
 ) -> Tuple[ConversationMessage, ConversationMessage, int]:
     conversation = await get_conversation_or_404(db, conversation_id, user.id)
+    if conversation.conversation_type == "text":
+        await expire_stale_task_records(
+            db,
+            user_id=user.id,
+            business_type="conversation",
+            generation_type="text",
+        )
+        conversation = await _lock_text_conversation(db, conversation_id, user.id)
+        existing_submission = await _find_idempotent_text_submission(
+            db, conversation, payload
+        )
+        if existing_submission is not None:
+            return existing_submission
+        await _ensure_no_active_text_generation(db, conversation)
+
     selected_ai_model_id = payload.ai_model_id or conversation.ai_model_id
     ai_model = await get_enabled_conversation_model_or_404(
         db,
@@ -559,8 +600,12 @@ async def send_conversation_message(
         extra=payload.extra or {},
         ai_model=ai_model,
     )
-    _validate_comfly_conversation_request(ai_model, conversation_type, payload.content, message_extra)
-    ai_model_points_cost = calculate_submission_points_cost(ai_model, conversation_type, message_extra)
+    _validate_comfly_conversation_request(
+        ai_model, conversation_type, payload.content, message_extra
+    )
+    ai_model_points_cost = calculate_submission_points_cost(
+        ai_model, conversation_type, message_extra
+    )
 
     points_transaction = None
     if ai_model_points_cost > 0:
@@ -572,6 +617,12 @@ async def send_conversation_message(
             auto_commit=False,
         )
 
+    turn_id = uuid4() if conversation_type == "text" else None
+    first_sequence_no = (
+        await _next_text_sequence_no(db, conversation_db_id)
+        if conversation_type == "text"
+        else None
+    )
     user_message = ConversationMessage(
         conversation_id=conversation_db_id,
         user_id=user.id,
@@ -580,6 +631,10 @@ async def send_conversation_message(
         message_type=conversation_type,
         extra=payload.extra or {},
         ai_model_id=ai_model_db_id,
+        turn_id=turn_id,
+        sequence_no=first_sequence_no,
+        status="success" if conversation_type == "text" else None,
+        client_message_id=(payload.client_message_id if conversation_type == "text" else None),
     )
     assistant_message = ConversationMessage(
         conversation_id=conversation_db_id,
@@ -589,6 +644,9 @@ async def send_conversation_message(
         message_type=conversation_type,
         extra={"task_status": "pending"},
         ai_model_id=ai_model_db_id,
+        turn_id=turn_id,
+        sequence_no=(first_sequence_no + 1 if first_sequence_no is not None else None),
+        status="pending" if conversation_type == "text" else None,
     )
     db.add(user_message)
     db.add(assistant_message)
@@ -607,10 +665,14 @@ async def send_conversation_message(
         points_cost=ai_model_points_cost,
         extra={
             "conversation_id": str(conversation_db_id),
+            "turn_id": str(turn_id) if turn_id else None,
+            "user_message_id": None,
             "assistant_message_id": None,
+            "submission_points_cost": ai_model_points_cost,
             "user_message_extra": message_extra,
             "assistant_message_extra": {},
         },
+        expire_stale=conversation_type != "text",
     )
     await db.flush()
     assistant_message.extra = {
@@ -619,6 +681,7 @@ async def send_conversation_message(
     }
     task_record.extra = {
         **(task_record.extra or {}),
+        "user_message_id": str(user_message.id),
         "assistant_message_id": str(assistant_message.id),
     }
     await db.execute(
@@ -652,6 +715,290 @@ async def send_conversation_message(
         )
         await db.refresh(assistant_message)
     return user_message, assistant_message, ai_model_points_cost
+
+
+async def _lock_text_conversation(
+    db: AsyncSession,
+    conversation_id: UUID,
+    user_id: UUID,
+) -> Conversation:
+    result = await db.execute(
+        select(Conversation)
+        .where(
+            Conversation.id == conversation_id,
+            Conversation.user_id == user_id,
+            Conversation.is_enabled.is_(True),
+            Conversation.conversation_type == "text",
+        )
+        .with_for_update()
+    )
+    conversation = result.scalar_one_or_none()
+    if conversation is None:
+        raise AppException("文本会话不存在", code=40405, status_code=404)
+    return conversation
+
+
+async def _find_idempotent_text_submission(
+    db: AsyncSession,
+    conversation: Conversation,
+    payload: ConversationSendMessageRequest,
+) -> Optional[Tuple[ConversationMessage, ConversationMessage, int]]:
+    if not payload.client_message_id:
+        return None
+
+    result = await db.execute(
+        select(ConversationMessage).where(
+            ConversationMessage.conversation_id == conversation.id,
+            ConversationMessage.role == "user",
+            ConversationMessage.message_type == "text",
+            ConversationMessage.client_message_id == payload.client_message_id,
+        )
+    )
+    user_message = result.scalar_one_or_none()
+    if user_message is None:
+        return None
+
+    model_mismatch = (
+        payload.ai_model_id is not None and user_message.ai_model_id != payload.ai_model_id
+    )
+    if (
+        user_message.content != payload.content
+        or model_mismatch
+        or (user_message.extra or {}) != (payload.extra or {})
+    ):
+        raise AppException(
+            "client_message_id 已用于其他文本消息",
+            code=40997,
+            status_code=409,
+        )
+
+    assistant_result = await db.execute(
+        select(ConversationMessage)
+        .where(
+            ConversationMessage.conversation_id == conversation.id,
+            ConversationMessage.turn_id == user_message.turn_id,
+            ConversationMessage.role == "assistant",
+            ConversationMessage.message_type == "text",
+        )
+        .order_by(
+            ConversationMessage.sequence_no.desc().nullslast(),
+            ConversationMessage.created_at.desc(),
+        )
+        .limit(1)
+    )
+    assistant_message = assistant_result.scalar_one_or_none()
+    if assistant_message is None:
+        raise AppException(
+            "幂等文本消息缺少对应回答记录",
+            code=40998,
+            status_code=409,
+        )
+
+    task_record_id = _parse_uuid((assistant_message.extra or {}).get("task_record_id"))
+    task_record = await db.get(UserTaskRecord, task_record_id) if task_record_id else None
+    points_cost = (
+        int((task_record.extra or {}).get("submission_points_cost", task_record.points_cost))
+        if task_record
+        else 0
+    )
+    return user_message, assistant_message, points_cost
+
+
+async def _ensure_no_active_text_generation(
+    db: AsyncSession,
+    conversation: Conversation,
+) -> None:
+    result = await db.execute(
+        select(UserTaskRecord)
+        .where(
+            UserTaskRecord.business_type == "conversation",
+            UserTaskRecord.business_id == conversation.id,
+            UserTaskRecord.generation_type == "text",
+            UserTaskRecord.status.in_(("pending", "running")),
+        )
+        .order_by(UserTaskRecord.created_at.desc())
+        .limit(1)
+    )
+    active_task = result.scalar_one_or_none()
+    if active_task is None:
+        return
+    raise AppException(
+        "当前文本会话仍有消息正在生成，请等待完成后再发送",
+        code=40996,
+        status_code=409,
+        data={
+            "active_task_record_id": str(active_task.id),
+            "assistant_message_id": (active_task.extra or {}).get("assistant_message_id"),
+        },
+    )
+
+
+async def _next_text_sequence_no(db: AsyncSession, conversation_id: UUID) -> int:
+    result = await db.execute(
+        select(func.max(ConversationMessage.sequence_no)).where(
+            ConversationMessage.conversation_id == conversation_id,
+            ConversationMessage.message_type == "text",
+        )
+    )
+    return int(result.scalar_one() or 0) + 1
+
+
+async def retry_text_conversation_turn(
+    db: AsyncSession,
+    conversation_id: UUID,
+    user_message_id: UUID,
+    user: User,
+) -> Tuple[ConversationMessage, ConversationMessage, int]:
+    conversation = await get_conversation_or_404(db, conversation_id, user.id)
+    if conversation.conversation_type != "text":
+        raise AppException("只有文本会话支持失败重试", code=40014, status_code=400)
+
+    await expire_stale_task_records(
+        db,
+        user_id=user.id,
+        business_type="conversation",
+        generation_type="text",
+    )
+    conversation = await _lock_text_conversation(db, conversation_id, user.id)
+    await _ensure_no_active_text_generation(db, conversation)
+
+    result = await db.execute(
+        select(ConversationMessage).where(
+            ConversationMessage.id == user_message_id,
+            ConversationMessage.conversation_id == conversation.id,
+            ConversationMessage.user_id == user.id,
+            ConversationMessage.role == "user",
+            ConversationMessage.message_type == "text",
+        )
+    )
+    user_message = result.scalar_one_or_none()
+    if user_message is None:
+        raise AppException("文本用户消息不存在", code=40407, status_code=404)
+    if user_message.turn_id is None:
+        raise AppException("旧版文本消息不支持按轮次重试", code=40999, status_code=409)
+
+    assistant_result = await db.execute(
+        select(ConversationMessage)
+        .where(
+            ConversationMessage.conversation_id == conversation.id,
+            ConversationMessage.turn_id == user_message.turn_id,
+            ConversationMessage.role == "assistant",
+            ConversationMessage.message_type == "text",
+        )
+        .order_by(
+            ConversationMessage.sequence_no.desc().nullslast(),
+            ConversationMessage.created_at.desc(),
+        )
+        .limit(1)
+    )
+    previous_assistant = assistant_result.scalar_one_or_none()
+    previous_status = (
+        previous_assistant.status
+        if previous_assistant is not None
+        else None
+    ) or ((previous_assistant.extra or {}).get("task_status") if previous_assistant else None)
+    if previous_assistant is None or previous_status != "failed":
+        raise AppException("只有生成失败的文本轮次可以重试", code=40995, status_code=409)
+
+    ai_model = await get_enabled_conversation_model_or_404(
+        db,
+        user_message.ai_model_id,
+        "text",
+    )
+    raw_extra = dict(user_message.extra or {})
+    raw_extra.pop("messages", None)
+    message_extra = await _build_message_extra_with_context(
+        db,
+        conversation_id=conversation.id,
+        conversation_type="text",
+        content=user_message.content,
+        extra=raw_extra,
+        ai_model=ai_model,
+    )
+    _validate_comfly_conversation_request(ai_model, "text", user_message.content, message_extra)
+    points_cost = calculate_submission_points_cost(ai_model, "text", message_extra)
+    points_transaction = None
+    if points_cost > 0:
+        points_transaction = await consume_user_points(
+            db,
+            user_id=user.id,
+            amount=points_cost,
+            remark=f"对话模型调用：{ai_model.nickname}",
+            auto_commit=False,
+        )
+
+    assistant_message = ConversationMessage(
+        conversation_id=conversation.id,
+        user_id=user.id,
+        role="assistant",
+        content="任务已提交，正在重新生成中",
+        message_type="text",
+        extra={
+            "task_status": "pending",
+            "retry_of_assistant_message_id": str(previous_assistant.id),
+        },
+        ai_model_id=ai_model.id,
+        turn_id=user_message.turn_id,
+        sequence_no=await _next_text_sequence_no(db, conversation.id),
+        status="pending",
+    )
+    db.add(assistant_message)
+    task_record = await create_user_task_record(
+        db,
+        user_id=user.id,
+        ai_model_id=ai_model.id,
+        points_transaction_id=points_transaction.id if points_transaction else None,
+        business_type="conversation",
+        business_id=conversation.id,
+        generation_type="text",
+        status="pending",
+        title=conversation.title,
+        prompt=user_message.content,
+        result=None,
+        points_cost=points_cost,
+        extra={
+            "conversation_id": str(conversation.id),
+            "turn_id": str(user_message.turn_id),
+            "user_message_id": str(user_message.id),
+            "assistant_message_id": None,
+            "retry_of_assistant_message_id": str(previous_assistant.id),
+            "submission_points_cost": points_cost,
+            "user_message_extra": message_extra,
+            "assistant_message_extra": {},
+        },
+        expire_stale=False,
+    )
+    await db.flush()
+    assistant_message.extra = {
+        **(assistant_message.extra or {}),
+        "task_record_id": str(task_record.id),
+    }
+    task_record.extra = {
+        **(task_record.extra or {}),
+        "assistant_message_id": str(assistant_message.id),
+    }
+    conversation.updated_at = beijing_datetime()
+    await db.commit()
+    await db.refresh(user_message)
+    await db.refresh(assistant_message)
+
+    try:
+        run_conversation_generation.apply_async(
+            args=(str(task_record.id), str(assistant_message.id)),
+            queue="story_ai_text",
+            routing_key="story_ai_text",
+        )
+    except Exception:
+        await _mark_conversation_generation_enqueue_failed(
+            db,
+            task_record.id,
+            assistant_message.id,
+            user.id,
+            points_cost,
+            conversation.title,
+        )
+        await db.refresh(assistant_message)
+    return user_message, assistant_message, points_cost
 
 
 def _conversation_generation_queue(conversation_type: str) -> str:
@@ -692,14 +1039,15 @@ async def _build_message_extra_with_context(
     ai_model: Optional[AiModel] = None,
 ) -> Dict[str, Any]:
     if conversation_type == "video":
-        return _build_video_message_extra(extra, ai_model)
+        return await _build_video_message_extra(extra, ai_model)
     if conversation_type != "text":
         return extra
-    if extra.get("messages"):
-        return {
-            **extra,
-            "messages": _normalize_text_request_messages(extra.get("messages"), content, extra),
-        }
+    if "messages" in extra:
+        raise AppException(
+            "文本对话历史消息由后端维护，不能提交 extra.messages",
+            code=40013,
+            status_code=400,
+        )
 
     chat_mode = str(extra.get("chat_mode") or extra.get("capability") or "chat")
     if chat_mode != "chat":
@@ -709,20 +1057,30 @@ async def _build_message_extra_with_context(
     return {**extra, "messages": messages}
 
 
-def _build_video_message_extra(extra: Dict[str, Any], ai_model: Optional[AiModel] = None) -> Dict[str, Any]:
-    generation_mode = _normalize_conversation_video_generation_mode(extra.get("generation_mode"), extra)
+async def _build_video_message_extra(
+    extra: Dict[str, Any], ai_model: Optional[AiModel] = None
+) -> Dict[str, Any]:
+    generation_mode = _normalize_conversation_video_generation_mode(
+        extra.get("generation_mode"), extra
+    )
     payload = dict(extra)
     payload["generation_mode"] = generation_mode
-    payload["resolution"] = _normalize_conversation_video_resolution(ai_model, payload.get("resolution"))
+    payload["resolution"] = _normalize_conversation_video_resolution(
+        ai_model, payload.get("resolution")
+    )
     provider_mode = CONVERSATION_VIDEO_MODE_TO_PROVIDER_MODE[generation_mode]
     payload["video_mode"] = provider_mode
     payload["capability"] = provider_mode
 
     if generation_mode == "text_to_video":
         if _has_video_media_input(payload):
-            raise AppException("文生视频不能传入参考图片、参考视频、参考音频或首尾帧图片", code=40012, status_code=400)
+            raise AppException(
+                "文生视频不能传入参考图片、参考视频、参考音频或首尾帧图片",
+                code=40012,
+                status_code=400,
+            )
         _drop_video_media_keys(payload)
-        _validate_conversation_video_model_capability(ai_model, payload, generation_mode)
+        await _validate_conversation_video_model_capability(ai_model, payload, generation_mode)
         return payload
 
     if generation_mode == "reference":
@@ -754,17 +1112,21 @@ def _build_video_message_extra(extra: Dict[str, Any], ai_model: Optional[AiModel
             payload["audios"] = reference_audios
             payload["audio_urls"] = reference_audios
         if reference_audios and not (reference_images or reference_videos):
-            raise AppException("参考音频不能单独使用，需要同时传入参考图片或参考视频", code=40012, status_code=400)
+            raise AppException(
+                "参考音频不能单独使用，需要同时传入参考图片或参考视频", code=40012, status_code=400
+            )
         if not reference_images and not reference_videos:
             raise AppException(
                 "参考生成需要至少传入参考图片或参考视频；上传后请把 /uploads/file 返回的 data.url 放入 extra.uploaded_images 或 extra.reference_video_url",
                 code=40012,
                 status_code=400,
             )
-        provider_mode = _reference_video_provider_mode(reference_images, reference_videos, reference_audios)
+        provider_mode = _reference_video_provider_mode(
+            reference_images, reference_videos, reference_audios
+        )
         payload["video_mode"] = provider_mode
         payload["capability"] = provider_mode
-        _validate_conversation_video_model_capability(ai_model, payload, generation_mode)
+        await _validate_conversation_video_model_capability(ai_model, payload, generation_mode)
         _drop_reference_media_source_keys(payload)
         _drop_frame_url_keys(payload)
         payload.pop("media", None)
@@ -779,10 +1141,14 @@ def _build_video_message_extra(extra: Dict[str, Any], ai_model: Optional[AiModel
 
     media_items = []
     payload["first_frame_url"] = first_frame_url
-    media_items.append({"type": "image_url", "image_url": {"url": first_frame_url}, "role": "first_frame"})
+    media_items.append(
+        {"type": "image_url", "image_url": {"url": first_frame_url}, "role": "first_frame"}
+    )
     if last_frame_url:
         payload["last_frame_url"] = last_frame_url
-        media_items.append({"type": "image_url", "image_url": {"url": last_frame_url}, "role": "last_frame"})
+        media_items.append(
+            {"type": "image_url", "image_url": {"url": last_frame_url}, "role": "last_frame"}
+        )
     payload["media_items"] = media_items
     payload.pop("images", None)
     payload.pop("image_urls", None)
@@ -791,7 +1157,7 @@ def _build_video_message_extra(extra: Dict[str, Any], ai_model: Optional[AiModel
     payload.pop("media", None)
     payload.pop("content", None)
     _drop_frame_url_keys(payload, keep={"first_frame_url", "last_frame_url"})
-    _validate_conversation_video_model_capability(ai_model, payload, generation_mode)
+    await _validate_conversation_video_model_capability(ai_model, payload, generation_mode)
     return payload
 
 
@@ -807,7 +1173,7 @@ def _reference_video_provider_mode(
     return "image_to_video"
 
 
-def _validate_conversation_video_model_capability(
+async def _validate_conversation_video_model_capability(
     ai_model: Optional[AiModel],
     payload: Dict[str, Any],
     generation_mode: str,
@@ -828,14 +1194,22 @@ def _validate_conversation_video_model_capability(
 
     if generation_mode == "text_to_video":
         if modes and "text_to_video" not in modes:
-            raise AppException("当前模型不支持文生视频，请切换支持文生视频的模型", code=40012, status_code=400)
+            raise AppException(
+                "当前模型不支持文生视频，请切换支持文生视频的模型", code=40012, status_code=400
+            )
         return
 
     if generation_mode == "first_last_frame":
         if modes and "first_last_frame" not in modes:
-            raise AppException("当前模型不支持首尾帧生成，请切换支持首尾帧的模型", code=40012, status_code=400)
+            raise AppException(
+                "当前模型不支持首尾帧生成，请切换支持首尾帧的模型", code=40012, status_code=400
+            )
         if not _supports_image_reference(ai_model, capabilities, allowed_keys, modes):
-            raise AppException("当前模型不支持首尾帧图片输入，请切换支持图片输入的视频模型", code=40012, status_code=400)
+            raise AppException(
+                "当前模型不支持首尾帧图片输入，请切换支持图片输入的视频模型",
+                code=40012,
+                status_code=400,
+            )
         return
 
     if generation_mode != "reference":
@@ -843,25 +1217,55 @@ def _validate_conversation_video_model_capability(
 
     if has_videos and has_input_constraints:
         if not _supports_video_reference(ai_model, capabilities, allowed_keys, modes):
-            raise AppException("当前模型不支持参考视频生成，请切换支持参考视频的视频模型，或改用参考图/文生视频", code=40012, status_code=400)
-        if modes and not modes.intersection({"reference", "multimodal_reference", "video_to_video"}):
-            raise AppException("当前模型不支持参考视频生成，请切换支持参考视频的视频模型", code=40012, status_code=400)
+            raise AppException(
+                "当前模型不支持参考视频生成，请切换支持参考视频的视频模型，或改用参考图/文生视频",
+                code=40012,
+                status_code=400,
+            )
+        if modes and not modes.intersection(
+            {"reference", "multimodal_reference", "video_to_video"}
+        ):
+            raise AppException(
+                "当前模型不支持参考视频生成，请切换支持参考视频的视频模型",
+                code=40012,
+                status_code=400,
+            )
 
     if has_images and has_input_constraints:
         if not _supports_image_reference(ai_model, capabilities, allowed_keys, modes):
-            raise AppException("当前模型不支持参考图生成，请切换支持图片输入的视频模型，或改用文生视频", code=40012, status_code=400)
-        if modes and not modes.intersection({"reference", "multimodal_reference", "image_to_video", "video_to_video", "audio_video"}):
-            raise AppException("当前模型不支持参考图生成，请切换支持图片输入的视频模型", code=40012, status_code=400)
+            raise AppException(
+                "当前模型不支持参考图生成，请切换支持图片输入的视频模型，或改用文生视频",
+                code=40012,
+                status_code=400,
+            )
+        if modes and not modes.intersection(
+            {"reference", "multimodal_reference", "image_to_video", "video_to_video", "audio_video"}
+        ):
+            raise AppException(
+                "当前模型不支持参考图生成，请切换支持图片输入的视频模型",
+                code=40012,
+                status_code=400,
+            )
 
     if has_audios and has_input_constraints:
         if not _supports_audio_reference(ai_model, capabilities, allowed_keys, modes):
-            raise AppException("当前模型不支持参考音频生成，请切换支持音频输入的视频模型", code=40012, status_code=400)
+            raise AppException(
+                "当前模型不支持参考音频生成，请切换支持音频输入的视频模型",
+                code=40012,
+                status_code=400,
+            )
         if modes and not modes.intersection({"reference", "multimodal_reference", "audio_video"}):
-            raise AppException("当前模型不支持参考音频生成，请切换支持音频输入的视频模型", code=40012, status_code=400)
+            raise AppException(
+                "当前模型不支持参考音频生成，请切换支持音频输入的视频模型",
+                code=40012,
+                status_code=400,
+            )
 
-    _validate_conversation_video_media_limits(capabilities, has_images, has_videos, has_audios, payload)
+    _validate_conversation_video_media_limits(
+        capabilities, has_images, has_videos, has_audios, payload
+    )
     if has_videos and _is_ark_conversation_video_model(ai_model):
-        _validate_ark_reference_video_metadata(payload)
+        await _validate_ark_reference_video_metadata(payload)
 
 
 def _conversation_video_capabilities(ai_model: AiModel) -> Dict[str, Any]:
@@ -899,7 +1303,15 @@ def _supports_image_reference(
     return (
         "images" in allowed_keys
         or _media_limit(capabilities, "images") > 0
-        or bool(modes.intersection({"reference", "multimodal_reference", "image_to_video", "video_to_video", "audio_video"}))
+        or bool(
+            modes.intersection(
+                {
+                    "reference",
+                    "multimodal_reference", "image_to_video", "video_to_video",
+                    "audio_video",
+                }
+            )
+        )
     )
 
 
@@ -966,7 +1378,7 @@ def _validate_conversation_video_media_limits(
             raise AppException(f"当前模型{label}最多支持 {limit} 个", code=40012, status_code=400)
 
 
-def _validate_ark_reference_video_metadata(payload: Dict[str, Any]) -> None:
+async def _validate_ark_reference_video_metadata(payload: Dict[str, Any]) -> None:
     reference_urls = _reference_video_url_set(payload)
     uploaded_items = _collect_uploaded_media_items(payload, "video")
     existing_urls = {_extract_media_url(item) for item in uploaded_items}
@@ -986,7 +1398,7 @@ def _validate_ark_reference_video_metadata(payload: Dict[str, Any]) -> None:
         if url in checked_urls:
             continue
         checked_urls.add(url)
-        duration = _validate_ark_reference_video_item(item)
+        duration = await _validate_ark_reference_video_item(item)
         if duration is not None:
             total_duration += duration
 
@@ -998,7 +1410,7 @@ def _validate_ark_reference_video_metadata(payload: Dict[str, Any]) -> None:
         )
 
 
-def _validate_ark_reference_video_item(item: Dict[str, Any]) -> Optional[float]:
+async def _validate_ark_reference_video_item(item: Dict[str, Any]) -> Optional[float]:
     url = _extract_media_url(item)
     content_type = str(item.get("content_type") or item.get("mime_type") or "").strip().lower()
     if content_type and content_type not in ARK_REFERENCE_VIDEO_CONTENT_TYPES:
@@ -1010,7 +1422,7 @@ def _validate_ark_reference_video_item(item: Dict[str, Any]) -> Optional[float]:
 
     media_info = _extract_media_info(item)
     if not media_info and url:
-        media_info = probe_media_url(url, "video") or {}
+        media_info = await probe_media_url(url, "video") or {}
     if not media_info:
         return None
 
@@ -1022,7 +1434,9 @@ def _validate_ark_reference_video_item(item: Dict[str, Any]) -> Optional[float]:
             status_code=400,
         )
 
-    video_codec = str(media_info.get("video_codec") or media_info.get("codec_name") or "").strip().lower()
+    video_codec = (
+        str(media_info.get("video_codec") or media_info.get("codec_name") or "").strip().lower()
+    )
     if video_codec and video_codec not in ARK_REFERENCE_VIDEO_CODECS:
         raise AppException("火山方舟参考视频编码仅支持 H.264/H.265", code=40012, status_code=400)
 
@@ -1059,7 +1473,9 @@ def _validate_ark_reference_video_dimensions(width: float, height: float) -> Non
         ARK_REFERENCE_VIDEO_MIN_SIDE_PX <= width <= ARK_REFERENCE_VIDEO_MAX_SIDE_PX
         and ARK_REFERENCE_VIDEO_MIN_SIDE_PX <= height <= ARK_REFERENCE_VIDEO_MAX_SIDE_PX
     ):
-        raise AppException("火山方舟参考视频宽高长度必须在 300-6000px 之间", code=40012, status_code=400)
+        raise AppException(
+            "火山方舟参考视频宽高长度必须在 300-6000px 之间", code=40012, status_code=400
+        )
 
     pixels = width * height
     if not (ARK_REFERENCE_VIDEO_MIN_PIXELS <= pixels <= ARK_REFERENCE_VIDEO_MAX_PIXELS):
@@ -1132,7 +1548,9 @@ def _normalize_conversation_video_resolution(ai_model: Optional[AiModel], value:
             raise AppException("火山方舟视频 resolution 参数不支持", code=40012, status_code=400)
         capabilities = merge_ark_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
         if value not in (None, "") and not is_video_resolution_supported(value, capabilities):
-            raise AppException("当前火山方舟视频模型不支持该 resolution 参数", code=40012, status_code=400)
+            raise AppException(
+                "当前火山方舟视频模型不支持该 resolution 参数", code=40012, status_code=400
+            )
         return normalize_video_resolution(value or "720p", capabilities)
 
     normalized = str(value or "720p").strip().lower()
@@ -1147,7 +1565,9 @@ def _normalize_conversation_video_resolution(ai_model: Optional[AiModel], value:
     return normalized if normalized in {"480p", "720p", "1080p"} else "720p"
 
 
-def _normalize_conversation_video_generation_mode(value: Any, extra: Optional[Dict[str, Any]] = None) -> str:
+def _normalize_conversation_video_generation_mode(
+    value: Any, extra: Optional[Dict[str, Any]] = None
+) -> str:
     if value in (None, ""):
         extra = extra or {}
         if _has_first_last_frame_input(extra):
@@ -1406,7 +1826,9 @@ def _extract_frame_url(extra: Dict[str, Any], keys: Tuple[str, ...], roles: set[
     return ""
 
 
-def _collect_media_image_urls(extra: Dict[str, Any], roles: set[str], *, allow_roleless: bool = False) -> List[str]:
+def _collect_media_image_urls(
+    extra: Dict[str, Any], roles: set[str], *, allow_roleless: bool = False
+) -> List[str]:
     urls: List[str] = []
     for key in ("media_items", "media", "content"):
         for item in _as_list(extra.get(key)):
@@ -1500,42 +1922,62 @@ async def _build_text_context_messages(
             ConversationMessage.message_type == "text",
             ConversationMessage.role.in_(("user", "assistant")),
         )
-        .order_by(ConversationMessage.created_at.desc())
-        .limit(DEFAULT_TEXT_CONTEXT_MESSAGE_LIMIT)
+        .order_by(
+            ConversationMessage.sequence_no.desc().nullslast(),
+            ConversationMessage.created_at.desc(),
+            ConversationMessage.id.desc(),
+        )
+        .limit(DEFAULT_TEXT_CONTEXT_MESSAGE_SCAN_LIMIT)
     )
     history = list(reversed(result.scalars().all()))
-    messages: List[Dict[str, Any]] = []
-    for item in history:
-        if _should_skip_text_context_message(item):
-            continue
-        role = "assistant" if item.role == "assistant" else "user"
-        messages.append({"role": role, "content": item.content})
-    messages.append({"role": "user", "content": _build_text_multimodal_content(current_content, current_extra or {})})
+    messages = _completed_text_context_messages(history)[-DEFAULT_TEXT_CONTEXT_MESSAGE_LIMIT:]
+    messages.append(
+        {
+            "role": "user", "content": _build_text_multimodal_content(current_content, current_extra or {}),
+        }
+    )
     return messages
 
 
-def _normalize_text_request_messages(
-    raw_messages: Any,
-    current_content: str,
-    current_extra: Dict[str, Any],
+def _completed_text_context_messages(
+    history: List[ConversationMessage],
 ) -> List[Dict[str, Any]]:
-    messages: List[Dict[str, Any]] = []
-    for item in _as_list(raw_messages):
-        if not isinstance(item, dict):
-            continue
-        role = str(item.get("role") or "").strip()
-        if role not in {"system", "user", "assistant", "tool"}:
-            continue
-        content = item.get("content")
-        if _is_empty_text_message_content(content):
-            continue
-        if role == "assistant" and _is_placeholder_assistant_content(content):
-            continue
-        messages.append({**item, "role": role, "content": content})
+    turns: Dict[UUID, Dict[str, Any]] = {}
+    ordered_entries: List[Tuple[str, Any]] = []
 
-    current_message_content = _build_text_multimodal_content(current_content, current_extra or {})
-    if not messages or messages[-1].get("role") != "user" or messages[-1].get("content") != current_message_content:
-        messages.append({"role": "user", "content": current_message_content})
+    for item in history:
+        turn_id = getattr(item, "turn_id", None)
+        if turn_id is None:
+            if not _should_skip_text_context_message(item):
+                ordered_entries.append(("legacy", item))
+            continue
+
+        if turn_id not in turns:
+            turns[turn_id] = {"user": None, "assistant": None}
+            ordered_entries.append(("turn", turn_id))
+
+        status = getattr(item, "status", None)
+        if item.role == "user" and status == "success" and item.content:
+            turns[turn_id]["user"] = item
+        elif item.role == "assistant" and status == "success" and item.content:
+            turns[turn_id]["assistant"] = item
+
+    messages: List[Dict[str, Any]] = []
+    for entry_type, value in ordered_entries:
+        if entry_type == "legacy":
+            role = "assistant" if value.role == "assistant" else "user"
+            messages.append({"role": role, "content": value.content})
+            continue
+
+        turn = turns[value]
+        if turn["user"] is None or turn["assistant"] is None:
+            continue
+        messages.extend(
+            [
+                {"role": "user", "content": turn["user"].content},
+                {"role": "assistant", "content": turn["assistant"].content},
+            ]
+        )
     return messages
 
 
@@ -1555,14 +1997,6 @@ def _is_placeholder_assistant_content(content: Any) -> bool:
     if not isinstance(content, str):
         return False
     return content.startswith("模型未返回有效内容")
-
-
-def _is_empty_text_message_content(content: Any) -> bool:
-    if content in (None, ""):
-        return True
-    if isinstance(content, list):
-        return not content
-    return False
 
 
 def _build_text_multimodal_content(content: str, extra: Dict[str, Any]) -> Any:
@@ -1653,6 +2087,8 @@ async def _mark_conversation_generation_enqueue_failed(
             "task_status": "failed",
             "failed_reason": "任务入队失败",
         }
+        if assistant_message.message_type == "text":
+            assistant_message.status = "failed"
     await db.commit()
 
 

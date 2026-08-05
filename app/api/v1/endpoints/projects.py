@@ -56,7 +56,9 @@ async def create_my_project(
     current_user: User = Depends(get_current_user),
 ):
     project = await create_project(db, current_user, payload)
-    return success(data=ProjectOut.model_validate(project).model_dump(mode="json"), message="创建成功")
+    return success(
+        data=ProjectOut.model_validate(project).model_dump(mode="json"), message="创建成功"
+    )
 
 
 @router.get("/{project_id}")
@@ -77,7 +79,9 @@ async def update_my_project(
     current_user: User = Depends(get_current_user),
 ):
     project = await update_project(db, project_id, current_user.id, payload)
-    return success(data=ProjectOut.model_validate(project).model_dump(mode="json"), message="更新成功")
+    return success(
+        data=ProjectOut.model_validate(project).model_dump(mode="json"), message="更新成功"
+    )
 
 
 @router.delete("/{project_id}")
@@ -87,4 +91,6 @@ async def delete_my_project(
     current_user: User = Depends(get_current_user),
 ):
     project = await delete_project(db, project_id, current_user.id)
-    return success(data=ProjectOut.model_validate(project).model_dump(mode="json"), message="删除成功")
+    return success(
+        data=ProjectOut.model_validate(project).model_dump(mode="json"), message="删除成功"
+    )

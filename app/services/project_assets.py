@@ -9,6 +9,7 @@ from app.core.timezone import beijing_datetime
 from app.models.project_asset import ProjectCharacter, ProjectProp, ProjectScene
 from app.models.project_chapter import ProjectChapter
 from app.services.projects import get_project_or_404
+from app.services.core_asset_change_tracking import track_core_asset_reference_change
 
 
 AssetModel = Union[Type[ProjectCharacter], Type[ProjectScene], Type[ProjectProp]]
@@ -24,10 +25,20 @@ async def list_project_assets(
     page_size: int,
 ) -> Tuple[List[Any], int]:
     await get_project_or_404(db, project_id, user_id)
-    conditions = [model.project_id == project_id, model.user_id == user_id, model.is_enabled.is_(True)]
+    conditions = [
+        model.project_id == project_id,
+        model.user_id == user_id,
+        model.is_enabled.is_(True),
+    ]
     if keyword:
         pattern = f"%{keyword}%"
-        conditions.append(or_(model.name.ilike(pattern), model.description.ilike(pattern), model.prompt.ilike(pattern)))
+        conditions.append(
+            or_(
+                model.name.ilike(pattern),
+                model.description.ilike(pattern),
+                model.prompt.ilike(pattern),
+            )
+        )
 
     count_result = await db.execute(select(func.count()).select_from(model).where(*conditions))
     total = count_result.scalar_one()
@@ -52,10 +63,20 @@ async def list_project_asset_options(
     limit: int,
 ) -> Tuple[List[Dict[str, Any]], int]:
     await get_project_or_404(db, project_id, user_id)
-    conditions = [model.project_id == project_id, model.user_id == user_id, model.is_enabled.is_(True)]
+    conditions = [
+        model.project_id == project_id,
+        model.user_id == user_id,
+        model.is_enabled.is_(True),
+    ]
     if keyword:
         pattern = f"%{keyword}%"
-        conditions.append(or_(model.name.ilike(pattern), model.description.ilike(pattern), model.prompt.ilike(pattern)))
+        conditions.append(
+            or_(
+                model.name.ilike(pattern),
+                model.description.ilike(pattern),
+                model.prompt.ilike(pattern),
+            )
+        )
 
     count_result = await db.execute(select(func.count()).select_from(model).where(*conditions))
     total = count_result.scalar_one()
@@ -134,12 +155,30 @@ async def update_project_asset(
     asset = await get_project_asset_or_404(db, model, project_id, asset_id, user_id)
     data: Dict[str, Any] = payload.model_dump(exclude_unset=True)
     await _validate_source_chapter(db, project_id, user_id, data.get("source_chapter_id"))
+    if "reference_image" in data:
+        await track_core_asset_reference_change(
+            db,
+            project_id=project_id,
+            user_id=user_id,
+            asset_type=_asset_type(model),
+            asset_id=asset.id,
+            previous_reference_image=asset.reference_image,
+            new_reference_image=data["reference_image"],
+        )
     for field, value in data.items():
         setattr(asset, field, value)
     asset.updated_at = beijing_datetime()
     await db.commit()
     await db.refresh(asset)
     return asset
+
+
+def _asset_type(model: AssetModel) -> str:
+    if model is ProjectCharacter:
+        return "character"
+    if model is ProjectScene:
+        return "scene"
+    return "prop"
 
 
 async def delete_project_asset(

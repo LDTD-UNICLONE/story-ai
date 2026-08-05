@@ -16,6 +16,7 @@ from starlette.concurrency import run_in_threadpool
 from app.core.config import settings
 from app.core.exceptions import AppException
 from app.core.logging import log_extra
+from app.core.outbound_url import open_safe_http_response
 from app.integrations.oss import OssClient
 from app.services.model_runner import ModelRunResult
 from app.services.uploads import build_story_directory, detect_content_type
@@ -51,7 +52,9 @@ async def persist_generated_media_to_oss(
             "oss_media_urls": [oss_url],
             "display_media_urls": [oss_url],
         }
-        return await _persist_sidecar_images(ModelRunResult(content=oss_url, extra=extra), sidecar_image_urls)
+        return await _persist_sidecar_images(
+            ModelRunResult(content=oss_url, extra=extra), sidecar_image_urls
+        )
 
     uploaded_urls = await _upload_urls_to_oss(source_urls, generation_type)
     if not uploaded_urls:
@@ -82,7 +85,9 @@ async def persist_generated_media_to_oss(
             uploaded_url_count=len(uploaded_urls),
         ),
     )
-    return await _persist_sidecar_images(ModelRunResult(content=content, extra=extra), sidecar_image_urls)
+    return await _persist_sidecar_images(
+        ModelRunResult(content=content, extra=extra), sidecar_image_urls
+    )
 
 
 def _collect_result_media_urls(model_result: ModelRunResult) -> List[str]:
@@ -129,7 +134,9 @@ def _replace_urls_in_data(value: Any, url_mapping: Dict[str, str]) -> Any:
     return value
 
 
-def _collect_sidecar_image_urls(model_result: ModelRunResult, excluded_urls: List[str]) -> List[str]:
+def _collect_sidecar_image_urls(
+    model_result: ModelRunResult, excluded_urls: List[str]
+) -> List[str]:
     urls: List[str] = []
     seen: Set[str] = set(excluded_urls)
     for value in _find_sidecar_image_values(model_result.extra):
@@ -177,7 +184,9 @@ def _split_content_urls(content: str) -> List[str]:
     return [item.strip() for item in content.split(",") if item.strip()]
 
 
-def _replace_result_media_urls(content: str, source_urls: List[str], uploaded_urls: List[str]) -> str:
+def _replace_result_media_urls(
+    content: str, source_urls: List[str], uploaded_urls: List[str]
+) -> str:
     url_mapping = dict(zip(source_urls, uploaded_urls))
     if not url_mapping:
         return content
@@ -263,7 +272,12 @@ async def _upload_urls_to_oss(source_urls: List[str], generation_type: str) -> L
         max_keepalive_connections=max(1, settings.generated_media_transfer_concurrency),
     )
     semaphore = asyncio.Semaphore(max(1, settings.generated_media_transfer_concurrency))
-    async with httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        limits=limits,
+        follow_redirects=False,
+        trust_env=False,
+    ) as client:
         tasks = [
             _upload_url_to_oss_with_limit(semaphore, client, source_url, generation_type)
             for source_url in source_urls
@@ -298,7 +312,8 @@ async def _upload_url_to_oss(
                 source_url=source_url,
             ),
         )
-        async with client.stream("GET", source_url) as response:
+        response = await _open_safe_media_response(client, source_url)
+        try:
             response.raise_for_status()
             content_type = response.headers.get("content-type", "")
             content_length = _parse_content_length(response.headers.get("content-length"))
@@ -320,6 +335,11 @@ async def _upload_url_to_oss(
                         status_code=413,
                     )
                 fileobj.write(chunk)
+        finally:
+            await response.aclose()
+    except AppException:
+        fileobj.close()
+        raise
     except httpx.HTTPError as exc:
         fileobj.close()
         logger.warning(
@@ -396,7 +416,9 @@ async def _upload_url_to_oss(
                 timeout_seconds=settings.generated_media_upload_timeout_seconds,
             ),
         )
-        raise AppException("生成媒体转存 OSS 超时，请稍后重试", code=50232, status_code=502) from exc
+        raise AppException(
+            "生成媒体转存 OSS 超时，请稍后重试", code=50232, status_code=502
+        ) from exc
     except Exception as exc:
         logger.exception(
             "Generated media OSS upload failed: generation_type=%s filename=%s directory=%s reason=%s",
@@ -415,6 +437,18 @@ async def _upload_url_to_oss(
         raise
     finally:
         fileobj.close()
+
+
+async def _open_safe_media_response(
+    client: httpx.AsyncClient,
+    source_url: str,
+    max_redirects: int = 5,
+) -> httpx.Response:
+    return await open_safe_http_response(
+        client,
+        source_url,
+        max_redirects=max_redirects,
+    )
 
 
 def _parse_content_length(value: Optional[str]) -> int:
@@ -457,7 +491,9 @@ async def _try_upload_base64_content_to_oss(content: str, generation_type: str) 
             timeout=settings.generated_media_upload_timeout_seconds,
         )
     except asyncio.TimeoutError as exc:
-        raise AppException("生成媒体转存 OSS 超时，请稍后重试", code=50232, status_code=502) from exc
+        raise AppException(
+            "生成媒体转存 OSS 超时，请稍后重试", code=50232, status_code=502
+        ) from exc
     return url
 
 

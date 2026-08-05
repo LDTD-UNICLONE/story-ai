@@ -41,7 +41,9 @@ class ProjectChapter(Base, TimestampMixin):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     processing_prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     processed_content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    process_status: Mapped[str] = mapped_column(String(32), index=True, nullable=False, server_default=text("'draft'"))
+    process_status: Mapped[str] = mapped_column(
+        String(32), index=True, nullable=False, server_default=text("'draft'")
+    )
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     extra: Mapped[dict] = mapped_column(JSON, nullable=False, server_default=text("'{}'::json"))
     is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))

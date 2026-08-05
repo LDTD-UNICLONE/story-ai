@@ -1,6 +1,16 @@
 from fastapi import APIRouter
 
 from app.api.v1.endpoints import (
+    agent_batch_productions,
+    agent_core_assets,
+    agent_pilot_productions,
+    agent_production_controls,
+    agent_productions,
+    agent_reviews,
+    agent_script_packages,
+    agent_storyboards,
+    agent_story_bibles,
+    agent_workflow_steps,
     announcements,
     auth,
     conversations,
@@ -44,6 +54,16 @@ api_router.include_router(admin_system_logs.router, tags=["Admin System Logs"])
 api_router.include_router(admin_task_records.router, tags=["Admin Task Records"])
 api_router.include_router(admin_users.router, tags=["Admin Users"])
 api_router.include_router(admin_works.router, tags=["Admin Works"])
+api_router.include_router(agent_batch_productions.router, tags=["Agent Batch Productions"])
+api_router.include_router(agent_core_assets.router, tags=["Agent Core Assets"])
+api_router.include_router(agent_pilot_productions.router, tags=["Agent Pilot Productions"])
+api_router.include_router(agent_production_controls.router, tags=["Agent Production Controls"])
+api_router.include_router(agent_productions.router, tags=["Agent Productions"])
+api_router.include_router(agent_reviews.router, tags=["Agent Reviews"])
+api_router.include_router(agent_script_packages.router, tags=["Agent Script Packages"])
+api_router.include_router(agent_storyboards.router, tags=["Agent Storyboards"])
+api_router.include_router(agent_story_bibles.router, tags=["Agent Story Bibles"])
+api_router.include_router(agent_workflow_steps.router, tags=["Agent Workflow"])
 api_router.include_router(announcements.router, tags=["Announcements"])
 api_router.include_router(auth.router, tags=["Auth"])
 api_router.include_router(conversations.router, tags=["Conversations"])

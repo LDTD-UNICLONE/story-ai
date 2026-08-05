@@ -86,7 +86,9 @@ def configure_logging() -> None:
     )
 
     app_handler = _rotating_file_handler(log_dir / settings.log_file, level, json_formatter)
-    error_handler = _rotating_file_handler(log_dir / settings.log_error_file, logging.ERROR, json_formatter)
+    error_handler = _rotating_file_handler(
+        log_dir / settings.log_error_file, logging.ERROR, json_formatter
+    )
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(console_formatter)
     console_handler.setLevel(level)
@@ -101,7 +103,9 @@ def configure_logging() -> None:
     root_logger.addHandler(error_handler)
     root_logger.addHandler(console_handler)
 
-    access_handler = _rotating_file_handler(log_dir / settings.log_access_file, level, json_formatter)
+    access_handler = _rotating_file_handler(
+        log_dir / settings.log_access_file, level, json_formatter
+    )
     access_handler.addFilter(context_filter)
     access_logger = logging.getLogger("story_ai.access")
     access_logger.setLevel(level)
@@ -146,7 +150,9 @@ def log_extra(**kwargs: Any) -> Dict[str, Any]:
     return {"extra": _sanitize_log_value(kwargs)}
 
 
-def _rotating_file_handler(path: Path, level: int, formatter: logging.Formatter) -> RotatingFileHandler:
+def _rotating_file_handler(
+    path: Path, level: int, formatter: logging.Formatter
+) -> RotatingFileHandler:
     handler = RotatingFileHandler(
         path,
         maxBytes=settings.log_max_bytes,

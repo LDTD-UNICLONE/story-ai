@@ -9,12 +9,13 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     app_name: str = "Story AI Backend"
-    app_env: str = "local"
-    app_debug: bool = True
+    app_env: str = "production"
+    app_debug: bool = False
     app_host: str = "0.0.0.0"
     app_port: int = 8000
     api_prefix: str = "/api/v1"
     cors_origins: List[str] = Field(default_factory=list)
+    trusted_proxy_ips: List[str] = Field(default_factory=list)
 
     timezone: str = "Asia/Shanghai"
     jwt_secret_key: str = "please-change-me-in-production"
@@ -48,8 +49,8 @@ class Settings(BaseSettings):
     postgres_user: str = "postgres"
     postgres_password: str = "postgres"
     postgres_db: str = "story_ai"
-    postgres_pool_size: int = 10
-    postgres_max_overflow: int = 20
+    postgres_pool_size: int = 5
+    postgres_max_overflow: int = 5
     postgres_pool_timeout: int = 30
     postgres_pool_recycle: int = 1800
 
@@ -77,6 +78,11 @@ class Settings(BaseSettings):
     user_pending_task_limit: int = 20
     user_pending_media_task_limit: int = 5
     user_pending_task_window_hours: int = 24
+    agent_source_max_characters: int = 100_000
+    agent_source_max_file_size_mb: int = 20
+    agent_source_chunk_characters: int = 12_000
+    agent_source_parse_timeout_seconds: int = 30
+    agent_source_parse_concurrency: int = 2
     task_stale_timeout_minutes: int = 30
     generated_media_download_max_size_mb: int = 500
     generated_media_transfer_concurrency: int = 3
@@ -89,7 +95,10 @@ class Settings(BaseSettings):
     oss_access_key_secret: str = ""
     oss_public_base_url: str = ""
     oss_root_directory: str = "story"
+    oss_signed_url_expires_seconds: int = 600
     max_upload_size_mb: int = 100
+    user_work_storage_limit_mb: int = 2048
+    unused_work_upload_ttl_hours: int = 24
 
     aliyun_sms_access_key_id: str = ""
     aliyun_sms_access_key_secret: str = ""
@@ -99,6 +108,7 @@ class Settings(BaseSettings):
     aliyun_sms_register_template_param_key: str = "code"
     aliyun_sms_code_ttl_seconds: int = 300
     aliyun_sms_send_interval_seconds: int = 60
+    aliyun_sms_max_verify_attempts: int = 5
     aliyun_sms_mock_enabled: bool = False
 
     wechat_pay_appid: str = ""
@@ -110,6 +120,7 @@ class Settings(BaseSettings):
     wechat_pay_platform_cert_path: str = ""
     wechat_pay_notify_url: str = ""
     wechat_pay_timeout_seconds: int = 30
+    wechat_pay_notify_tolerance_seconds: int = 300
     wechat_pay_native_expire_minutes: int = 30
     wechat_pay_mock_enabled: bool = False
 

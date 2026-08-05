@@ -16,6 +16,7 @@ QUEUE_NAMES = {
     "text": "story_ai_text",
     "image": "story_ai_image",
     "video": "story_ai_video",
+    "delivery": "story_ai_delivery",
 }
 
 
@@ -47,6 +48,9 @@ celery_app = Celery(
         "app.tasks.project_storyboard",
         "app.tasks.project_storyboard_image",
         "app.tasks.project_storyboard_video",
+        "app.tasks.agent_source_analysis",
+        "app.tasks.agent_production_controller",
+        "app.tasks.agent_delivery",
         "app.tasks.provider_reconcile",
     ],
 )
@@ -64,15 +68,21 @@ celery_app.conf.update(
         _queue(QUEUE_NAMES["text"]),
         _queue(QUEUE_NAMES["image"]),
         _queue(QUEUE_NAMES["video"]),
+        _queue(QUEUE_NAMES["delivery"]),
     ),
     task_routes={
         "tasks.project_chapter.run_project_chapter_processing": _route("text"),
+        "tasks.agent_source_analysis.run_source_analysis": _route("text"),
+        "tasks.agent_source_analysis.run_agent_text_task": _route("text"),
         "tasks.project_asset_analysis.run_project_asset_analysis": _route("text"),
         "tasks.project_storyboard.run_project_storyboard_analysis": _route("text"),
         "tasks.project_storyboard.run_project_storyboard_stage": _route("text"),
         "tasks.project_asset_generation.run_project_asset_image_generation": _route("image"),
         "tasks.project_storyboard_image.run_project_storyboard_image_generation": _route("image"),
         "tasks.project_storyboard_video.run_project_storyboard_video_generation": _route("video"),
+        "tasks.agent_production_controller.advance_agent_batch_production": _route("default"),
+        "tasks.agent_production_controller.enqueue_agent_batch_productions": _route("default"),
+        "tasks.agent_delivery.build_agent_delivery": _route("delivery"),
         "tasks.provider_reconcile.reconcile_provider_task": _route("default"),
         "tasks.provider_reconcile.enqueue_pending_provider_reconciliations": _route("default"),
     },
@@ -88,6 +98,11 @@ celery_app.conf.update(
     worker_max_tasks_per_child=settings.celery_worker_max_tasks_per_child,
     result_expires=settings.celery_result_expires_seconds,
     beat_schedule={
+        "enqueue-agent-batch-productions": {
+            "task": "tasks.agent_production_controller.enqueue_agent_batch_productions",
+            "schedule": 30,
+            "args": (100,),
+        },
         "enqueue-pending-provider-reconciliations": {
             "task": "tasks.provider_reconcile.enqueue_pending_provider_reconciliations",
             "schedule": _provider_reconcile_sweep_interval_seconds(),
@@ -156,4 +171,4 @@ def clear_task_logging_context(task_id=None, task=None, state=None, retval=None,
     clear_request_context()
 
 # Ensure tasks are registered when the Celery app is imported by scripts or tests.
-from app.tasks import example, model_generation, project_asset_analysis, project_asset_generation, project_chapter, project_storyboard, project_storyboard_image, project_storyboard_video, provider_reconcile  # noqa: E402,F401
+from app.tasks import agent_delivery, agent_source_analysis, example, model_generation, project_asset_analysis, project_asset_generation, project_chapter, project_storyboard, project_storyboard_image, project_storyboard_video, provider_reconcile  # noqa: E402,F401

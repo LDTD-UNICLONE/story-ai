@@ -1,7 +1,7 @@
 import uuid
 from typing import Optional
 
-from sqlalchemy import Boolean, ForeignKey, Integer, JSON, String, Text, text
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, JSON, String, Text, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -13,6 +13,17 @@ from app.models.project_chapter import ProjectChapter
 
 class ProjectStoryboard(Base, TimestampMixin):
     __tablename__ = "project_storyboards"
+    __table_args__ = (
+        Index(
+            "ix_project_storyboards_owner_order",
+            "project_id",
+            "chapter_id",
+            "user_id",
+            "is_enabled",
+            "shot_number",
+            "created_at",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -53,7 +64,9 @@ class ProjectStoryboard(Base, TimestampMixin):
     camera_angle: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     camera_movement: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     screen_execution: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    characters: Mapped[list] = mapped_column(JSON, nullable=False, server_default=text("'[]'::json"))
+    characters: Mapped[list] = mapped_column(
+        JSON, nullable=False, server_default=text("'[]'::json")
+    )
     props: Mapped[list] = mapped_column(JSON, nullable=False, server_default=text("'[]'::json"))
     action: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     character_action: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

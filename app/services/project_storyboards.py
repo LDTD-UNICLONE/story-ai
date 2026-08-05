@@ -1,5 +1,7 @@
+import hashlib
 import json
 import logging
+import math
 import re
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -7,13 +9,17 @@ from uuid import UUID
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import AppException
 from app.core.logging import log_extra
 from app.core.timezone import beijing_datetime
+from app.models.agent_story_bible import AgentAssetCandidate, AgentAssetVariant
 from app.models.ai_model import AiModel
+from app.models.project import Project
 from app.models.project_asset import ProjectCharacter, ProjectProp, ProjectScene
 from app.models.project_chapter import ProjectChapter
+from app.models.project_generated_asset import ProjectGeneratedAsset
 from app.models.project_storyboard import ProjectStoryboard
 from app.models.task_record import UserTaskRecord
 from app.models.user import User
@@ -44,6 +50,26 @@ from app.services.text_model_extra import normalize_text_analysis_extra
 logger = logging.getLogger(__name__)
 
 
+async def _get_owned_enabled_project_or_404(
+    db: AsyncSession,
+    project_id: UUID,
+    user_id: UUID,
+) -> Project:
+    result = await db.execute(
+        select(Project)
+        .options(selectinload(Project.style))
+        .where(
+            Project.id == project_id,
+            Project.user_id == user_id,
+            Project.is_enabled.is_(True),
+        )
+    )
+    project = result.scalar_one_or_none()
+    if project is None:
+        raise AppException("项目不存在", code=40407, status_code=404)
+    return project
+
+
 async def list_project_storyboards(
     db: AsyncSession,
     project_id: UUID,
@@ -59,7 +85,9 @@ async def list_project_storyboards(
         ProjectStoryboard.user_id == user_id,
         ProjectStoryboard.is_enabled.is_(True),
     ]
-    count_result = await db.execute(select(func.count()).select_from(ProjectStoryboard).where(*conditions))
+    count_result = await db.execute(
+        select(func.count()).select_from(ProjectStoryboard).where(*conditions)
+    )
     total = count_result.scalar_one()
     result = await db.execute(
         select(ProjectStoryboard)
@@ -95,8 +123,12 @@ async def get_project_storyboard_or_404(
 
 
 async def reconcile_storyboard_media_tasks(db: AsyncSession, storyboard: ProjectStoryboard) -> None:
-    await _reconcile_storyboard_media_task(db, storyboard, "image_generation_task_record_id", "image_generation_status")
-    await _reconcile_storyboard_media_task(db, storyboard, "video_generation_task_record_id", "video_generation_status")
+    await _reconcile_storyboard_media_task(
+        db, storyboard, "image_generation_task_record_id", "image_generation_status"
+    )
+    await _reconcile_storyboard_media_task(
+        db, storyboard, "video_generation_task_record_id", "video_generation_status"
+    )
 
 
 async def _reconcile_storyboard_media_task(
@@ -167,10 +199,13 @@ async def update_project_storyboard(
     user_id: UUID,
     payload: ProjectStoryboardUpdateRequest,
 ) -> ProjectStoryboard:
-    storyboard = await get_project_storyboard_or_404(db, project_id, chapter_id, storyboard_id, user_id)
+    storyboard = await get_project_storyboard_or_404(
+        db, project_id, chapter_id, storyboard_id, user_id
+    )
     update_data = payload.model_dump(exclude_unset=True)
     event_goal = update_data.pop("event_goal", None)
     split_reason = update_data.pop("split_reason", None)
+    changed = bool(update_data) or event_goal is not None or split_reason is not None
     for field, value in update_data.items():
         setattr(storyboard, field, value)
     if event_goal is not None or split_reason is not None:
@@ -179,7 +214,30 @@ async def update_project_storyboard(
             **({"event_goal": event_goal} if event_goal is not None else {}),
             **({"split_reason": split_reason} if split_reason is not None else {}),
         }
-    storyboard.updated_at = beijing_datetime()
+    now = beijing_datetime()
+    if changed:
+        extra = dict(storyboard.extra or {})
+        for media_type in ("image", "video"):
+            status_key = f"{media_type}_generation_status"
+            if extra.get(status_key) in {"success", "selected"}:
+                extra[status_key] = "invalidated"
+        storyboard.extra = extra
+        history_result = await db.execute(
+            select(ProjectGeneratedAsset).where(
+                ProjectGeneratedAsset.target_type == "storyboard",
+                ProjectGeneratedAsset.target_id == storyboard.id,
+                ProjectGeneratedAsset.media_type.in_(("image", "video")),
+                ProjectGeneratedAsset.is_enabled.is_(True),
+            )
+        )
+        for history in history_result.scalars().all():
+            history.extra = {
+                **(history.extra or {}),
+                "validity_status": "invalidated",
+                "invalidated_by": "storyboard_edit",
+                "invalidated_at": now.isoformat(),
+            }
+    storyboard.updated_at = now
     await db.commit()
     await db.refresh(storyboard)
     return storyboard
@@ -192,7 +250,9 @@ async def delete_project_storyboard(
     storyboard_id: UUID,
     user_id: UUID,
 ) -> ProjectStoryboard:
-    storyboard = await get_project_storyboard_or_404(db, project_id, chapter_id, storyboard_id, user_id)
+    storyboard = await get_project_storyboard_or_404(
+        db, project_id, chapter_id, storyboard_id, user_id
+    )
     storyboard.is_enabled = False
     storyboard.updated_at = beijing_datetime()
     await db.commit()
@@ -214,12 +274,16 @@ async def merge_project_storyboards(
 
     storyboards = await _list_enabled_storyboards(db, project_id, chapter_id, user_id)
     selected_ids = set(storyboard_ids)
-    selected_map = {storyboard.id: storyboard for storyboard in storyboards if storyboard.id in selected_ids}
+    selected_map = {
+        storyboard.id: storyboard for storyboard in storyboards if storyboard.id in selected_ids
+    }
     if len(selected_map) != len(storyboard_ids):
         raise AppException("待合并分镜不存在或已不可用", code=40410, status_code=404)
 
     selected = [storyboard for storyboard in storyboards if storyboard.id in selected_map]
-    first_selected_index = next(index for index, storyboard in enumerate(storyboards) if storyboard.id in selected_map)
+    first_selected_index = next(
+        index for index, storyboard in enumerate(storyboards) if storyboard.id in selected_map
+    )
     merged_item = _build_merged_storyboard_item(selected, payload)
 
     now = beijing_datetime()
@@ -266,9 +330,13 @@ async def split_project_storyboard(
     user_id: UUID,
     payload: ProjectStoryboardSplitRequest,
 ) -> List[ProjectStoryboard]:
-    storyboard = await get_project_storyboard_or_404(db, project_id, chapter_id, storyboard_id, user_id)
+    storyboard = await get_project_storyboard_or_404(
+        db, project_id, chapter_id, storyboard_id, user_id
+    )
     storyboards = await _list_enabled_storyboards(db, project_id, chapter_id, user_id)
-    original_index = next((index for index, item in enumerate(storyboards) if item.id == storyboard.id), None)
+    original_index = next(
+        (index for index, item in enumerate(storyboards) if item.id == storyboard.id), None
+    )
     if original_index is None:
         raise AppException("项目分镜不存在", code=40410, status_code=404)
 
@@ -363,7 +431,9 @@ async def submit_storyboard_image_prompt_generation(
     )
     prompt = render_system_prompt(
         "storyboard_image_prompt_generation.md",
-        storyboard_unit=json.dumps(_storyboard_image_prompt_unit_payload(storyboard), ensure_ascii=False),
+        storyboard_unit=json.dumps(
+            _storyboard_image_prompt_unit_payload(storyboard), ensure_ascii=False
+        ),
         characters=await _dump_storyboard_assets(db, ProjectCharacter, project_id, user.id),
         scenes=await _dump_storyboard_assets(db, ProjectScene, project_id, user.id),
         props=await _dump_storyboard_assets(db, ProjectProp, project_id, user.id),
@@ -390,8 +460,14 @@ async def submit_storyboard_analysis(
     chapter_id: UUID,
     user: User,
     payload: ProjectStoryboardAnalyzeRequest,
+    *,
+    agent_context: Optional[Dict[str, object]] = None,
 ) -> Tuple[UserTaskRecord, int]:
-    await get_project_or_404(db, project_id, user.id)
+    agent_project = None
+    if agent_context:
+        agent_project = await _get_owned_enabled_project_or_404(db, project_id, user.id)
+    else:
+        await get_project_or_404(db, project_id, user.id)
     chapter = await get_project_chapter_or_404(db, project_id, chapter_id, user.id)
     if not chapter.processed_content:
         raise AppException("章节还没有处理后的内容，无法分析分镜", code=40011, status_code=400)
@@ -409,9 +485,15 @@ async def submit_storyboard_analysis(
         )
 
     model_extra = normalize_text_analysis_extra(payload.extra)
-    characters = await _dump_storyboard_assets(db, ProjectCharacter, project_id, user.id)
-    scenes = await _dump_storyboard_assets(db, ProjectScene, project_id, user.id)
-    props = await _dump_storyboard_assets(db, ProjectProp, project_id, user.id)
+    characters = await _dump_storyboard_assets(
+        db, ProjectCharacter, project_id, user.id, chapter, agent_context
+    )
+    scenes = await _dump_storyboard_assets(
+        db, ProjectScene, project_id, user.id, chapter, agent_context
+    )
+    props = await _dump_storyboard_assets(
+        db, ProjectProp, project_id, user.id, chapter, agent_context
+    )
     custom_system_prompt = (payload.analysis_prompt or "").strip()
     if custom_system_prompt:
         model_extra["system_prompt"] = custom_system_prompt
@@ -422,6 +504,18 @@ async def submit_storyboard_analysis(
             props=props,
         )
         prompt_source = "custom"
+    elif agent_context:
+        prompt = render_system_prompt(
+            "agent_storyboard_generation.md",
+            input_text=chapter.processed_content,
+            characters=characters,
+            scenes=scenes,
+            props=props,
+            visual_style=agent_project.style.prompt
+            if agent_project is not None and agent_project.style is not None
+            else "",
+        )
+        prompt_source = "agent"
     else:
         prompt = render_system_prompt(
             "storyboard_analysis.md",
@@ -431,6 +525,9 @@ async def submit_storyboard_analysis(
             props=props,
         )
         prompt_source = "system"
+    storyboard_input_fingerprint = (
+        hashlib.sha256(prompt.encode("utf-8")).hexdigest() if agent_context else None
+    )
     task_record = await create_user_task_record(
         db,
         user_id=user.id,
@@ -450,13 +547,36 @@ async def submit_storyboard_analysis(
             "chapter_title": chapter.title,
             "prompt_source": prompt_source,
             "model_extra": model_extra,
+            **(
+                {
+                    "agent_visual_style": agent_project.style.prompt
+                    if agent_project.style is not None
+                    else ""
+                }
+                if agent_project is not None
+                else {}
+            ),
             **({"analysis_prompt": custom_system_prompt} if custom_system_prompt else {}),
+            **(
+                {"storyboard_analysis_input_fingerprint": storyboard_input_fingerprint}
+                if storyboard_input_fingerprint is not None
+                else {}
+            ),
+            **(agent_context or {}),
         },
     )
+    await db.flush()
     chapter.extra = {
         **(chapter.extra or {}),
         "storyboard_analysis_status": "pending",
         "storyboard_analysis_task_record_id": str(task_record.id),
+        **(
+            {
+                "storyboard_analysis_input_fingerprint": storyboard_input_fingerprint,
+            }
+            if storyboard_input_fingerprint is not None
+            else {}
+        ),
     }
     await db.commit()
 
@@ -523,6 +643,7 @@ async def _submit_storyboard_text_stage(
             "model_extra": model_extra,
         },
     )
+    await db.flush()
     chapter.extra = {
         **(chapter.extra or {}),
         status_key: "pending",
@@ -545,7 +666,9 @@ async def _submit_storyboard_text_stage(
             routing_key="story_ai_text",
         )
     except Exception:
-        await _mark_storyboard_stage_enqueue_failed(db, task_record, chapter, status_key, storyboard)
+        await _mark_storyboard_stage_enqueue_failed(
+            db, task_record, chapter, status_key, storyboard
+        )
     return task_record, points_cost
 
 
@@ -603,8 +726,13 @@ async def run_storyboard_analysis_in_worker(
         "text",
         task_record.prompt,
         (task_record.extra or {}).get("model_extra") or {},
+        idempotency_key=str(task_record.id),
     )
     if await refresh_task_record_interrupted(db, task_record):
+        return
+    await db.refresh(chapter, with_for_update=True)
+    if not storyboard_analysis_task_is_current(task_record, chapter):
+        await mark_storyboard_analysis_task_superseded(db, task_record)
         return
 
     items = parse_storyboard_items(model_result.content)
@@ -624,6 +752,12 @@ async def run_storyboard_analysis_in_worker(
             "model_result_extra": model_result.extra,
         }
         raise AppException("分镜分析未返回有效数据", code=50231, status_code=502)
+    if (task_record.extra or {}).get("agent_production_id"):
+        _validate_agent_storyboard_sequence(items, chapter.processed_content)
+        items = _prepare_agent_storyboard_groups(
+            items,
+            str((task_record.extra or {}).get("agent_visual_style") or ""),
+        )
 
     logger.info(
         "Storyboard analysis model result parsed",
@@ -653,7 +787,9 @@ async def run_storyboard_analysis_in_worker(
         )
         .values(is_enabled=False, updated_at=beijing_datetime())
     )
+    created_storyboards: List[ProjectStoryboard] = []
     for index, item in enumerate(items, start=1):
+        item = {**item, "shot_number": index}
         storyboard = _make_storyboard_from_item(
             project_id=task_record.business_id,
             chapter_id=chapter.id,
@@ -664,11 +800,36 @@ async def run_storyboard_analysis_in_worker(
             extra={"task_record_id": str(task_record.id)},
         )
         db.add(storyboard)
+        created_storyboards.append(storyboard)
+
+    agent_production_id = (task_record.extra or {}).get("agent_production_id")
+    if agent_production_id:
+        await db.flush()
+        from app.services.agent_storyboard_bindings import (
+            bind_agent_storyboard_analysis_result,
+        )
+
+        await bind_agent_storyboard_analysis_result(
+            db,
+            UUID(str(agent_production_id)),
+            created_storyboards,
+        )
 
     chapter.extra = {
         **_clear_status_retry_state(chapter.extra or {}, "storyboard_analysis_status"),
         "storyboard_analysis_status": "success",
         "storyboard_analysis_task_record_id": str(task_record.id),
+        **(
+            {
+                "storyboard_analysis_result_fingerprint": str(
+                    (task_record.extra or {}).get(
+                        "storyboard_analysis_input_fingerprint"
+                    )
+                )
+            }
+            if (task_record.extra or {}).get("storyboard_analysis_input_fingerprint")
+            else {}
+        ),
     }
     task_record.status = "success"
     task_record.result = model_result.content
@@ -686,6 +847,55 @@ async def run_storyboard_analysis_in_worker(
             storyboard_count=len(items),
         ),
     )
+
+
+def storyboard_analysis_task_is_current(
+    task_record: UserTaskRecord,
+    chapter: ProjectChapter,
+) -> bool:
+    task_extra = task_record.extra or {}
+    if not task_extra.get("agent_production_id"):
+        return True
+    chapter_extra = chapter.extra or {}
+    task_fingerprint = str(
+        task_extra.get("storyboard_analysis_input_fingerprint") or ""
+    )
+    expected_fingerprint = str(
+        chapter_extra.get("storyboard_analysis_input_fingerprint") or ""
+    )
+    current_task_id = str(
+        chapter_extra.get("storyboard_analysis_task_record_id") or ""
+    )
+    return bool(
+        task_fingerprint
+        and expected_fingerprint == task_fingerprint
+        and current_task_id == str(task_record.id)
+    )
+
+
+async def mark_storyboard_analysis_task_superseded(
+    db: AsyncSession,
+    task_record: UserTaskRecord,
+) -> None:
+    refund_transaction_id = (task_record.extra or {}).get("refund_transaction_id")
+    if task_record.points_cost > 0 and not refund_transaction_id:
+        refund = await change_user_points(
+            db,
+            user_id=task_record.user_id,
+            amount=task_record.points_cost,
+            transaction_type="refund",
+            remark=f"分镜输入已更新退回积分：{task_record.title}",
+            auto_commit=False,
+        )
+        refund_transaction_id = str(refund.id)
+    task_record.status = "failed"
+    task_record.result = "分镜输入已更新，本次旧任务结果已忽略"
+    task_record.extra = {
+        **_clear_task_retry_state(task_record.extra or {}),
+        "superseded": True,
+        "failed_reason": "分镜输入已更新，本次旧任务结果已忽略",
+        "refund_transaction_id": refund_transaction_id,
+    }
 
 
 async def run_storyboard_stage_in_worker(
@@ -721,6 +931,7 @@ async def run_storyboard_stage_in_worker(
         "text",
         task_record.prompt,
         (task_record.extra or {}).get("model_extra") or {},
+        idempotency_key=str(task_record.id),
     )
     if await refresh_task_record_interrupted(db, task_record):
         return
@@ -817,7 +1028,9 @@ async def _apply_storyboard_refinement_items(
         _apply_storyboard_refinement_item(storyboard, task_record, items[0], beijing_datetime())
         return
 
-    storyboards = await _list_enabled_storyboards(db, task_record.business_id, chapter.id, task_record.user_id)
+    storyboards = await _list_enabled_storyboards(
+        db, task_record.business_id, chapter.id, task_record.user_id
+    )
     if len(items) != len(storyboards):
         raise AppException("分镜细化结果必须与当前分镜数量一致", code=50231, status_code=502)
     by_shot_number = {storyboard.shot_number: storyboard for storyboard in storyboards}
@@ -854,7 +1067,9 @@ async def _apply_storyboard_prompt_items(
         _apply_storyboard_prompt_item(storyboard, task_record, items[0], beijing_datetime())
         return
 
-    storyboards = await _list_enabled_storyboards(db, task_record.business_id, chapter.id, task_record.user_id)
+    storyboards = await _list_enabled_storyboards(
+        db, task_record.business_id, chapter.id, task_record.user_id
+    )
     if len(items) != len(storyboards):
         raise AppException("视频提示词结果必须与当前分镜数量一致", code=50231, status_code=502)
     by_shot_number = {storyboard.shot_number: storyboard for storyboard in storyboards}
@@ -880,7 +1095,9 @@ async def _apply_storyboard_image_prompt_items(
     storyboard_id = _task_storyboard_id(task_record)
     if storyboard_id is not None:
         if len(items) != 1:
-            raise AppException("单个故事板提示词结果必须只包含一条分镜", code=50231, status_code=502)
+            raise AppException(
+                "单个故事板提示词结果必须只包含一条分镜", code=50231, status_code=502
+            )
         storyboard = await get_project_storyboard_or_404(
             db,
             project_id=task_record.business_id,
@@ -920,7 +1137,9 @@ def _apply_storyboard_refinement_item(
     storyboard.duration_suggestion = _optional_str(item.get("duration_suggestion"), 64)
     storyboard.production_focus = _optional_str(item.get("production_focus"))
     storyboard.negative_prompt = _optional_str(item.get("negative_prompt"))
-    storyboard.ending_frame = _optional_str(_first_value(item, "ending_frame", "结尾画面", "收束画面"))
+    storyboard.ending_frame = _optional_str(
+        _first_value(item, "ending_frame", "结尾画面", "收束画面")
+    )
     storyboard.extra = {
         **_clear_status_retry_state(storyboard.extra or {}, "storyboard_refinement_status"),
         "storyboard_refinement_status": "success",
@@ -939,10 +1158,16 @@ def _apply_storyboard_image_prompt_item(
 ) -> None:
     storyboard.image_prompt = _optional_str(_first_value(item, "image_prompt", "图像提示词"))
     storyboard.video_prompt = _optional_str(_first_value(item, "video_prompt", "视频提示词"))
-    storyboard.duration_suggestion = _optional_str(_first_value(item, "duration_suggestion", "时长建议"), 64)
-    storyboard.negative_prompt = _optional_str(_first_value(item, "negative_prompt", "负面规避词", "负面规避"))
+    storyboard.duration_suggestion = _optional_str(
+        _first_value(item, "duration_suggestion", "时长建议"), 64
+    )
+    storyboard.negative_prompt = _optional_str(
+        _first_value(item, "negative_prompt", "负面规避词", "负面规避")
+    )
     storyboard.extra = {
-        **_clear_status_retry_state(storyboard.extra or {}, "storyboard_image_prompt_generation_status"),
+        **_clear_status_retry_state(
+            storyboard.extra or {}, "storyboard_image_prompt_generation_status"
+        ),
         "storyboard_image_prompt_generation_status": "success",
         "storyboard_image_prompt_generation_task_record_id": str(task_record.id),
         "storyboard_image_prompt_generation_raw_item": item,
@@ -973,7 +1198,14 @@ def parse_storyboard_stage_items(content: str, generation_type: str) -> List[Dic
     if generation_type == "storyboard_refinement":
         items = _extract_items_by_keys(
             payload,
-            ("storyboard_execution_item", "storyboard_execution_items", "item", "items", "分镜细化", "分镜细化列表"),
+            (
+                "storyboard_execution_item",
+                "storyboard_execution_items",
+                "item",
+                "items",
+                "分镜细化",
+                "分镜细化列表",
+            ),
         )
         return [
             _normalize_storyboard_refinement_item(item, index)
@@ -998,7 +1230,14 @@ def parse_storyboard_stage_items(content: str, generation_type: str) -> List[Dic
     if generation_type == "storyboard_prompt_generation":
         items = _extract_items_by_keys(
             payload,
-            ("storyboard_prompt_item", "storyboard_prompt_items", "item", "items", "视频提示词", "视频提示词列表"),
+            (
+                "storyboard_prompt_item",
+                "storyboard_prompt_items",
+                "item",
+                "items",
+                "视频提示词",
+                "视频提示词列表",
+            ),
         )
         return [
             _normalize_storyboard_prompt_item(item, index)
@@ -1043,7 +1282,8 @@ def _normalize_storyboard_refinement_item(item: Dict[str, Any], index: int) -> D
         "sound_effect": _first_value(item, "sound_effect", "音效") or "",
         "atmosphere": _first_value(item, "atmosphere", "氛围参考", "画面氛围") or "",
         "duration_suggestion": _first_value(item, "duration_suggestion", "时长建议") or "",
-        "production_focus": _first_value(item, "production_focus", "制作重点", "制作重点提示词") or "",
+        "production_focus": _first_value(item, "production_focus", "制作重点", "制作重点提示词")
+        or "",
         "negative_prompt": _first_value(item, "negative_prompt", "负面规避词", "负面规避") or "",
         "ending_frame": _first_value(item, "ending_frame", "结尾画面", "收束画面") or "",
     }
@@ -1082,6 +1322,9 @@ def _make_storyboard_from_item(
     event_goal = _optional_str(item.get("event_goal"))
     split_reason = _optional_str(item.get("split_reason"))
     item_extra = item.get("extra") if isinstance(item.get("extra"), dict) else {}
+    estimated_duration_seconds = _positive_duration_seconds(
+        item.get("estimated_duration_seconds")
+    )
     return ProjectStoryboard(
         project_id=project_id,
         chapter_id=chapter_id,
@@ -1113,6 +1356,11 @@ def _make_storyboard_from_item(
         extra={
             **item_extra,
             **(extra or {}),
+            **(
+                {"estimated_duration_seconds": estimated_duration_seconds}
+                if estimated_duration_seconds is not None
+                else {}
+            ),
             **({"event_goal": event_goal} if event_goal else {}),
             **({"split_reason": split_reason} if split_reason else {}),
             "raw_item": item,
@@ -1126,10 +1374,21 @@ def parse_storyboard_items(content: str) -> List[Dict[str, Any]]:
     items = _extract_storyboard_items(payload)
     if not isinstance(items, list):
         return []
-    return [_normalize_storyboard_item(item, index) for index, item in enumerate(items, start=1) if isinstance(item, dict)]
+    return [
+        _normalize_storyboard_item(item, index)
+        for index, item in enumerate(items, start=1)
+        if isinstance(item, dict)
+    ]
 
 
-async def _dump_storyboard_assets(db: AsyncSession, model: Any, project_id: UUID, user_id: UUID) -> str:
+async def _dump_storyboard_assets(
+    db: AsyncSession,
+    model: Any,
+    project_id: UUID,
+    user_id: UUID,
+    chapter: Optional[ProjectChapter] = None,
+    agent_context: Optional[Dict[str, object]] = None,
+) -> str:
     result = await db.execute(
         select(model)
         .where(
@@ -1139,8 +1398,105 @@ async def _dump_storyboard_assets(db: AsyncSession, model: Any, project_id: UUID
         )
         .order_by(model.created_at.asc())
     )
-    assets = [_storyboard_asset_payload(asset) for asset in result.scalars().all()]
+    model_assets = list(result.scalars().all())
+    if agent_context and chapter is not None:
+        model_assets = await _filter_agent_storyboard_assets(
+            db,
+            model_assets,
+            agent_context,
+            chapter,
+        )
+    assets = [_storyboard_asset_payload(asset) for asset in model_assets]
+    if agent_context:
+        await _append_agent_asset_variants(
+            db,
+            assets,
+            model_assets,
+            agent_context,
+            chapter,
+        )
     return json.dumps(assets, ensure_ascii=False)
+
+
+async def _filter_agent_storyboard_assets(
+    db: AsyncSession,
+    assets: List[Any],
+    agent_context: Dict[str, object],
+    chapter: ProjectChapter,
+) -> List[Any]:
+    production_id = _parse_uuid(agent_context.get("agent_production_id"))
+    if production_id is None or not assets:
+        return assets
+    result = await db.execute(
+        select(AgentAssetCandidate).where(
+            AgentAssetCandidate.production_id == production_id,
+            AgentAssetCandidate.materialized_asset_id.in_([asset.id for asset in assets]),
+        )
+    )
+    candidates = {
+        candidate.materialized_asset_id: candidate
+        for candidate in result.scalars().all()
+        if candidate.materialized_asset_id is not None
+    }
+    episode_number = int((chapter.extra or {}).get("episode_number") or 0)
+    return [
+        asset
+        for asset in assets
+        if (candidate := candidates.get(asset.id)) is None
+        or not candidate.episode_numbers
+        or episode_number in candidate.episode_numbers
+    ]
+
+
+async def _append_agent_asset_variants(
+    db: AsyncSession,
+    payloads: List[Dict[str, Any]],
+    assets: List[Any],
+    agent_context: Dict[str, object],
+    chapter: Optional[ProjectChapter],
+) -> None:
+    production_id = _parse_uuid(agent_context.get("agent_production_id"))
+    asset_ids = [asset.id for asset in assets]
+    if production_id is None or not asset_ids:
+        return
+    candidate_result = await db.execute(
+        select(AgentAssetCandidate).where(
+            AgentAssetCandidate.production_id == production_id,
+            AgentAssetCandidate.materialized_asset_id.in_(asset_ids),
+        )
+    )
+    candidates = list(candidate_result.scalars().all())
+    if not candidates:
+        return
+    variant_result = await db.execute(
+        select(AgentAssetVariant)
+        .where(
+            AgentAssetVariant.production_id == production_id,
+            AgentAssetVariant.base_candidate_id.in_([item.id for item in candidates]),
+            AgentAssetVariant.review_status != "rejected",
+        )
+        .order_by(AgentAssetVariant.created_at, AgentAssetVariant.id)
+    )
+    episode_number = int((chapter.extra or {}).get("episode_number") or 0) if chapter else 0
+    variants_by_candidate: Dict[UUID, List[Dict[str, Any]]] = {}
+    for variant in variant_result.scalars().all():
+        episode_numbers = [int(value) for value in variant.episode_numbers or []]
+        if episode_numbers and episode_number not in episode_numbers:
+            continue
+        variants_by_candidate.setdefault(variant.base_candidate_id, []).append(
+            {
+                "id": str(variant.id),
+                "name": variant.canonical_name,
+                "type": variant.variant_type,
+                "description": variant.description,
+                "trigger_reason": variant.trigger_reason,
+                "content": variant.content or {},
+            }
+        )
+    candidate_by_asset = {item.materialized_asset_id: item for item in candidates}
+    for payload, asset in zip(payloads, assets):
+        candidate = candidate_by_asset.get(asset.id)
+        payload["variants"] = variants_by_candidate.get(candidate.id, []) if candidate else []
 
 
 async def _list_enabled_storyboards(
@@ -1248,9 +1604,13 @@ def _storyboard_continuity_context(
     storyboards: List[ProjectStoryboard],
     current: ProjectStoryboard,
 ) -> Dict[str, Any]:
-    current_index = next((index for index, item in enumerate(storyboards) if item.id == current.id), -1)
+    current_index = next(
+        (index for index, item in enumerate(storyboards) if item.id == current.id), -1
+    )
     previous_storyboard = storyboards[current_index - 1] if current_index > 0 else None
-    next_storyboard = storyboards[current_index + 1] if 0 <= current_index < len(storyboards) - 1 else None
+    next_storyboard = (
+        storyboards[current_index + 1] if 0 <= current_index < len(storyboards) - 1 else None
+    )
     return {
         "position": {
             "current_index": current_index + 1 if current_index >= 0 else current.shot_number,
@@ -1263,7 +1623,9 @@ def _storyboard_continuity_context(
     }
 
 
-def _storyboard_continuity_payload(storyboard: Optional[ProjectStoryboard]) -> Optional[Dict[str, Any]]:
+def _storyboard_continuity_payload(
+    storyboard: Optional[ProjectStoryboard],
+) -> Optional[Dict[str, Any]]:
     if storyboard is None:
         return None
     return {
@@ -1336,7 +1698,10 @@ def _storyboard_stage_keys(generation_type: str) -> Tuple[str, str]:
     if generation_type == "storyboard_refinement":
         return "storyboard_refinement_status", "storyboard_refinement_task_record_id"
     if _is_storyboard_image_prompt_generation(generation_type):
-        return "storyboard_image_prompt_generation_status", "storyboard_image_prompt_generation_task_record_id"
+        return (
+            "storyboard_image_prompt_generation_status",
+            "storyboard_image_prompt_generation_task_record_id",
+        )
     if generation_type == "storyboard_prompt_generation":
         return "storyboard_prompt_generation_status", "storyboard_prompt_generation_task_record_id"
     return "storyboard_analysis_status", "storyboard_analysis_task_record_id"
@@ -1374,19 +1739,30 @@ def _build_merged_storyboard_item(
     payload: ProjectStoryboardMergeRequest,
 ) -> Dict[str, Any]:
     first = storyboards[0]
-    source_content = payload.source_content or _join_texts(storyboard.source_content for storyboard in storyboards)
+    source_content = payload.source_content or _join_texts(
+        storyboard.source_content for storyboard in storyboards
+    )
     action = payload.action or _join_texts(storyboard.action for storyboard in storyboards)
     split_reason = payload.split_reason or "用户判断所选分镜属于同一连续事件，合并为一个分镜。"
     return {
         "shot_number": first.shot_number,
         "title": payload.title or _merged_title(storyboards),
         "source_content": source_content,
-        "event_goal": payload.event_goal or _join_texts(storyboard.event_goal for storyboard in storyboards) or "推进连续事件",
-        "scene_name": payload.scene_name or _first_nonempty(storyboard.scene_name for storyboard in storyboards),
-        "characters": payload.characters if payload.characters is not None else _merge_string_lists(storyboard.characters for storyboard in storyboards),
-        "props": payload.props if payload.props is not None else _merge_string_lists(storyboard.props for storyboard in storyboards),
+        "event_goal": payload.event_goal
+        or _join_texts(storyboard.event_goal for storyboard in storyboards)
+        or "推进连续事件",
+        "scene_name": payload.scene_name
+        or _first_nonempty(storyboard.scene_name for storyboard in storyboards),
+        "characters": payload.characters
+        if payload.characters is not None
+        else _merge_string_lists(storyboard.characters for storyboard in storyboards),
+        "props": payload.props
+        if payload.props is not None
+        else _merge_string_lists(storyboard.props for storyboard in storyboards),
         "action": action,
-        "dialogue": payload.dialogue if payload.dialogue is not None else _join_texts(storyboard.dialogue for storyboard in storyboards),
+        "dialogue": payload.dialogue
+        if payload.dialogue is not None
+        else _join_texts(storyboard.dialogue for storyboard in storyboards),
         "split_reason": split_reason,
         "extra": payload.extra or {},
     }
@@ -1461,36 +1837,300 @@ def _merge_string_lists(values: Any) -> List[str]:
 
 
 def _normalize_storyboard_item(item: Dict[str, Any], index: int) -> Dict[str, Any]:
-    description_prompt = str(_first_value(item, "description_prompt", "画面描述", "视频提示词") or "")
+    description_prompt = str(
+        _first_value(item, "description_prompt", "画面描述", "视频提示词") or ""
+    )
     scenes = _as_string_list(_first_value(item, "scenes", "场景", "场景名称"))
+    shots = [
+        _normalize_agent_group_shot(shot, shot_index)
+        for shot_index, shot in enumerate(item.get("shots") or item.get("镜头组") or [], start=1)
+        if isinstance(shot, dict)
+    ]
+    duration_seconds = (
+        estimate_agent_shot_group_duration(shots)
+        if shots
+        else _duration_seconds_from_value(
+            _first_value(
+                item,
+                "estimated_duration_seconds",
+                "duration_seconds",
+                "duration_suggestion",
+                "预估时长",
+                "时长建议",
+            )
+        )
+    )
+    shot_characters = _ordered_shot_values(shots, "characters")
+    shot_props = _ordered_shot_values(shots, "props")
+    shot_scenes = _ordered_shot_values(shots, "scene_name")
+    first_shot = shots[0] if shots else {}
     return {
         **item,
-        "shot_number": _first_value(item, "shot_number", "storyboard_index", "分镜序号", "镜头编号") or index,
-        "title": _first_value(item, "title", "标题") or f"分镜{_first_value(item, 'storyboard_index') or index}",
-        "source_content": _first_value(item, "source_content", "original_text", "原文", "原始文本") or "",
+        "shot_number": _first_value(
+            item,
+            "group_number",
+            "shot_number",
+            "storyboard_index",
+            "分镜组序号",
+            "分镜序号",
+            "镜头编号",
+        )
+        or index,
+        "title": _first_value(item, "title", "标题")
+        or f"分镜{_first_value(item, 'storyboard_index') or index}",
+        "source_content": _first_value(item, "source_content", "original_text", "原文", "原始文本")
+        or "",
         "event_goal": _first_value(item, "event_goal", "叙事目标", "事件目标") or "",
-        "scene_name": _first_value(item, "scene_name", "scene", "场景名称") or (scenes[0] if scenes else ""),
-        "scene_state": "",
-        "shot_size": "",
-        "camera_angle": "",
-        "camera_movement": "",
-        "screen_execution": "",
-        "characters": _first_value(item, "characters", "角色", "人物") or [],
-        "props": _first_value(item, "props", "道具") or [],
-        "action": _first_value(item, "action", "动作") or description_prompt,
-        "character_action": "",
-        "character_expression": "",
-        "dialogue": _first_value(item, "dialogue", "台词") or "",
-        "sound_effect": "",
-        "atmosphere": "",
+        "scene_name": _first_value(item, "scene_name", "scene", "场景名称")
+        or (scenes[0] if scenes else "")
+        or (shot_scenes[0] if shot_scenes else ""),
+        "scene_state": _first_value(item, "scene_state", "场景状态") or "",
+        "shot_size": _first_value(item, "shot_size", "景别")
+        or first_shot.get("shot_size")
+        or "",
+        "camera_angle": _first_value(item, "camera_angle", "拍摄角度", "机位")
+        or first_shot.get("camera_angle")
+        or "",
+        "camera_movement": _first_value(item, "camera_movement", "运镜")
+        or first_shot.get("camera_movement")
+        or "",
+        "screen_execution": _first_value(item, "screen_execution", "画面执行")
+        or _shot_group_screen_execution(shots),
+        "characters": _merge_ordered_values(
+            _as_string_list(_first_value(item, "characters", "角色", "人物")),
+            shot_characters,
+        ),
+        "props": _merge_ordered_values(
+            _as_string_list(_first_value(item, "props", "道具")),
+            shot_props,
+        ),
+        "action": _first_value(item, "action", "动作")
+        or _shot_group_screen_execution(shots)
+        or description_prompt,
+        "character_action": _first_value(item, "character_action", "角色动作") or "",
+        "character_expression": _first_value(item, "character_expression", "角色表情") or "",
+        "dialogue": _first_value(item, "dialogue", "台词")
+        or _shot_group_dialogue(shots),
+        "sound_effect": _first_value(item, "sound_effect", "音效") or "",
+        "atmosphere": _first_value(item, "atmosphere", "氛围参考", "画面氛围") or "",
         "image_prompt": "",
         "video_prompt": "",
-        "duration_suggestion": "",
-        "production_focus": "",
+        "duration_suggestion": f"{duration_seconds}秒" if duration_seconds else "",
+        "estimated_duration_seconds": duration_seconds or 0,
+        "production_focus": _first_value(item, "production_focus", "制作重点") or "",
         "negative_prompt": "",
-        "ending_frame": "",
+        "ending_frame": _first_value(item, "ending_frame", "结尾画面", "收束画面") or "",
         "split_reason": _first_value(item, "split_reason", "拆分理由") or "",
+        "shots": shots,
     }
+
+
+def _normalize_agent_group_shot(item: Dict[str, Any], index: int) -> Dict[str, Any]:
+    return {
+        "shot_number": index,
+        "shot_size": str(_first_value(item, "shot_size", "景别") or "").strip(),
+        "camera_shot": str(
+            _first_value(item, "camera_shot", "shooting_shot", "拍摄镜头", "镜头拍摄") or ""
+        ).strip(),
+        "camera_angle": str(
+            _first_value(item, "camera_angle", "拍摄角度", "机位") or ""
+        ).strip(),
+        "camera_movement": str(
+            _first_value(item, "camera_movement", "镜头运镜", "运镜") or ""
+        ).strip(),
+        "visual_content": str(
+            _first_value(item, "visual_content", "screen_content", "画面内容", "画面执行")
+            or ""
+        ).strip(),
+        "scene_name": str(_first_value(item, "scene_name", "场景名称", "场景") or "").strip(),
+        "characters": _as_string_list(_first_value(item, "characters", "人物", "角色")),
+        "props": _as_string_list(_first_value(item, "props", "道具")),
+        "speaker": str(_first_value(item, "speaker", "说话人物", "台词人物") or "").strip(),
+        "dialogue": str(_first_value(item, "dialogue", "台词") or "").strip(),
+    }
+
+
+def estimate_agent_shot_group_duration(shots: List[Dict[str, Any]]) -> int:
+    chinese_character_count = 0
+    english_word_count = 0
+    for shot in shots:
+        dialogue = str(shot.get("dialogue") or "")
+        chinese_character_count += len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", dialogue))
+        english_word_count += len(re.findall(r"[A-Za-z]+(?:['’-][A-Za-z]+)*", dialogue))
+    dialogue_seconds = math.ceil(
+        chinese_character_count / 4 + english_word_count / 4
+    )
+    visual_seconds = max(4, len(shots) * 2)
+    return max(visual_seconds, dialogue_seconds)
+
+
+def build_agent_storyboard_prompt(
+    visual_style: str,
+    shots: List[Dict[str, Any]],
+    duration_seconds: Optional[int] = None,
+) -> str:
+    lines = [
+        f"画面风格：{visual_style.strip() or '沿用项目整体画风'}",
+        "视频中不得出现任何字幕、文字叠加，保持纯画面。不要BGM，不要配乐。",
+    ]
+    for index, shot in enumerate(shots, start=1):
+        line = (
+            f"镜头{index}：景别：{shot.get('shot_size') or ''}；"
+            f"拍摄镜头：{shot.get('camera_shot') or ''}；"
+            f"拍摄角度：{shot.get('camera_angle') or ''}；"
+            f"镜头运镜：{shot.get('camera_movement') or ''}；"
+            f"画面内容：{shot.get('visual_content') or ''}"
+        )
+        dialogue = str(shot.get("dialogue") or "").strip()
+        if dialogue:
+            speaker = str(shot.get("speaker") or "人物").strip()
+            line += f"；人物说台词：{speaker}：{dialogue}"
+        lines.append(line)
+    if duration_seconds is not None:
+        lines.append(f"分镜组总时长：{duration_seconds}秒")
+    return "\n".join(lines)
+
+
+def _prepare_agent_storyboard_groups(
+    items: List[Dict[str, Any]],
+    visual_style: str,
+) -> List[Dict[str, Any]]:
+    prepared = []
+    for item in items:
+        shots = item.get("shots") if isinstance(item.get("shots"), list) else []
+        if not shots:
+            raise AppException("分镜组必须包含至少一个镜头", code=50231, status_code=502)
+        if any(
+            not shot.get("shot_size")
+            or not shot.get("camera_shot")
+            or not shot.get("camera_angle")
+            or not shot.get("camera_movement")
+            or not shot.get("visual_content")
+            for shot in shots
+        ):
+            raise AppException("分镜组镜头字段不完整", code=50231, status_code=502)
+        duration_seconds = estimate_agent_shot_group_duration(shots)
+        if not 4 <= duration_seconds <= 15:
+            raise AppException(
+                "模型未按剪辑规则拆分分镜组，预估时长超出 4-15 秒",
+                code=50231,
+                status_code=502,
+            )
+        prompt = build_agent_storyboard_prompt(
+            visual_style,
+            shots,
+            duration_seconds,
+        )
+        prepared.append(
+            {
+                **item,
+                "duration_suggestion": f"{duration_seconds}秒",
+                "estimated_duration_seconds": duration_seconds,
+                "video_prompt": prompt,
+                "extra": {
+                    **(item.get("extra") if isinstance(item.get("extra"), dict) else {}),
+                    "agent_shots": shots,
+                    "agent_storyboard_prompt": prompt,
+                    "agent_storyboard_prompt_template": prompt,
+                    "agent_storyboard_prompt_notes": "",
+                    "agent_storyboard_revision": 1,
+                    "agent_storyboard_status": "ready",
+                    "agent_storyboard_origin": "model",
+                },
+            }
+        )
+    return prepared
+
+
+def _validate_agent_storyboard_sequence(
+    items: List[Dict[str, Any]],
+    chapter_content: str,
+) -> None:
+    normalized_source = _normalize_storyboard_source(chapter_content)
+    if not normalized_source:
+        raise AppException("当前分集没有可用于分镜分析的正文", code=50231, status_code=502)
+    cursor = 0
+    covered_length = 0
+    for index, item in enumerate(items, start=1):
+        if _as_int(item.get("shot_number"), 0) != index:
+            raise AppException(
+                "模型返回的分镜组序号不连续",
+                code=50231,
+                status_code=502,
+            )
+        source_content = _normalize_storyboard_source(item.get("source_content"))
+        if not source_content:
+            raise AppException(
+                "模型返回的分镜组缺少对应原文",
+                code=50231,
+                status_code=502,
+            )
+        position = normalized_source.find(source_content, cursor)
+        if position < 0:
+            raise AppException(
+                "模型返回的分镜组原文不属于当前分集或顺序错误",
+                code=50231,
+                status_code=502,
+            )
+        cursor = position + len(source_content)
+        covered_length += len(source_content)
+    if covered_length / len(normalized_source) < 0.8:
+        raise AppException(
+            "模型返回的分镜组未覆盖当前分集主要剧情",
+            code=50231,
+            status_code=502,
+        )
+
+
+def _normalize_storyboard_source(value: Any) -> str:
+    return re.sub(r"[\W_]+", "", str(value or ""), flags=re.UNICODE).lower()
+
+
+def _ordered_shot_values(shots: List[Dict[str, Any]], key: str) -> List[str]:
+    values: List[str] = []
+    for shot in shots:
+        raw = shot.get(key)
+        items = raw if isinstance(raw, list) else [raw]
+        for item in items:
+            value = str(item or "").strip()
+            if value and value not in values:
+                values.append(value)
+    return values
+
+
+def _merge_ordered_values(first: List[str], second: List[str]) -> List[str]:
+    return list(dict.fromkeys([*first, *second]))
+
+
+def _shot_group_screen_execution(shots: List[Dict[str, Any]]) -> str:
+    return "\n".join(
+        f"镜头{index}：{shot.get('visual_content')}"
+        for index, shot in enumerate(shots, start=1)
+        if shot.get("visual_content")
+    )
+
+
+def _shot_group_dialogue(shots: List[Dict[str, Any]]) -> str:
+    return "\n".join(
+        f"{shot.get('speaker') or '人物'}：{shot.get('dialogue')}"
+        for shot in shots
+        if shot.get("dialogue")
+    )
+
+
+def _duration_seconds_from_value(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    match = re.search(r"-?\d+(?:\.\d+)?", str(value))
+    if match is None:
+        return None
+    seconds = round(float(match.group(0)))
+    return seconds if seconds > 0 else None
+
+
+def _positive_duration_seconds(value: Any) -> Optional[int]:
+    duration = _duration_seconds_from_value(value)
+    return duration if duration and duration > 0 else None
 
 
 def _extract_storyboard_items(payload: Any) -> Optional[List[Any]]:
@@ -1498,7 +2138,16 @@ def _extract_storyboard_items(payload: Any) -> Optional[List[Any]]:
         return payload
     if not isinstance(payload, dict):
         return None
-    for key in ("storyboard_units", "items", "shots", "storyboards", "分镜", "分镜列表"):
+    for key in (
+        "storyboard_groups",
+        "storyboard_units",
+        "items",
+        "shots",
+        "storyboards",
+        "分镜组",
+        "分镜",
+        "分镜列表",
+    ):
         value = payload.get(key)
         if isinstance(value, list):
             return value
@@ -1527,6 +2176,7 @@ def _looks_like_storyboard_item(value: Dict[str, Any]) -> bool:
     keys = set(value.keys())
     storyboard_keys = {
         "shot_number",
+        "group_number",
         "storyboard_index",
         "title",
         "source_content",
@@ -1549,6 +2199,8 @@ def _looks_like_storyboard_item(value: Dict[str, Any]) -> bool:
         "production_focus",
         "negative_prompt",
         "ending_frame",
+        "shots",
+        "分镜组序号",
         "分镜序号",
         "镜头编号",
         "标题",

@@ -70,4 +70,5 @@ async def material_image(
     current_user: User = Depends(get_current_user),
 ):
     material = await get_enabled_material_or_404(db, material_id)
+    await db.close()
     return await stream_material_image(material)

@@ -7,7 +7,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.responses import success
 from app.db.session import get_db
 from app.schemas.ai_model import AiModelOptionOut, AiModelOut
-from app.services.ai_models import get_ai_model_or_404, list_ai_model_options, resolve_ai_model_capabilities
+from app.services.ai_models import ( get_ai_model_or_404, list_ai_model_options,
+    resolve_ai_model_capabilities,
+)
 
 
 def dump_ai_model(model, schema):

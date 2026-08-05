@@ -7,7 +7,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.exceptions import AppException
-from app.core.security import create_access_token, hash_password, verify_password
+from app.core.security import (
+    create_access_token,
+    hash_password,
+    verify_password,
+    verify_password_and_update,
+)
 from app.models.user import User
 from app.schemas.user import (
     LoginRequest,
@@ -24,6 +29,7 @@ from app.services.phone_verification import (
 )
 
 NEW_USER_REGISTER_POINTS = 100
+DUMMY_PASSWORD_HASH = hash_password("invalid-login-password")
 
 
 async def get_user_by_id(db: AsyncSession, user_id: UUID) -> Optional[User]:
@@ -33,7 +39,9 @@ async def get_user_by_id(db: AsyncSession, user_id: UUID) -> Optional[User]:
 
 async def get_user_by_identity(db: AsyncSession, identity: str) -> Optional[User]:
     result = await db.execute(
-        select(User).where(or_(User.account == identity, User.phone == identity, User.email == identity))
+        select(User).where(
+            or_(User.account == identity, User.phone == identity, User.email == identity)
+        )
     )
     return result.scalar_one_or_none()
 
@@ -91,12 +99,23 @@ async def send_register_code(db: AsyncSession, payload: SendRegisterSmsCodeReque
 
 async def login_user(db: AsyncSession, payload: LoginRequest) -> TokenOut:
     user = await get_user_by_identity(db, payload.identifier)
-    if user is None or not verify_password(payload.password, user.password_hash):
+    if user is None:
+        verify_password(payload.password, DUMMY_PASSWORD_HASH)
+        raise AppException("账号或密码错误", code=40101, status_code=401)
+    verified, updated_password_hash = verify_password_and_update(
+        payload.password,
+        user.password_hash,
+    )
+    if not verified:
         raise AppException("账号或密码错误", code=40101, status_code=401)
     if not user.is_enabled:
         raise AppException("账号已被禁用", code=40302, status_code=403)
 
-    token = create_access_token(str(user.id))
+    if updated_password_hash is not None:
+        user.password_hash = updated_password_hash
+        await db.commit()
+
+    token = create_access_token(str(user.id), token_version=user.token_version)
     return TokenOut(
         access_token=token,
         expires_in=settings.access_token_expire_minutes * 60,

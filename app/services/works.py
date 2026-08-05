@@ -1,9 +1,11 @@
+import logging
+from datetime import timedelta
 from pathlib import PurePosixPath
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from uuid import UUID, uuid4
 
 from fastapi import UploadFile
-from sqlalchemy import delete, exists, func, select, update
+from sqlalchemy import and_, delete, exists, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
@@ -22,7 +24,8 @@ from app.schemas.work import (
     WorkUpdateRequest,
     WorkUploadOut,
 )
-from app.services.uploads import detect_content_type, detect_file_type
+from app.services.oss_deletions import enqueue_oss_deletions, process_oss_deletion_outbox
+from app.services.uploads import detect_content_type, detect_file_type, matches_media_signature
 
 
 WORK_VISIBILITIES = {"public", "private"}
@@ -30,6 +33,7 @@ WORK_STATUSES = {"draft", "published", "hidden", "deleted"}
 WORK_OWNER_STATUSES = {"draft", "published"}
 WORK_MEDIA_TYPES = {"image", "video"}
 WORKS_OSS_PREFIX = "works"
+logger = logging.getLogger(__name__)
 
 
 async def upload_work_file(db: AsyncSession, user: User, file: UploadFile) -> WorkUploadOut:
@@ -46,7 +50,14 @@ async def upload_work_file(db: AsyncSession, user: User, file: UploadFile) -> Wo
     if size <= 0:
         raise AppException("上传文件不能为空", code=40007, status_code=400)
     if size > max_size:
-        raise AppException(f"上传文件不能超过 {settings.max_upload_size_mb}MB", code=41300, status_code=413)
+        raise AppException(
+            f"上传文件不能超过 {settings.max_upload_size_mb}MB", code=41300, status_code=413
+        )
+    if not matches_media_signature(file.file, content_type):
+        raise AppException("上传文件内容与图片或视频类型不匹配", code=40050, status_code=400)
+
+    await _lock_user_work_storage(db, user.id)
+    await _enforce_user_work_storage_limit(db, user.id, size)
 
     upload_id = uuid4()
     object_key = _work_upload_object_key(user.id, upload_id, filename)
@@ -55,7 +66,7 @@ async def upload_work_file(db: AsyncSession, user: User, file: UploadFile) -> Wo
         oss_client.bucket.put_object,
         object_key,
         file.file,
-        headers={"Content-Type": content_type},
+        headers={"Content-Type": content_type, "x-oss-object-acl": "private"},
     )
     if result.status >= 300:
         raise AppException("OSS 上传失败", code=50011, status_code=500)
@@ -74,15 +85,49 @@ async def upload_work_file(db: AsyncSession, user: User, file: UploadFile) -> Wo
     db.add(upload)
     await db.commit()
     await db.refresh(upload)
+    preview_url = _work_upload_preview_url(upload.id)
     return WorkUploadOut(
         upload_id=upload.id,
         media_type=upload.media_type,
-        url=upload.url,
+        url=preview_url,
         filename=upload.filename,
         content_type=upload.content_type,
         size=upload.size,
-        preview_url=upload.url,
+        preview_url=preview_url,
     )
+
+
+async def purge_unused_work_uploads(db: AsyncSession, limit: int = 100) -> int:
+    ttl_hours = max(0, settings.unused_work_upload_ttl_hours)
+    if ttl_hours == 0:
+        return 0
+    cutoff = beijing_datetime() - timedelta(hours=ttl_hours)
+    result = await db.execute(
+        select(UserWorkUpload)
+        .where(
+            UserWorkUpload.is_used.is_(False),
+            UserWorkUpload.created_at < cutoff,
+        )
+        .order_by(UserWorkUpload.created_at.asc())
+        .limit(max(1, limit))
+        .with_for_update(skip_locked=True)
+    )
+    uploads = list(result.scalars().all())
+    if not uploads:
+        return 0
+
+    oss_client = OssClient()
+    deleted = 0
+    for upload in uploads:
+        try:
+            await run_in_threadpool(oss_client.delete_object, upload.object_key)
+        except Exception:
+            logger.exception("Failed to clean up unused work upload: upload_id=%s", upload.id)
+            continue
+        await db.delete(upload)
+        deleted += 1
+    await db.commit()
+    return deleted
 
 
 async def create_work(db: AsyncSession, user: User, payload: WorkCreateRequest) -> WorkOut:
@@ -134,7 +179,7 @@ async def create_work(db: AsyncSession, user: User, payload: WorkCreateRequest) 
 
 async def list_public_works(
     db: AsyncSession,
-    user: User,
+    user: Optional[User],
     page: int,
     page_size: int,
 ) -> Tuple[List[WorkOut], int]:
@@ -143,9 +188,10 @@ async def list_public_works(
         UserWork.status == "published",
         UserWork.visibility == "public",
     ]
-    total = await _count_works(db, conditions)
-    works = await _query_works(db, conditions, page, page_size, rank_order=True)
-    return await _build_work_out_list(db, works, user), total
+    works, total = await _query_public_works_with_total(
+        db, conditions, page, page_size
+    )
+    return await _build_work_out_list(db, works, user, preview_only=True), total
 
 
 async def list_my_works(
@@ -195,20 +241,30 @@ async def list_admin_works(
     return await _build_work_out_list(db, works, user), total
 
 
-async def get_work_detail(db: AsyncSession, work_id: UUID, user: User) -> WorkOut:
+async def get_work_detail(
+    db: AsyncSession, work_id: UUID, user: Optional[User]
+) -> WorkOut:
     work = await _get_work_or_404(db, work_id)
     _ensure_can_view_work(work, user)
     if work.status == "published" and work.visibility == "public" and work.is_enabled:
-        work.view_count += 1
+        await db.execute(
+            update(UserWork)
+            .where(UserWork.id == work.id)
+            .values(view_count=UserWork.view_count + 1, updated_at=beijing_datetime())
+        )
         await db.commit()
         await db.refresh(work)
     return await _build_work_out(db, work, user)
 
 
-async def update_work(db: AsyncSession, work_id: UUID, user: User, payload: WorkUpdateRequest) -> WorkOut:
+async def update_work(
+    db: AsyncSession, work_id: UUID, user: User, payload: WorkUpdateRequest
+) -> WorkOut:
     work = await _get_work_or_404(db, work_id)
     if work.user_id != user.id:
         raise AppException("无权修改该作品", code=40320, status_code=403)
+    if work.status == "deleted":
+        raise AppException("已删除作品不能恢复或修改", code=40051, status_code=400)
     data = payload.model_dump(exclude_unset=True)
     media_items = data.pop("media_items", None)
     target_status = data.get("status", work.status)
@@ -228,31 +284,36 @@ async def update_work(db: AsyncSession, work_id: UUID, user: User, payload: Work
         for key, value in data.items():
             setattr(work, key, value)
         work.updated_at = beijing_datetime()
-        await db.flush()
-        await _delete_oss_objects(removed_object_keys)
+        await enqueue_oss_deletions(db, removed_object_keys)
         await db.commit()
     except Exception:
         await db.rollback()
         raise
+    await _process_queued_oss_deletions_best_effort(db, removed_object_keys)
     await db.refresh(work)
     return await _build_work_out(db, work, user)
 
 
-async def admin_update_work(db: AsyncSession, work_id: UUID, user: User, payload: AdminWorkUpdateRequest) -> WorkOut:
+async def admin_update_work(
+    db: AsyncSession, work_id: UUID, user: User, payload: AdminWorkUpdateRequest
+) -> WorkOut:
     work = await _get_work_or_404(db, work_id)
+    if work.status == "deleted":
+        raise AppException("已删除作品不能恢复或修改", code=40051, status_code=400)
     data = payload.model_dump(exclude_unset=True)
     if "visibility" in data and data["visibility"] not in WORK_VISIBILITIES:
         raise AppException("作品权限参数不正确", code=40042, status_code=400)
     if "status" in data and data["status"] not in WORK_STATUSES:
         raise AppException("作品状态参数不正确", code=40043, status_code=400)
     deleting = data.get("status") == "deleted" and work.status != "deleted"
-    if deleting:
-        await _delete_work_oss_objects(db, work.id)
+    object_keys = await _work_oss_object_keys(db, work.id) if deleting else []
     for key, value in data.items():
         setattr(work, key, value)
     work.is_enabled = work.status != "deleted"
     work.updated_at = beijing_datetime()
+    await enqueue_oss_deletions(db, object_keys)
     await db.commit()
+    await _process_queued_oss_deletions_best_effort(db, object_keys)
     await db.refresh(work)
     return await _build_work_out(db, work, user)
 
@@ -285,12 +346,13 @@ async def admin_hide_work(db: AsyncSession, work_id: UUID, user: User) -> WorkOu
 
 async def admin_delete_work(db: AsyncSession, work_id: UUID, user: User) -> WorkOut:
     work = await _get_work_or_404(db, work_id)
-    if work.status != "deleted":
-        await _delete_work_oss_objects(db, work.id)
+    object_keys = await _work_oss_object_keys(db, work.id)
     work.status = "deleted"
     work.is_enabled = False
     work.updated_at = beijing_datetime()
+    await enqueue_oss_deletions(db, object_keys)
     await db.commit()
+    await _process_queued_oss_deletions_best_effort(db, object_keys)
     await db.refresh(work)
     return await _build_work_out(db, work, user)
 
@@ -299,12 +361,13 @@ async def delete_work(db: AsyncSession, work_id: UUID, user: User) -> WorkOut:
     work = await _get_work_or_404(db, work_id)
     if work.user_id != user.id:
         raise AppException("无权删除该作品", code=40320, status_code=403)
-    if work.status != "deleted":
-        await _delete_work_oss_objects(db, work.id)
+    object_keys = await _work_oss_object_keys(db, work.id)
     work.status = "deleted"
     work.is_enabled = False
     work.updated_at = beijing_datetime()
+    await enqueue_oss_deletions(db, object_keys)
     await db.commit()
+    await _process_queued_oss_deletions_best_effort(db, object_keys)
     await db.refresh(work)
     return await _build_work_out(db, work, user)
 
@@ -322,7 +385,11 @@ async def like_work(db: AsyncSession, work_id: UUID, user: User) -> WorkOut:
         await db.rollback()
         work = await _get_work_or_404(db, work_id)
         return await _build_work_out(db, work, user)
-    work.like_count += 1
+    await db.execute(
+        update(UserWork)
+        .where(UserWork.id == work.id)
+        .values(like_count=UserWork.like_count + 1, updated_at=beijing_datetime())
+    )
     await db.commit()
     await db.refresh(work)
     return await _build_work_out(db, work, user)
@@ -330,7 +397,9 @@ async def like_work(db: AsyncSession, work_id: UUID, user: User) -> WorkOut:
 
 async def unlike_work(db: AsyncSession, work_id: UUID, user: User) -> WorkOut:
     work = await _get_work_or_404(db, work_id)
-    result = await db.execute(delete(UserWorkLike).where(UserWorkLike.work_id == work.id, UserWorkLike.user_id == user.id))
+    result = await db.execute(
+        delete(UserWorkLike).where(UserWorkLike.work_id == work.id, UserWorkLike.user_id == user.id)
+    )
     if result.rowcount:
         await db.execute(
             update(UserWork)
@@ -346,14 +415,24 @@ async def get_work_media_for_stream(
     db: AsyncSession,
     work_id: UUID,
     media_id: UUID,
-    user: User,
+    user: Optional[User],
 ) -> UserWorkMedia:
-    work = await _get_work_or_404(db, work_id)
-    _ensure_can_view_work(work, user)
     result = await db.execute(
-        select(UserWorkMedia).where(UserWorkMedia.id == media_id, UserWorkMedia.work_id == work_id)
+        select(UserWork, UserWorkMedia)
+        .outerjoin(
+            UserWorkMedia,
+            and_(
+                UserWorkMedia.work_id == UserWork.id,
+                UserWorkMedia.id == media_id,
+            ),
+        )
+        .where(UserWork.id == work_id)
     )
-    media = result.scalar_one_or_none()
+    row = result.one_or_none()
+    if row is None:
+        raise AppException("作品不存在", code=40420, status_code=404)
+    work, media = row
+    _ensure_can_view_work(work, user)
     if media is None:
         raise AppException("作品媒体不存在", code=40421, status_code=404)
     return media
@@ -361,7 +440,9 @@ async def get_work_media_for_stream(
 
 async def get_upload_for_preview(db: AsyncSession, upload_id: UUID, user: User) -> UserWorkUpload:
     result = await db.execute(
-        select(UserWorkUpload).where(UserWorkUpload.id == upload_id, UserWorkUpload.user_id == user.id)
+        select(UserWorkUpload).where(
+            UserWorkUpload.id == upload_id, UserWorkUpload.user_id == user.id
+        )
     )
     upload = result.scalar_one_or_none()
     if upload is None:
@@ -377,11 +458,13 @@ async def _uploads_for_create(
     if not upload_ids:
         return []
     result = await db.execute(
-        select(UserWorkUpload).where(
+        select(UserWorkUpload)
+        .where(
             UserWorkUpload.id.in_(upload_ids),
             UserWorkUpload.user_id == user_id,
             UserWorkUpload.is_used.is_(False),
         )
+        .with_for_update()
     )
     uploads = list(result.scalars().all())
     if len(uploads) != len(upload_ids):
@@ -465,12 +548,12 @@ async def _get_work_or_404(db: AsyncSession, work_id: UUID) -> UserWork:
     return work
 
 
-def _ensure_can_view_work(work: UserWork, user: User) -> None:
-    if user.is_admin:
+def _ensure_can_view_work(work: UserWork, user: Optional[User]) -> None:
+    if user is not None and user.is_admin:
         return
     if not work.is_enabled:
         raise AppException("作品不存在", code=40420, status_code=404)
-    if work.user_id == user.id:
+    if user is not None and work.user_id == user.id:
         return
     if work.status != "published":
         raise AppException("作品不存在", code=40420, status_code=404)
@@ -507,29 +590,101 @@ async def _query_works(
     return list(result.scalars().all())
 
 
-async def _build_work_out_list(db: AsyncSession, works: List[UserWork], user: User) -> List[WorkOut]:
+async def _query_public_works_with_total(
+    db: AsyncSession,
+    conditions: List[Any],
+    page: int,
+    page_size: int,
+) -> Tuple[List[UserWork], int]:
+    result = await db.execute(
+        select(UserWork, func.count().over().label("total"))
+        .where(*conditions)
+        .order_by(
+            UserWork.like_count.desc(),
+            UserWork.created_at.desc(),
+            UserWork.id.desc(),
+        )
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    rows = result.all()
+    if rows:
+        return [row[0] for row in rows], int(rows[0][1] or 0)
+    if page == 1:
+        return [], 0
+    return [], await _count_works(db, conditions)
+
+
+async def _build_work_out_list(
+    db: AsyncSession,
+    works: List[UserWork],
+    user: Optional[User],
+    *,
+    preview_only: bool = False,
+) -> List[WorkOut]:
     if not works:
         return []
     work_ids = [work.id for work in works]
-    media_result = await db.execute(
-        select(UserWorkMedia)
-        .where(UserWorkMedia.work_id.in_(work_ids))
-        .order_by(UserWorkMedia.work_id.asc(), UserWorkMedia.sort_order.asc(), UserWorkMedia.created_at.asc())
-    )
     media_by_work: Dict[UUID, List[UserWorkMedia]] = {work_id: [] for work_id in work_ids}
-    for media in media_result.scalars().all():
-        media_by_work.setdefault(media.work_id, []).append(media)
+    media_count_by_work: Dict[UUID, int] = {work_id: 0 for work_id in work_ids}
+    if preview_only:
+        media_result = await db.execute(
+            select(
+                UserWorkMedia,
+                func.count().over(partition_by=UserWorkMedia.work_id).label("media_count"),
+            )
+            .where(UserWorkMedia.work_id.in_(work_ids))
+            .distinct(UserWorkMedia.work_id)
+            .order_by(
+                UserWorkMedia.work_id.asc(),
+                UserWorkMedia.sort_order.asc(),
+                UserWorkMedia.created_at.asc(),
+                UserWorkMedia.id.asc(),
+            )
+        )
+        for media, media_count in media_result.all():
+            media_by_work[media.work_id] = [media]
+            media_count_by_work[media.work_id] = int(media_count or 0)
+    else:
+        media_result = await db.execute(
+            select(UserWorkMedia)
+            .where(UserWorkMedia.work_id.in_(work_ids))
+            .order_by(
+                UserWorkMedia.work_id.asc(),
+                UserWorkMedia.sort_order.asc(),
+                UserWorkMedia.created_at.asc(),
+            )
+        )
+        for media in media_result.scalars().all():
+            media_by_work.setdefault(media.work_id, []).append(media)
+        media_count_by_work = {
+            work_id: len(media_items) for work_id, media_items in media_by_work.items()
+        }
 
-    like_result = await db.execute(
-        select(UserWorkLike.work_id).where(UserWorkLike.work_id.in_(work_ids), UserWorkLike.user_id == user.id)
-    )
-    liked_work_ids = set(like_result.scalars().all())
-    return [_build_work_out_from_items(work, media_by_work.get(work.id, []), work.id in liked_work_ids) for work in works]
+    liked_work_ids: Set[UUID] = set()
+    if user is not None:
+        like_result = await db.execute(
+            select(UserWorkLike.work_id).where(
+                UserWorkLike.work_id.in_(work_ids), UserWorkLike.user_id == user.id
+            )
+        )
+        liked_work_ids = set(like_result.scalars().all())
+    return [
+        _build_work_out_from_items(
+            work,
+            media_by_work.get(work.id, []),
+            work.id in liked_work_ids,
+            media_count=media_count_by_work.get(work.id, 0),
+        )
+        for work in works
+    ]
 
 
-async def _build_work_out(db: AsyncSession, work: UserWork, user: User) -> WorkOut:
+async def _build_work_out(
+    db: AsyncSession, work: UserWork, user: Optional[User]
+) -> WorkOut:
     media_items = await _work_media_items(db, work.id)
-    liked = await _liked_by_user(db, work.id, user.id)
+    liked = await _liked_by_user(db, work.id, user.id) if user is not None else False
     return _build_work_out_from_items(work, media_items, liked)
 
 
@@ -537,6 +692,8 @@ def _build_work_out_from_items(
     work: UserWork,
     media_items: List[UserWorkMedia],
     liked: bool,
+    *,
+    media_count: Optional[int] = None,
 ) -> WorkOut:
     return WorkOut(
         id=work.id,
@@ -548,6 +705,7 @@ def _build_work_out_from_items(
         like_count=work.like_count,
         view_count=work.view_count,
         liked_by_me=liked,
+        media_count=len(media_items) if media_count is None else media_count,
         media_items=[_media_out(work.id, media) for media in media_items],
         created_at=work.created_at,
         updated_at=work.updated_at,
@@ -575,9 +733,43 @@ async def _work_has_media(db: AsyncSession, work_id: UUID) -> bool:
     return bool(result.scalar())
 
 
-async def _delete_work_oss_objects(db: AsyncSession, work_id: UUID) -> None:
+async def _lock_user_work_storage(db: AsyncSession, user_id: UUID) -> None:
+    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+
+
+async def _enforce_user_work_storage_limit(
+    db: AsyncSession, user_id: UUID, incoming_size: int
+) -> None:
+    limit_mb = max(0, settings.user_work_storage_limit_mb)
+    if limit_mb == 0:
+        return
+
+    pending_result = await db.execute(
+        select(func.coalesce(func.sum(UserWorkUpload.size), 0)).where(
+            UserWorkUpload.user_id == user_id,
+            UserWorkUpload.is_used.is_(False),
+        )
+    )
+    media_result = await db.execute(
+        select(func.coalesce(func.sum(UserWorkMedia.size), 0))
+        .join(UserWork, UserWork.id == UserWorkMedia.work_id)
+        .where(UserWork.user_id == user_id, UserWork.status != "deleted")
+    )
+    current_size = int(pending_result.scalar_one() or 0) + int(media_result.scalar_one() or 0)
+    limit_bytes = limit_mb * 1024 * 1024
+    if current_size + incoming_size > limit_bytes:
+        raise AppException(
+            f"作品存储空间已达到上限（{limit_mb}MB）",
+            code=41301,
+            status_code=413,
+        )
+
+
+async def _work_oss_object_keys(db: AsyncSession, work_id: UUID) -> List[str]:
     result = await db.execute(
-        select(UserWorkMedia.object_key, UserWorkMedia.thumbnail_object_key).where(UserWorkMedia.work_id == work_id)
+        select(UserWorkMedia.object_key, UserWorkMedia.thumbnail_object_key).where(
+            UserWorkMedia.work_id == work_id
+        )
     )
     object_keys: List[str] = []
     for object_key, thumbnail_object_key in result.all():
@@ -585,24 +777,29 @@ async def _delete_work_oss_objects(db: AsyncSession, work_id: UUID) -> None:
             object_keys.append(object_key)
         if thumbnail_object_key:
             object_keys.append(thumbnail_object_key)
-    await _delete_oss_objects(object_keys)
+    return object_keys
 
 
-async def _delete_oss_objects(object_keys: Sequence[str]) -> None:
-    object_keys = list(dict.fromkeys(object_keys))
-    if not object_keys:
+async def _process_queued_oss_deletions_best_effort(
+    db: AsyncSession,
+    object_keys: Sequence[str],
+) -> None:
+    keys = list(dict.fromkeys(key for key in object_keys if key))
+    if not keys:
         return
-    oss_client = OssClient()
-    for object_key in object_keys:
-        await run_in_threadpool(oss_client.delete_object, object_key)
+    try:
+        await process_oss_deletion_outbox(db, limit=len(keys), object_keys=keys)
+    except Exception:
+        await db.rollback()
+        logger.exception("Failed to process committed work media deletion outbox")
 
 
 def _media_out(work_id: UUID, media: UserWorkMedia) -> WorkMediaOut:
-    thumbnail_url = _oss_public_url(media.thumbnail_object_key) if media.thumbnail_object_key else None
+    stream_url = _work_media_stream_url(work_id, media.id)
     return WorkMediaOut(
         id=media.id,
         media_type=media.media_type,
-        url=media.url,
+        url=stream_url,
         filename=media.filename,
         content_type=media.content_type,
         size=media.size,
@@ -610,8 +807,12 @@ def _media_out(work_id: UUID, media: UserWorkMedia) -> WorkMediaOut:
         height=media.height,
         duration_seconds=media.duration_seconds,
         sort_order=media.sort_order,
-        stream_url=media.url,
-        thumbnail_url=thumbnail_url,
+        stream_url=stream_url,
+        thumbnail_url=(
+            _work_media_thumbnail_url(work_id, media.id)
+            if media.thumbnail_object_key
+            else None
+        ),
         created_at=media.created_at,
     )
 
@@ -630,8 +831,13 @@ def _works_object_key(*parts: str) -> str:
     return str(PurePosixPath(*key_parts))
 
 
-def _oss_public_url(object_key: str) -> str:
-    if settings.oss_public_base_url:
-        return f"{settings.oss_public_base_url.rstrip('/')}/{object_key.lstrip('/')}"
-    endpoint = settings.oss_endpoint.removeprefix("https://").removeprefix("http://").rstrip("/")
-    return f"https://{settings.oss_bucket_name}.{endpoint}/{object_key.lstrip('/')}"
+def _work_upload_preview_url(upload_id: UUID) -> str:
+    return f"{settings.api_prefix}/works/uploads/{upload_id}/preview"
+
+
+def _work_media_stream_url(work_id: UUID, media_id: UUID) -> str:
+    return f"{settings.api_prefix}/works/{work_id}/media/{media_id}/stream"
+
+
+def _work_media_thumbnail_url(work_id: UUID, media_id: UUID) -> str:
+    return f"{settings.api_prefix}/works/{work_id}/media/{media_id}/thumbnail"

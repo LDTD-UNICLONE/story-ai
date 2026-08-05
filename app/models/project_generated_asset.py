@@ -1,7 +1,7 @@
 import uuid
 from typing import Optional
 
-from sqlalchemy import Boolean, ForeignKey, JSON, String, Text, text
+from sqlalchemy import Boolean, ForeignKey, Index, JSON, String, Text, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -14,6 +14,27 @@ from app.models.task_record import UserTaskRecord
 
 class ProjectGeneratedAsset(Base, TimestampMixin):
     __tablename__ = "project_generated_assets"
+    __table_args__ = (
+        Index(
+            "uq_project_generated_assets_selected_target",
+            "project_id",
+            "user_id",
+            "target_type",
+            "target_id",
+            "media_type",
+            unique=True,
+            postgresql_where=text("is_selected"),
+        ),
+        Index(
+            "ix_project_generated_assets_target_media_selected",
+            "project_id",
+            "user_id",
+            "target_type",
+            "target_id",
+            "media_type",
+            "is_selected",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -55,11 +76,15 @@ class ProjectGeneratedAsset(Base, TimestampMixin):
     target_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True, nullable=False)
     media_type: Mapped[str] = mapped_column(String(16), index=True, nullable=False)
     result_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
-    result_urls: Mapped[list] = mapped_column(JSON, nullable=False, server_default=text("'[]'::json"))
+    result_urls: Mapped[list] = mapped_column(
+        JSON, nullable=False, server_default=text("'[]'::json")
+    )
     last_frame_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     generation_mode: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    status: Mapped[str] = mapped_column(String(32), index=True, nullable=False, server_default=text("'success'"))
+    status: Mapped[str] = mapped_column(
+        String(32), index=True, nullable=False, server_default=text("'success'")
+    )
     is_selected: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     extra: Mapped[dict] = mapped_column(JSON, nullable=False, server_default=text("'{}'::json"))
     is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))

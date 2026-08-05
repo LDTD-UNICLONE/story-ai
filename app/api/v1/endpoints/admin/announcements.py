@@ -63,7 +63,10 @@ async def admin_create_announcement(
     current_admin: User = Depends(get_current_admin_user),
 ):
     announcement = await create_announcement(db, payload)
-    return success(data=AnnouncementOut.model_validate(announcement).model_dump(mode="json"), message="创建成功")
+    return success(
+        data=AnnouncementOut.model_validate(announcement).model_dump(mode="json"),
+        message="创建成功",
+    )
 
 
 @router.get("/{announcement_id}")
@@ -98,7 +101,10 @@ async def admin_update_announcement(
     current_admin: User = Depends(get_current_admin_user),
 ):
     announcement = await update_announcement(db, announcement_id, payload)
-    return success(data=AnnouncementOut.model_validate(announcement).model_dump(mode="json"), message="更新成功")
+    return success(
+        data=AnnouncementOut.model_validate(announcement).model_dump(mode="json"),
+        message="更新成功",
+    )
 
 
 @router.delete("/{announcement_id}")
@@ -108,4 +114,7 @@ async def admin_delete_announcement(
     current_admin: User = Depends(get_current_admin_user),
 ):
     announcement = await delete_announcement(db, announcement_id)
-    return success(data=AnnouncementOut.model_validate(announcement).model_dump(mode="json"), message="删除成功")
+    return success(
+        data=AnnouncementOut.model_validate(announcement).model_dump(mode="json"),
+        message="删除成功",
+    )

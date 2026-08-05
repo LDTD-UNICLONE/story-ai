@@ -113,6 +113,7 @@ class WechatPayClient:
         serial = headers.get("wechatpay-serial")
         if not timestamp or not nonce or not signature:
             raise AppException("微信支付回调签名缺失", code=40030, status_code=400)
+        _validate_notify_timestamp(timestamp)
 
         message = f"{timestamp}\n{nonce}\n{body.decode('utf-8')}\n".encode("utf-8")
         cert_bytes = Path(settings.wechat_pay_platform_cert_path).read_bytes()
@@ -147,8 +148,12 @@ class WechatPayClient:
         except Exception as exc:
             raise AppException("微信支付回调解密失败", code=40032, status_code=400) from exc
 
-    async def _request(self, method: str, path: str, payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        body = "" if payload is None else json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    async def _request(
+        self, method: str, path: str, payload: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        body = (
+            "" if payload is None else json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        )
         headers = {
             "Accept": "application/json",
             "Authorization": self._authorization(method, path, body),
@@ -182,7 +187,7 @@ class WechatPayClient:
         message = f"{method}\n{path}\n{timestamp}\n{nonce}\n{body}\n"
         signature = self._sign(message)
         return (
-            'WECHATPAY2-SHA256-RSA2048 '
+            "WECHATPAY2-SHA256-RSA2048 "
             f'mchid="{settings.wechat_pay_mchid}",'
             f'nonce_str="{nonce}",'
             f'signature="{signature}",'
@@ -203,5 +208,15 @@ class WechatPayClient:
             hashes.SHA256(),
         )
         return base64.b64encode(signature).decode("utf-8")
+
+
+def _validate_notify_timestamp(value: str) -> None:
+    try:
+        timestamp = int(value)
+    except (TypeError, ValueError) as exc:
+        raise AppException("微信支付回调时间戳无效", code=40034, status_code=400) from exc
+    tolerance = max(1, settings.wechat_pay_notify_tolerance_seconds)
+    if abs(int(time.time()) - timestamp) > tolerance:
+        raise AppException("微信支付回调已过期", code=40034, status_code=400)
 
 wechat_pay_client = WechatPayClient()

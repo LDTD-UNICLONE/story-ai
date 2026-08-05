@@ -127,7 +127,9 @@ def normalize_ratio(value: Any) -> Optional[str]:
 def adapt_image_dimensions(model: str, payload: Dict[str, Any], extra: Dict[str, Any]) -> None:
     ratio = normalize_ratio(extra.get("aspect_ratio") or extra.get("ratio"))
     policy = _image_size_policy(model)
-    requested_size = _normalize_size(payload.get("size") or extra.get("image_size") or extra.get("resolution"))
+    requested_size = _normalize_size(
+        payload.get("size") or extra.get("image_size") or extra.get("resolution")
+    )
     if requested_size and _is_custom_size_allowed(policy, requested_size):
         payload["size"] = requested_size
         payload.pop("aspect_ratio", None)
@@ -163,7 +165,12 @@ def adapt_image_dimensions(model: str, payload: Dict[str, Any], extra: Dict[str,
         return
 
     raise AppException(
-        _unsupported_image_parameter_message(ratio=ratio, quality=_normalize_quality(extra.get("quality") or extra.get("resolution") or extra.get("image_quality"))),
+        _unsupported_image_parameter_message(
+            ratio=ratio,
+            quality=_normalize_quality(
+                extra.get("quality") or extra.get("resolution") or extra.get("image_quality")
+            ),
+        ),
         code=40016,
         status_code=400,
     )
@@ -246,7 +253,9 @@ def _unsupported_image_parameter_message(
 
 
 def _select_image_quality(policy: Dict[str, Any], extra: Dict[str, Any]) -> str:
-    requested_quality = _normalize_quality(extra.get("quality") or extra.get("resolution") or extra.get("image_quality"))
+    requested_quality = _normalize_quality(
+        extra.get("quality") or extra.get("resolution") or extra.get("image_quality")
+    )
     supported = tuple(policy["qualities"])
     if requested_quality is None:
         return str(policy["default_quality"])

@@ -109,7 +109,9 @@ async def get_points_consumption_stats(
     result = await db.execute(
         select(day_expr, consumed_expr)
         .where(
-            *_datetime_range_conditions(UserPointsTransaction.created_at, resolved_start, resolved_end),
+            *_datetime_range_conditions(
+                UserPointsTransaction.created_at, resolved_start, resolved_end
+            ),
             UserPointsTransaction.transaction_type == "consume",
             UserPointsTransaction.amount < 0,
         )
@@ -240,7 +242,9 @@ def _date_range_out(start_date: date, end_date: date) -> StatisticsDateRangeOut:
 
 
 def _date_series(start_date: date, end_date: date) -> List[date]:
-    return [start_date + timedelta(days=offset) for offset in range((end_date - start_date).days + 1)]
+    return [
+        start_date + timedelta(days=offset) for offset in range((end_date - start_date).days + 1)
+    ]
 
 
 def _coerce_date(value) -> date:

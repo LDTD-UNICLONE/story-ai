@@ -20,14 +20,16 @@ async def list_projects(
     page: int,
     page_size: int,
 ) -> Tuple[List[Project], int]:
-    conditions = [Project.user_id == user_id, Project.is_enabled.is_(True)]
+    conditions = [
+        Project.user_id == user_id,
+        Project.is_enabled.is_(True),
+        Project.project_kind == "standard",
+    ]
     if keyword:
         pattern = f"%{keyword}%"
         conditions.append(or_(Project.name.ilike(pattern), Project.description.ilike(pattern)))
 
-    count_result = await db.execute(
-        select(func.count()).select_from(Project).where(*conditions)
-    )
+    count_result = await db.execute(select(func.count()).select_from(Project).where(*conditions))
     total = count_result.scalar_one()
 
     result = await db.execute(
@@ -43,10 +45,12 @@ async def list_projects(
 
 async def get_project_or_404(db: AsyncSession, project_id: UUID, user_id: UUID) -> Project:
     result = await db.execute(
-        select(Project).where(
+        select(Project)
+        .where(
             Project.id == project_id,
             Project.user_id == user_id,
             Project.is_enabled.is_(True),
+            Project.project_kind == "standard",
         )
         .options(selectinload(Project.style))
     )
@@ -65,6 +69,7 @@ async def create_project(db: AsyncSession, user: User, payload: ProjectCreateReq
         cover=payload.cover or "",
         description=payload.description or "",
         generation_ratio=payload.generation_ratio,
+        project_kind="standard",
         is_enabled=True,
     )
     db.add(project)

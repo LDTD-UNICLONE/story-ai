@@ -4,6 +4,8 @@ from uuid import UUID
 from pydantic import ConfigDict, Field, field_validator
 from app.schemas.base import SchemaBaseModel
 
+MIN_PASSWORD_LENGTH = 8
+
 
 def _normalize_optional_string(value: object) -> object:
     if isinstance(value, str):
@@ -35,7 +37,7 @@ class UserListOut(SchemaBaseModel):
 
 class AdminUserCreateRequest(SchemaBaseModel):
     account: str = Field(..., min_length=3, max_length=64)
-    password: str = Field(..., min_length=6, max_length=128)
+    password: str = Field(..., min_length=MIN_PASSWORD_LENGTH, max_length=128)
     nickname: str = Field(..., min_length=1, max_length=64)
     avatar: Optional[str] = Field(default=None, max_length=512)
     phone: Optional[str] = Field(default=None, max_length=32)
@@ -78,12 +80,12 @@ class UserProfileUpdateRequest(SchemaBaseModel):
 
 
 class AdminPasswordResetRequest(SchemaBaseModel):
-    password: str = Field(..., min_length=6, max_length=128)
+    password: str = Field(..., min_length=MIN_PASSWORD_LENGTH, max_length=128)
 
 
 class RegisterRequest(SchemaBaseModel):
     account: str = Field(..., min_length=3, max_length=64)
-    password: str = Field(..., min_length=6, max_length=128)
+    password: str = Field(..., min_length=MIN_PASSWORD_LENGTH, max_length=128)
     nickname: str = Field(..., min_length=1, max_length=64)
     avatar: Optional[str] = Field(default=None, max_length=512)
     phone: str = Field(..., min_length=11, max_length=11)

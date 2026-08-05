@@ -4,6 +4,10 @@ from uuid import UUID
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.announcement_security import (
+    sanitize_announcement_content,
+    validate_announcement_url,
+)
 from app.core.exceptions import AppException
 from app.core.timezone import beijing_datetime
 from app.models.announcement import Announcement
@@ -33,7 +37,9 @@ async def list_announcements(
     conditions = []
     if keyword:
         pattern = f"%{keyword}%"
-        conditions.append(or_(Announcement.title.ilike(pattern), Announcement.content.ilike(pattern)))
+        conditions.append(
+            or_(Announcement.title.ilike(pattern), Announcement.content.ilike(pattern))
+        )
     if announcement_type:
         conditions.append(Announcement.announcement_type == announcement_type)
     if display_position:
@@ -102,7 +108,9 @@ async def get_active_announcement_or_404(db: AsyncSession, announcement_id: UUID
 
 async def create_announcement(db: AsyncSession, payload: AnnouncementCreateRequest) -> Announcement:
     _validate_publish_time(payload.start_at, payload.end_at)
-    announcement = Announcement(**payload.model_dump())
+    create_data = payload.model_dump()
+    _sanitize_announcement_write_data(create_data)
+    announcement = Announcement(**create_data)
     db.add(announcement)
     await db.commit()
     await db.refresh(announcement)
@@ -119,6 +127,19 @@ async def update_announcement(
     start_at = update_data.get("start_at", announcement.start_at)
     end_at = update_data.get("end_at", announcement.end_at)
     _validate_publish_time(start_at, end_at)
+    if "content" in update_data or "content_format" in update_data:
+        update_data["content"] = sanitize_announcement_content(
+            update_data.get("content", announcement.content),
+            update_data.get("content_format", announcement.content_format),
+        )
+    if "image_url" in update_data:
+        update_data["image_url"] = validate_announcement_url(
+            update_data["image_url"], "公告图片地址"
+        )
+    if "link_url" in update_data:
+        update_data["link_url"] = validate_announcement_url(
+            update_data["link_url"], "公告跳转地址"
+        )
     for field, value in update_data.items():
         setattr(announcement, field, value)
     announcement.updated_at = beijing_datetime()
@@ -143,3 +164,9 @@ def build_announcement_preview_style(announcement: Announcement) -> dict:
 def _validate_publish_time(start_at, end_at) -> None:
     if start_at and end_at and start_at > end_at:
         raise AppException("公告开始时间不能晚于结束时间", code=40020, status_code=400)
+
+
+def _sanitize_announcement_write_data(data: dict) -> None:
+    data["content"] = sanitize_announcement_content(data["content"], data["content_format"])
+    data["image_url"] = validate_announcement_url(data.get("image_url"), "公告图片地址")
+    data["link_url"] = validate_announcement_url(data.get("link_url"), "公告跳转地址")

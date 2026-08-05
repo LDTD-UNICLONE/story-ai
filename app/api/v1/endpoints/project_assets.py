@@ -59,7 +59,9 @@ async def my_project_characters(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    items, total = await list_project_assets(db, ProjectCharacter, project_id, current_user.id, keyword, page, page_size)
+    items, total = await list_project_assets(
+        db, ProjectCharacter, project_id, current_user.id, keyword, page, page_size
+    )
     data = ProjectCharacterListOut(
         items=[ProjectCharacterOut.model_validate(item) for item in items],
         total=total,
@@ -170,7 +172,9 @@ async def create_my_project_character(
     current_user: User = Depends(get_current_user),
 ):
     item = await create_project_asset(db, ProjectCharacter, project_id, current_user.id, payload)
-    return success(data=ProjectCharacterOut.model_validate(item).model_dump(mode="json"), message="创建成功")
+    return success(
+        data=ProjectCharacterOut.model_validate(item).model_dump(mode="json"), message="创建成功"
+    )
 
 
 @router.get("/characters/{character_id:uuid}")
@@ -180,7 +184,9 @@ async def my_project_character_detail(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    item = await get_project_asset_or_404(db, ProjectCharacter, project_id, character_id, current_user.id)
+    item = await get_project_asset_or_404(
+        db, ProjectCharacter, project_id, character_id, current_user.id
+    )
     return success(data=ProjectCharacterOut.model_validate(item).model_dump(mode="json"))
 
 
@@ -192,8 +198,12 @@ async def update_my_project_character(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    item = await update_project_asset(db, ProjectCharacter, project_id, character_id, current_user.id, payload)
-    return success(data=ProjectCharacterOut.model_validate(item).model_dump(mode="json"), message="更新成功")
+    item = await update_project_asset(
+        db, ProjectCharacter, project_id, character_id, current_user.id, payload
+    )
+    return success(
+        data=ProjectCharacterOut.model_validate(item).model_dump(mode="json"), message="更新成功"
+    )
 
 
 @router.delete("/characters/{character_id:uuid}")
@@ -203,8 +213,12 @@ async def delete_my_project_character(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    item = await delete_project_asset(db, ProjectCharacter, project_id, character_id, current_user.id)
-    return success(data=ProjectCharacterOut.model_validate(item).model_dump(mode="json"), message="删除成功")
+    item = await delete_project_asset(
+        db, ProjectCharacter, project_id, character_id, current_user.id
+    )
+    return success(
+        data=ProjectCharacterOut.model_validate(item).model_dump(mode="json"), message="删除成功"
+    )
 
 
 @router.post("/characters/{character_id:uuid}/image-generation")
@@ -245,7 +259,9 @@ async def my_project_scenes(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    items, total = await list_project_assets(db, ProjectScene, project_id, current_user.id, keyword, page, page_size)
+    items, total = await list_project_assets(
+        db, ProjectScene, project_id, current_user.id, keyword, page, page_size
+    )
     data = ProjectSceneListOut(
         items=[ProjectSceneOut.model_validate(item) for item in items],
         total=total,
@@ -278,7 +294,9 @@ async def create_my_project_scene(
     current_user: User = Depends(get_current_user),
 ):
     item = await create_project_asset(db, ProjectScene, project_id, current_user.id, payload)
-    return success(data=ProjectSceneOut.model_validate(item).model_dump(mode="json"), message="创建成功")
+    return success(
+        data=ProjectSceneOut.model_validate(item).model_dump(mode="json"), message="创建成功"
+    )
 
 
 @router.get("/scenes/{scene_id:uuid}")
@@ -300,8 +318,12 @@ async def update_my_project_scene(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    item = await update_project_asset(db, ProjectScene, project_id, scene_id, current_user.id, payload)
-    return success(data=ProjectSceneOut.model_validate(item).model_dump(mode="json"), message="更新成功")
+    item = await update_project_asset(
+        db, ProjectScene, project_id, scene_id, current_user.id, payload
+    )
+    return success(
+        data=ProjectSceneOut.model_validate(item).model_dump(mode="json"), message="更新成功"
+    )
 
 
 @router.delete("/scenes/{scene_id:uuid}")
@@ -312,7 +334,9 @@ async def delete_my_project_scene(
     current_user: User = Depends(get_current_user),
 ):
     item = await delete_project_asset(db, ProjectScene, project_id, scene_id, current_user.id)
-    return success(data=ProjectSceneOut.model_validate(item).model_dump(mode="json"), message="删除成功")
+    return success(
+        data=ProjectSceneOut.model_validate(item).model_dump(mode="json"), message="删除成功"
+    )
 
 
 @router.post("/scenes/{scene_id:uuid}/image-generation")
@@ -353,7 +377,9 @@ async def my_project_props(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    items, total = await list_project_assets(db, ProjectProp, project_id, current_user.id, keyword, page, page_size)
+    items, total = await list_project_assets(
+        db, ProjectProp, project_id, current_user.id, keyword, page, page_size
+    )
     data = ProjectPropListOut(
         items=[ProjectPropOut.model_validate(item) for item in items],
         total=total,
@@ -386,7 +412,9 @@ async def create_my_project_prop(
     current_user: User = Depends(get_current_user),
 ):
     item = await create_project_asset(db, ProjectProp, project_id, current_user.id, payload)
-    return success(data=ProjectPropOut.model_validate(item).model_dump(mode="json"), message="创建成功")
+    return success(
+        data=ProjectPropOut.model_validate(item).model_dump(mode="json"), message="创建成功"
+    )
 
 
 @router.get("/props/{prop_id:uuid}")
@@ -408,8 +436,12 @@ async def update_my_project_prop(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    item = await update_project_asset(db, ProjectProp, project_id, prop_id, current_user.id, payload)
-    return success(data=ProjectPropOut.model_validate(item).model_dump(mode="json"), message="更新成功")
+    item = await update_project_asset(
+        db, ProjectProp, project_id, prop_id, current_user.id, payload
+    )
+    return success(
+        data=ProjectPropOut.model_validate(item).model_dump(mode="json"), message="更新成功"
+    )
 
 
 @router.delete("/props/{prop_id:uuid}")
@@ -420,7 +452,9 @@ async def delete_my_project_prop(
     current_user: User = Depends(get_current_user),
 ):
     item = await delete_project_asset(db, ProjectProp, project_id, prop_id, current_user.id)
-    return success(data=ProjectPropOut.model_validate(item).model_dump(mode="json"), message="删除成功")
+    return success(
+        data=ProjectPropOut.model_validate(item).model_dump(mode="json"), message="删除成功"
+    )
 
 
 @router.post("/props/{prop_id:uuid}/image-generation")

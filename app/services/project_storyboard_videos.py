@@ -13,7 +13,9 @@ from sqlalchemy.orm import selectinload
 from app.core.config import settings
 from app.core.exceptions import AppException
 from app.core.timezone import beijing_datetime
-from app.integrations.comfly_video_specs import merge_video_capabilities as merge_comfly_video_capabilities
+from app.integrations.comfly_video_specs import (
+    merge_video_capabilities as merge_comfly_video_capabilities,
+)
 from app.integrations.volcengine_ark_video_specs import (
     VOLCENGINE_ARK_VENDOR,
     is_video_resolution_supported,
@@ -22,9 +24,10 @@ from app.integrations.volcengine_ark_video_specs import (
     normalize_video_resolution,
 )
 from app.models.ai_model import AiModel
+from app.models.agent_story_bible import AgentAssetVariant
+from app.models.material import Material
 from app.models.project import Project
 from app.models.project_asset import ProjectCharacter, ProjectProp, ProjectScene
-from app.models.material import Material
 from app.models.project_storyboard import ProjectStoryboard
 from app.models.task_record import UserTaskRecord
 from app.models.user import User
@@ -33,11 +36,17 @@ from app.services.generated_media import persist_generated_media_to_oss
 from app.services.model_points import calculate_submission_points_cost, settle_video_task_points
 from app.services.model_runner import ModelRunResult, query_model_task, run_model
 from app.services.points import change_user_points, consume_user_points
-from app.services.project_generated_assets import create_project_generated_asset_history, extract_result_urls
+from app.services.project_generated_assets import (
+    record_storyboard_video_generation_success,
+)
 from app.services.project_storyboards import get_project_storyboard_or_404
 from app.services.provider_polling import provider_poll_interval_seconds
 from app.services.projects import get_project_or_404
-from app.services.task_records import create_user_task_record, refresh_task_record_interrupted
+from app.services.task_records import (
+    create_user_task_record,
+    record_provider_task_state,
+    refresh_task_record_interrupted,
+)
 
 
 MODE_TO_PROVIDER_MODE = {
@@ -55,21 +64,57 @@ async def submit_storyboard_video_generation(
     storyboard_id: UUID,
     user: User,
     payload: ProjectStoryboardVideoGenerateRequest,
+    *,
+    agent_context: Optional[Dict[str, object]] = None,
 ) -> Tuple[UserTaskRecord, int]:
-    await get_project_or_404(db, project_id, user.id)
-    storyboard = await get_project_storyboard_or_404(db, project_id, chapter_id, storyboard_id, user.id)
+    if not agent_context:
+        await get_project_or_404(db, project_id, user.id)
+    storyboard = await get_project_storyboard_or_404(
+        db, project_id, chapter_id, storyboard_id, user.id
+    )
     project = await _get_project_with_style_or_404(db, project_id, user.id)
     ai_model = await _get_enabled_video_model_or_404(db, payload.ai_model_id)
     resolution = _normalize_storyboard_video_resolution(ai_model, payload.resolution)
-    previous_ending_frame = await _previous_storyboard_ending_frame(db, project_id, chapter_id, storyboard, user.id)
+    previous_ending_frame = await _previous_storyboard_ending_frame(
+        db, project_id, chapter_id, storyboard, user.id
+    )
 
-    reference_images = await _collect_reference_images(db, project_id, user.id, payload, storyboard)
+    prepared_reference_images = (
+        list(agent_context.get("agent_reference_images") or [])
+        if agent_context and "agent_reference_images" in agent_context
+        else None
+    )
+    reference_images = (
+        prepared_reference_images
+        if prepared_reference_images is not None
+        else await _collect_reference_images(db, project_id, user.id, payload, storyboard)
+    )
     if payload.generation_mode == "storyboard":
         if not _clean_prompt_part(storyboard.video_prompt):
-            raise AppException("请先生成故事板提示词，再使用故事版生成视频", code=40033, status_code=400)
+            raise AppException(
+                "请先生成故事板提示词，再使用故事版生成视频", code=40033, status_code=400
+            )
         if not reference_images:
-            raise AppException("请先生成故事版图像后再使用故事版生成视频", code=40034, status_code=400)
-    reference_images, dropped_reference_images = _limit_reference_images_for_model(ai_model, payload, reference_images)
+            raise AppException(
+                "请先生成故事版图像后再使用故事版生成视频", code=40034, status_code=400
+            )
+    reference_images, dropped_reference_images = _limit_reference_images_for_model(
+        ai_model, payload, reference_images
+    )
+    if prepared_reference_images is not None and dropped_reference_images:
+        raise AppException(
+            f"当前分镜组需要引用 {len(prepared_reference_images)} 张图片，"
+            f"但所选模型最多支持 {len(reference_images)} 张",
+            code=40037,
+            status_code=400,
+            data={
+                "required_count": len(prepared_reference_images),
+                "max_count": len(reference_images),
+                "reference_manifest": list(
+                    (agent_context or {}).get("agent_reference_manifest") or []
+                ),
+            },
+        )
     model_extra = _build_storyboard_video_extra(
         project,
         ai_model,
@@ -78,7 +123,10 @@ async def submit_storyboard_video_generation(
         reference_images,
         resolution,
     )
-    prompt = _build_storyboard_video_prompt(
+    compiled_agent_prompt = str(
+        (agent_context or {}).get("agent_compiled_prompt") or ""
+    ).strip()
+    prompt = compiled_agent_prompt or _build_storyboard_video_prompt(
         project,
         storyboard,
         payload.prompt,
@@ -126,8 +174,10 @@ async def submit_storyboard_video_generation(
             "first_frame_url": payload.first_frame_url,
             "last_frame_url": payload.last_frame_url,
             "model_extra": model_extra,
+            **(agent_context or {}),
         },
     )
+    await db.flush()
     storyboard.extra = {
         **(storyboard.extra or {}),
         "video_generation_status": "pending",
@@ -135,6 +185,11 @@ async def submit_storyboard_video_generation(
         "video_generation_mode": payload.generation_mode,
         "video_generation_resolution": resolution,
         "video_generation_return_last_frame": payload.return_last_frame,
+        "video_reference_asset_ids": {
+            "character": [str(value) for value in payload.character_ids],
+            "scene": [str(value) for value in payload.scene_ids],
+            "prop": [str(value) for value in payload.prop_ids],
+        },
     }
     await db.commit()
 
@@ -184,11 +239,19 @@ async def run_storyboard_video_generation_in_worker(
         "video",
         task_record.prompt,
         (task_record.extra or {}).get("model_extra") or {},
+        idempotency_key=str(task_record.id),
     )
+    if record_provider_task_state(task_record, model_result.extra, ai_model.vendor):
+        task_record.extra = {
+            **(task_record.extra or {}),
+            "model_result_extra": model_result.extra,
+        }
+        await db.commit()
     model_result = await _resolve_video_provider_task(model_snapshot, model_result)
     model_result = await persist_generated_media_to_oss("video", model_result)
     if await refresh_task_record_interrupted(db, task_record):
         return
+    record_provider_task_state(task_record, model_result.extra, ai_model.vendor)
 
     if model_result.extra.get("platform_task_status") == "running":
         last_frame_url = _first_generated_last_frame_url(model_result.extra)
@@ -215,45 +278,14 @@ async def run_storyboard_video_generation_in_worker(
         raise AppException("视频生成未返回有效结果", code=50231, status_code=502)
 
     last_frame_url = _first_generated_last_frame_url(model_result.extra)
-    result_urls = extract_result_urls(model_result.content)
-    history = await create_project_generated_asset_history(
+    await record_storyboard_video_generation_success(
         db,
         task_record=task_record,
-        target_type="storyboard",
-        target_id=storyboard_id,
-        media_type="video",
-        result_urls=result_urls or [model_result.content],
-        result_url=result_urls[0] if result_urls else model_result.content,
+        storyboard=storyboard,
+        content=model_result.content,
+        result_extra=model_result.extra,
         last_frame_url=last_frame_url,
-        chapter_id=storyboard.chapter_id,
-        generation_mode=(task_record.extra or {}).get("generation_mode"),
-        extra={
-            "storyboard_title": storyboard.title,
-            "shot_number": storyboard.shot_number,
-            "resolution": (task_record.extra or {}).get("resolution"),
-            "return_last_frame": (task_record.extra or {}).get("return_last_frame"),
-            "model_result_extra": model_result.extra,
-        },
     )
-    storyboard.extra = {
-        **(storyboard.extra or {}),
-        "video_generation_status": model_result.extra.get("platform_task_status") or "success",
-        "video_generation_history_id": str(history.id),
-        "video_generation_task_record_id": str(task_record.id),
-        "video_generation_result": model_result.content,
-        "video_generation_extra": model_result.extra,
-        **({"video_generation_last_frame_url": last_frame_url} if last_frame_url else {}),
-    }
-    storyboard.updated_at = beijing_datetime()
-    task_record.status = model_result.extra.get("platform_task_status") or "success"
-    task_record.result = model_result.content
-    task_record.extra = {
-        **(task_record.extra or {}),
-        "model_result_extra": model_result.extra,
-        "storyboard_video_result": model_result.content,
-        **({"storyboard_video_last_frame_url": last_frame_url} if last_frame_url else {}),
-        "generated_asset_history_id": str(history.id),
-    }
     await settle_video_task_points(
         db,
         task_record,
@@ -263,7 +295,9 @@ async def run_storyboard_video_generation_in_worker(
     )
 
 
-async def _get_project_with_style_or_404(db: AsyncSession, project_id: UUID, user_id: UUID) -> Project:
+async def _get_project_with_style_or_404(
+    db: AsyncSession, project_id: UUID, user_id: UUID
+) -> Project:
     result = await db.execute(
         select(Project)
         .options(selectinload(Project.style))
@@ -293,7 +327,9 @@ async def _previous_storyboard_ending_frame(
         .order_by(ProjectStoryboard.shot_number.asc(), ProjectStoryboard.created_at.asc())
     )
     storyboards = list(result.scalars().all())
-    current_index = next((index for index, item in enumerate(storyboards) if item.id == storyboard.id), -1)
+    current_index = next(
+        (index for index, item in enumerate(storyboards) if item.id == storyboard.id), -1
+    )
     if current_index <= 0:
         return ""
     return _clean_prompt_part(storyboards[current_index - 1].ending_frame)
@@ -325,14 +361,89 @@ async def _collect_reference_images(
         return []
     if payload.generation_mode == "storyboard" and storyboard is not None:
         urls.extend(_storyboard_reference_images(storyboard))
-        return await _resolve_reference_image_urls(db, _dedupe(urls))
+        return await resolve_storyboard_reference_image_urls(db, _dedupe(urls))
     if payload.generation_mode == "first_last_frame":
         return []
+    variant_asset_ids, variant_urls = await _agent_variant_reference_images(
+        db,
+        storyboard,
+    )
     urls.extend(payload.uploaded_images or [])
-    urls.extend(await _asset_reference_images(db, ProjectCharacter, project_id, user_id, payload.character_ids))
-    urls.extend(await _asset_reference_images(db, ProjectScene, project_id, user_id, payload.scene_ids))
-    urls.extend(await _asset_reference_images(db, ProjectProp, project_id, user_id, payload.prop_ids))
-    return await _resolve_reference_image_urls(db, _dedupe(urls))
+    urls.extend(
+        await _asset_reference_images(
+            db,
+            ProjectCharacter,
+            project_id,
+            user_id,
+            [
+                value
+                for value in payload.character_ids
+                if value not in variant_asset_ids["character"]
+            ],
+        )
+    )
+    urls.extend(
+        await _asset_reference_images(
+            db,
+            ProjectScene,
+            project_id,
+            user_id,
+            [value for value in payload.scene_ids if value not in variant_asset_ids["scene"]],
+        )
+    )
+    urls.extend(
+        await _asset_reference_images(
+            db,
+            ProjectProp,
+            project_id,
+            user_id,
+            [value for value in payload.prop_ids if value not in variant_asset_ids["prop"]],
+        )
+    )
+    urls.extend(variant_urls)
+    return await resolve_storyboard_reference_image_urls(db, _dedupe(urls))
+
+
+async def _agent_variant_reference_images(
+    db: AsyncSession,
+    storyboard: Optional[ProjectStoryboard],
+) -> Tuple[Dict[str, set[UUID]], List[str]]:
+    selected_asset_ids: Dict[str, set[UUID]] = {
+        "character": set(),
+        "scene": set(),
+        "prop": set(),
+    }
+    if storyboard is None:
+        return selected_asset_ids, []
+    mapping = (storyboard.extra or {}).get("agent_asset_variant_ids") or {}
+    requested: Dict[UUID, Tuple[str, UUID]] = {}
+    for asset_type in selected_asset_ids:
+        for raw_asset_id, raw_variant_id in (mapping.get(asset_type) or {}).items():
+            try:
+                requested[UUID(str(raw_variant_id))] = (
+                    asset_type,
+                    UUID(str(raw_asset_id)),
+                )
+            except (TypeError, ValueError, AttributeError):
+                continue
+    if not requested:
+        return selected_asset_ids, []
+    result = await db.execute(
+        select(AgentAssetVariant).where(
+            AgentAssetVariant.id.in_(requested),
+            AgentAssetVariant.review_status == "ready",
+            AgentAssetVariant.reference_image.is_not(None),
+        )
+    )
+    urls = []
+    for variant in result.scalars().all():
+        asset_type, asset_id = requested[variant.id]
+        reference_image = str(variant.reference_image or "").strip()
+        if not reference_image:
+            continue
+        selected_asset_ids[asset_type].add(asset_id)
+        urls.append(reference_image)
+    return selected_asset_ids, urls
 
 
 def _storyboard_reference_images(storyboard: ProjectStoryboard) -> List[str]:
@@ -348,7 +459,10 @@ def _storyboard_reference_images(storyboard: ProjectStoryboard) -> List[str]:
     return _dedupe([url for url in urls if url])
 
 
-async def _resolve_reference_image_urls(db: AsyncSession, urls: List[str]) -> List[str]:
+async def resolve_storyboard_reference_image_urls(
+    db: AsyncSession,
+    urls: List[str],
+) -> List[str]:
     material_ids = [_material_id_from_image_url(url) for url in urls]
     material_ids = [material_id for material_id in material_ids if material_id is not None]
     material_url_map: Dict[UUID, str] = {}
@@ -366,7 +480,7 @@ async def _resolve_reference_image_urls(db: AsyncSession, urls: List[str]) -> Li
     for url in urls:
         material_id = _material_id_from_image_url(url)
         resolved.append(material_url_map.get(material_id, url) if material_id else url)
-    return _dedupe(resolved)
+    return resolved
 
 
 def _material_id_from_image_url(value: Any) -> Optional[UUID]:
@@ -418,7 +532,7 @@ def _limit_reference_images_for_model(
     if payload.generation_mode == "storyboard":
         return reference_images[:1], reference_images[1:]
 
-    max_images = _model_image_limit(ai_model)
+    max_images = storyboard_video_image_limit(ai_model)
     if max_images is None:
         return reference_images, []
     if max_images <= 0:
@@ -435,11 +549,13 @@ def _limit_reference_images_for_model(
     return reference_images[:allowed_reference_count], reference_images[allowed_reference_count:]
 
 
-def _model_image_limit(ai_model: AiModel) -> Optional[int]:
+def storyboard_video_image_limit(ai_model: AiModel) -> Optional[int]:
     if ai_model.vendor == VOLCENGINE_ARK_VENDOR or is_volcengine_ark_video_model(ai_model.model_id):
         capabilities = merge_ark_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
     else:
-        capabilities = merge_comfly_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
+        capabilities = merge_comfly_video_capabilities(
+            ai_model.model_id, ai_model.capabilities or {}
+        )
     media_limits = (capabilities or {}).get("media_limits") or {}
     raw_limit = media_limits.get("images")
     if isinstance(raw_limit, int) and raw_limit >= 0:
@@ -453,7 +569,9 @@ def _normalize_storyboard_video_resolution(ai_model: AiModel, resolution: str) -
     if ai_model.vendor == VOLCENGINE_ARK_VENDOR or is_volcengine_ark_video_model(ai_model.model_id):
         capabilities = merge_ark_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
         if not is_video_resolution_supported(resolution, capabilities):
-            raise AppException("当前火山方舟视频模型不支持该 resolution 参数", code=40012, status_code=400)
+            raise AppException(
+                "当前火山方舟视频模型不支持该 resolution 参数", code=40012, status_code=400
+            )
         return normalize_video_resolution(resolution, capabilities)
     return resolution
 
@@ -500,28 +618,48 @@ def _build_storyboard_video_extra(
     if explicit_duration_seconds:
         _set_video_duration_extra(extra, explicit_duration_seconds, "request_extra")
     elif suggested_duration_seconds:
-        _set_video_duration_extra(extra, suggested_duration_seconds, "storyboard_duration_suggestion")
+        _set_video_duration_extra(
+            extra, suggested_duration_seconds, "storyboard_duration_suggestion"
+        )
         extra["duration_suggestion"] = storyboard.duration_suggestion
     extra["video_mode"] = MODE_TO_PROVIDER_MODE[payload.generation_mode]
     extra["capability"] = MODE_TO_PROVIDER_MODE[payload.generation_mode]
     if payload.generation_mode == "text_to_video":
         _drop_frame_url_keys(extra)
         return extra
-    if payload.generation_mode == "reference" and not reference_images and not _has_reference_image_or_video_extra(extra):
+    if (
+        payload.generation_mode == "reference"
+        and not reference_images
+        and not _has_reference_image_or_video_extra(extra)
+    ):
         raise AppException("参考生成需要至少传入参考图片或参考视频", code=40012, status_code=400)
     if reference_images and payload.generation_mode != "first_last_frame":
         extra["images"] = reference_images
-        if ai_model.vendor != VOLCENGINE_ARK_VENDOR and not is_volcengine_ark_video_model(ai_model.model_id):
+        if ai_model.vendor != VOLCENGINE_ARK_VENDOR and not is_volcengine_ark_video_model(
+            ai_model.model_id
+        ):
             extra["image_urls"] = reference_images
     if payload.generation_mode == "first_last_frame":
         if not payload.first_frame_url:
             raise AppException("首尾帧生成需要传入 first_frame_url", code=40012, status_code=400)
         _clear_video_reference_media_extra(extra)
         extra["first_frame_url"] = payload.first_frame_url
-        media_items = [{"type": "image_url", "image_url": {"url": payload.first_frame_url}, "role": "first_frame"}]
+        media_items = [
+            {
+                "type": "image_url",
+                "image_url": {"url": payload.first_frame_url},
+                "role": "first_frame",
+            }
+        ]
         if payload.last_frame_url:
             extra["last_frame_url"] = payload.last_frame_url
-            media_items.append({"type": "image_url", "image_url": {"url": payload.last_frame_url}, "role": "last_frame"})
+            media_items.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": payload.last_frame_url},
+                    "role": "last_frame",
+                }
+            )
         extra["media_items"] = media_items
     return extra
 
@@ -697,9 +835,21 @@ def _has_reference_image_or_video_extra(extra: Dict[str, Any]) -> bool:
                 continue
             item_type = str(item.get("type") or "").strip()
             role = str(item.get("role") or "").strip().replace("-", "_")
-            if item_type == "video_url" or role in {"reference_video", "video", "ref_video", "referenceVideo"}:
+            if item_type == "video_url" or role in {
+                "reference_video",
+                "video",
+                "ref_video",
+                "referenceVideo",
+            }:
                 return True
-            if item_type == "image_url" and role in {"", "reference_image", "reference", "image", "ref_image", "referenceImage"}:
+            if item_type == "image_url" and role in {
+                "",
+                "reference_image",
+                "reference",
+                "image",
+                "ref_image",
+                "referenceImage",
+            }:
                 return True
     return False
 
@@ -774,7 +924,9 @@ def _as_list(value: Any) -> List[Any]:
     return [value]
 
 
-def _storyboard_duration_seconds(storyboard: ProjectStoryboard, min_seconds: int = 5) -> Optional[int]:
+def _storyboard_duration_seconds(
+    storyboard: ProjectStoryboard, min_seconds: int = 5
+) -> Optional[int]:
     return _parse_duration_suggestion_seconds(storyboard.duration_suggestion, min_seconds)
 
 
@@ -813,7 +965,11 @@ def _normalize_duration_text(value: str) -> str:
 
 def _chinese_duration_numbers(value: str) -> List[int]:
     matches = re.findall(r"[零〇一二两三四五六七八九十]{1,4}", value)
-    return [number for number in (_parse_chinese_number(match) for match in matches) if number is not None]
+    return [
+        number
+        for number in (_parse_chinese_number(match) for match in matches)
+        if number is not None
+    ]
 
 
 def _parse_chinese_number(value: str) -> Optional[int]:
@@ -893,10 +1049,14 @@ def _build_storyboard_video_prompt(
     model_extra: Optional[Dict[str, Any]] = None,
 ) -> str:
     if generation_mode == "storyboard":
-        return _build_storyboard_reference_video_prompt(project, storyboard, custom_prompt, model_extra)
+        return _build_storyboard_reference_video_prompt(
+            project, storyboard, custom_prompt, model_extra
+        )
 
     style_prompt = _clean_prompt_part(project.style.prompt if project.style else "")
-    opening_visual = _first_prompt_part(previous_ending_frame, storyboard.screen_execution, storyboard.action)
+    opening_visual = _first_prompt_part(
+        previous_ending_frame, storyboard.screen_execution, storyboard.action
+    )
     action = _first_prompt_part(storyboard.character_action, storyboard.action)
     character_expression = _clean_prompt_part(storyboard.character_expression)
     scene_name = _clean_prompt_part(storyboard.scene_name)
@@ -958,15 +1118,16 @@ def _build_storyboard_video_prompt(
     if sound_effect:
         sound_effect_sentence = _as_prompt_sentence(f"声音与节奏参考：{sound_effect}")
         parts.append(
-            sound_effect_sentence +
-            "声音与节奏只作为动作节奏和氛围参考，不生成字幕文字、声音文字或可视化音效文字。"
+            sound_effect_sentence
+            + "声音与节奏只作为动作节奏和氛围参考，不生成字幕文字、声音文字或可视化音效文字。"
         )
 
     if storyboard.dialogue and storyboard.dialogue.strip():
-        dialogue_sentence = _as_prompt_sentence(f"角色按原文台词进行说话表演：{storyboard.dialogue.strip()}")
+        dialogue_sentence = _as_prompt_sentence(
+            f"角色按原文台词进行说话表演：{storyboard.dialogue.strip()}"
+        )
         parts.append(
-            dialogue_sentence +
-            "台词只用于嘴型、停顿、视线和表演节奏参考，"
+            dialogue_sentence + "台词只用于嘴型、停顿、视线和表演节奏参考，"
             "画面中不得出现字幕、气泡文字、台词文字或任何屏幕文字。"
         )
 
@@ -982,8 +1143,8 @@ def _build_storyboard_video_prompt(
     if custom_prompt and custom_prompt.strip():
         custom_prompt_sentence = _as_prompt_sentence(f"用户补充要求：{custom_prompt.strip()}")
         parts.append(
-            custom_prompt_sentence +
-            "用户补充要求只能补充当前镜头的表现方式，不得覆盖当前分镜剧情、人物资产、场景资产、"
+            custom_prompt_sentence
+            + "用户补充要求只能补充当前镜头的表现方式，不得覆盖当前分镜剧情、人物资产、场景资产、"
             "道具资产、参考图一致性、视频建议时长、制作重点和负面规避要求。"
         )
 
@@ -996,6 +1157,18 @@ def _build_storyboard_reference_video_prompt(
     custom_prompt: Optional[str],
     model_extra: Optional[Dict[str, Any]] = None,
 ) -> str:
+    agent_prompt = _clean_prompt_part(
+        (storyboard.extra or {}).get("agent_storyboard_prompt")
+    )
+    if agent_prompt:
+        parts = [agent_prompt]
+        variant_text = _agent_variant_context_text(storyboard)
+        if variant_text:
+            parts.append(f"当前选定资产变体：{variant_text}")
+        if custom_prompt and custom_prompt.strip():
+            parts.append(f"用户补充要求：{custom_prompt.strip()}")
+        return "\n".join(parts)
+
     style_prompt = _clean_prompt_part(project.style.prompt if project.style else "")
     duration_suggestion = _video_prompt_duration_text(storyboard, model_extra or {})
     video_prompt = _clean_prompt_part(storyboard.video_prompt)
@@ -1027,6 +1200,15 @@ def _build_storyboard_reference_video_prompt(
             "用户补充要求只能补充当前视频表现方式，例如动作强度、节奏、氛围、镜头运动或画面质感；不得覆盖当前分镜剧情、故事版参考图、人物资产、场景资产、道具资产、视频建议总时长、镜头连续性和负面规避要求。",
             f"负面规避：{negative_prompt}",
         ]
+    )
+
+
+def _agent_variant_context_text(storyboard: ProjectStoryboard) -> str:
+    items = (storyboard.extra or {}).get("agent_asset_variant_context") or []
+    return "；".join(
+        f"{item.get('name')}（{item.get('description')}，触发：{item.get('trigger_reason')}）"
+        for item in items
+        if isinstance(item, dict) and item.get("name")
     )
 
 
@@ -1108,7 +1290,9 @@ def _as_prompt_sentence(value: str) -> str:
     return cleaned + "。"
 
 
-async def _resolve_video_provider_task(model_snapshot: SimpleNamespace, model_result: ModelRunResult) -> ModelRunResult:
+async def _resolve_video_provider_task(
+    model_snapshot: SimpleNamespace, model_result: ModelRunResult
+) -> ModelRunResult:
     task_id = model_result.extra.get("task_id")
     if not task_id:
         return model_result
@@ -1137,7 +1321,11 @@ async def _resolve_video_provider_task(model_snapshot: SimpleNamespace, model_re
         if latest_result.content and latest_result.content != "生成任务处理中":
             latest_result.extra = {**latest_result.extra, "platform_task_status": "success"}
             return latest_result
-    latest_result.extra = {**latest_result.extra, "platform_task_status": "running", "provider_polling_timeout": True}
+    latest_result.extra = {
+        **latest_result.extra,
+        "platform_task_status": "running",
+        "provider_polling_timeout": True,
+    }
     latest_result.extra["next_poll_seconds"] = provider_poll_interval_seconds("video")
     latest_result.content = f"模型任务仍在生成中：{task_id}"
     return latest_result

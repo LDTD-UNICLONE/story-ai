@@ -23,7 +23,9 @@ async def announcement_options(
         display_position=display_position,
         limit=limit,
     )
-    data = [AnnouncementBaseOut.model_validate(item).model_dump(mode="json") for item in announcements]
+    data = [
+        AnnouncementBaseOut.model_validate(item).model_dump(mode="json") for item in announcements
+    ]
     return success(data=data)
 
 

@@ -15,6 +15,8 @@ from app.models.project_storyboard import ProjectStoryboard
 from app.models.task_record import UserTaskRecord
 from app.services.points import change_user_points
 from app.services.project_storyboard_videos import run_storyboard_video_generation_in_worker
+from app.services.task_records import has_provider_task_id
+from app.services.task_execution import TaskExecutionDeferred, prepare_task_execution
 from app.worker import celery_app
 
 
@@ -30,11 +32,17 @@ WorkerSessionLocal = create_worker_sessionmaker()
 )
 def run_project_storyboard_video_generation(self, task_record_id: str, storyboard_id: str) -> None:
     try:
-        asyncio.run(_run_project_storyboard_video_generation(UUID(task_record_id), UUID(storyboard_id)))
+        asyncio.run(
+            _run_project_storyboard_video_generation(UUID(task_record_id), UUID(storyboard_id))
+        )
     except SoftTimeLimitExceeded:
         asyncio.run(_fail_generation(UUID(task_record_id), UUID(storyboard_id), "任务执行超时"))
+    except TaskExecutionDeferred as exc:
+        raise self.retry(countdown=exc.retry_after_seconds) from exc
     except Exception as exc:
-        if self.request.retries < settings.celery_task_max_retries and _is_retryable_provider_error(exc):
+        if self.request.retries < settings.celery_task_max_retries and _is_retryable_provider_error(
+            exc
+        ):
             raise self.retry(exc=exc, countdown=_retry_countdown(self.request.retries)) from exc
         asyncio.run(
             _fail_generation(
@@ -46,7 +54,9 @@ def run_project_storyboard_video_generation(self, task_record_id: str, storyboar
         )
 
 
-async def _run_project_storyboard_video_generation(task_record_id: UUID, storyboard_id: UUID) -> None:
+async def _run_project_storyboard_video_generation(
+    task_record_id: UUID, storyboard_id: UUID
+) -> None:
     try:
         await _execute_generation(task_record_id, storyboard_id)
     finally:
@@ -57,15 +67,13 @@ async def _run_project_storyboard_video_generation(task_record_id: UUID, storybo
 async def _execute_generation(task_record_id: UUID, storyboard_id: UUID) -> None:
     async with WorkerSessionLocal() as db:
         result = await db.execute(
-            select(UserTaskRecord)
-            .where(UserTaskRecord.id == task_record_id)
-            .with_for_update(skip_locked=True)
+            select(UserTaskRecord).where(UserTaskRecord.id == task_record_id).with_for_update()
         )
         task_record = result.scalar_one_or_none()
         storyboard = await db.get(ProjectStoryboard, storyboard_id)
         if task_record is None or storyboard is None:
             return
-        if task_record.status != "pending":
+        if not prepare_task_execution(task_record):
             return
 
         task_record.status = "running"
@@ -79,6 +87,12 @@ async def _execute_generation(task_record_id: UUID, storyboard_id: UUID) -> None
         try:
             await run_storyboard_video_generation_in_worker(db, task_record, storyboard_id)
         except Exception as exc:
+            if has_provider_task_id(task_record):
+                await db.rollback()
+                await db.refresh(task_record)
+                if has_provider_task_id(task_record):
+                    _enqueue_provider_reconcile_if_needed(task_record)
+                    return
             if _is_retryable_provider_error(exc):
                 await _mark_retrying(
                     db,
@@ -112,6 +126,8 @@ async def _fail_generation(
         if task_record is None or storyboard is None:
             return
         if task_record.status in {"success", "failed"}:
+            return
+        if has_provider_task_id(task_record):
             return
         await _mark_failed(db, task_record, storyboard, reason, refund=True, raw_reason=raw_reason)
 
@@ -156,7 +172,9 @@ async def _mark_failed(
     await db.commit()
 
 
-async def _mark_retrying(db, task_record: UserTaskRecord, storyboard: ProjectStoryboard, reason: str) -> None:
+async def _mark_retrying(
+    db, task_record: UserTaskRecord, storyboard: ProjectStoryboard, reason: str
+) -> None:
     reason = sanitize_public_message(reason, fallback="模型服务繁忙，正在重试")
     task_record.status = "pending"
     task_record.result = reason
@@ -207,11 +225,6 @@ def _user_failed_reason(exc: Exception) -> str:
 
 
 def _enqueue_provider_reconcile_if_needed(task_record: UserTaskRecord) -> None:
-    from app.services.task_records import provider_reconcile_delay_seconds, should_reconcile_provider_task
-    from app.tasks.provider_reconcile import enqueue_provider_reconcile
+    from app.tasks.provider_reconcile import enqueue_provider_reconcile_best_effort
 
-    if should_reconcile_provider_task(task_record):
-        enqueue_provider_reconcile(
-            str(task_record.id),
-            countdown=provider_reconcile_delay_seconds(task_record),
-        )
+    enqueue_provider_reconcile_best_effort(task_record)

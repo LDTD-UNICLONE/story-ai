@@ -1,11 +1,12 @@
 import logging
+from typing import Any, Optional
 
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.core.public_messages import sanitize_public_message
+from app.core.public_messages import sanitize_public_data, sanitize_public_message
 from app.core.responses import error
 from app.core.logging import log_extra
 
@@ -13,11 +14,18 @@ logger = logging.getLogger(__name__)
 
 
 class AppException(Exception):
-    def __init__(self, message: str, code: int = 40000, status_code: int = 400) -> None:
+    def __init__(
+        self,
+        message: str,
+        code: int = 40000,
+        status_code: int = 400,
+        data: Optional[Any] = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.code = code
         self.status_code = status_code
+        self.data = data
 
 
 def register_exception_handlers(app: FastAPI) -> None:
@@ -41,6 +49,7 @@ def register_exception_handlers(app: FastAPI) -> None:
         return error(
             message=sanitize_public_message(exc.message),
             code=exc.code,
+            data=sanitize_public_data(exc.data),
             http_status=exc.status_code,
         )
 
@@ -69,22 +78,23 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def validation_exception_handler(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
+        validation_errors = safe_validation_errors(exc)
         logger.info(
             "Validation error: %s %s errors=%s",
             request.method,
             request.url.path,
-            exc.errors(),
+            validation_errors,
             extra=log_extra(
                 event="validation_error",
                 method=request.method,
                 path=request.url.path,
-                errors=exc.errors(),
+                errors=validation_errors,
             ),
         )
         return error(
             message="参数校验失败",
             code=42200,
-            data=exc.errors(),
+            data=validation_errors,
             http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
 
@@ -94,6 +104,19 @@ def register_exception_handlers(app: FastAPI) -> None:
             "Unhandled exception: %s %s",
             request.method,
             request.url.path,
-            extra=log_extra(event="unhandled_exception", method=request.method, path=request.url.path),
+            extra=log_extra(
+                event="unhandled_exception", method=request.method, path=request.url.path
+            ),
         )
         return error(message="服务器内部错误", code=50000, http_status=500)
+
+
+def safe_validation_errors(exc: RequestValidationError) -> list[dict]:
+    return [
+        {
+            "type": item.get("type"),
+            "loc": item.get("loc"),
+            "msg": item.get("msg"),
+        }
+        for item in exc.errors()
+    ]

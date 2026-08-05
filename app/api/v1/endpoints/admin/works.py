@@ -31,7 +31,9 @@ async def admin_works(
     db: AsyncSession = Depends(get_db),
     current_admin: User = Depends(get_current_admin_user),
 ):
-    works, total = await list_admin_works(db, current_admin, user_id, visibility, status, page, page_size)
+    works, total = await list_admin_works(
+        db, current_admin, user_id, visibility, status, page, page_size
+    )
     data = AdminWorkListOut(items=works, total=total, page=page, page_size=page_size)
     return success(data=data.model_dump(mode="json"))
 

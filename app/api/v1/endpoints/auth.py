@@ -17,7 +17,9 @@ router = APIRouter(prefix="/auth")
 
 
 @router.post("/register/sms-code")
-async def send_register_sms(payload: SendRegisterSmsCodeRequest, db: AsyncSession = Depends(get_db)):
+async def send_register_sms(
+    payload: SendRegisterSmsCodeRequest, db: AsyncSession = Depends(get_db)
+):
     await send_register_code(db, payload)
     return success(message="验证码已发送")
 

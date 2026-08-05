@@ -1,6 +1,7 @@
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
+from starlette.concurrency import run_in_threadpool
 
 from app.api.deps import get_current_admin_user
 from app.core.responses import success
@@ -20,13 +21,13 @@ async def admin_system_logs(
     user_id: Optional[str] = Query(default=None, max_length=64),
     current_admin: User = Depends(get_current_admin_user),
 ):
-    return success(
-        data=read_system_log_tail(
-            lines=lines,
-            keyword=keyword or "",
-            log_file=log_file,
-            level=level,
-            request_id=request_id,
-            user_id=user_id,
-        )
+    data = await run_in_threadpool(
+        read_system_log_tail,
+        lines=lines,
+        keyword=keyword or "",
+        log_file=log_file,
+        level=level,
+        request_id=request_id,
+        user_id=user_id,
     )
+    return success(data=data)

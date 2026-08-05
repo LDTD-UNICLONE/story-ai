@@ -32,7 +32,9 @@ async def list_user_points_transactions(
     page_size: int,
 ) -> Tuple[List[UserPointsTransaction], int]:
     count_result = await db.execute(
-        select(func.count()).select_from(UserPointsTransaction).where(UserPointsTransaction.user_id == user_id)
+        select(func.count())
+        .select_from(UserPointsTransaction)
+        .where(UserPointsTransaction.user_id == user_id)
     )
     total = count_result.scalar_one()
 

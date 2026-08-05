@@ -35,11 +35,12 @@ async def run_model(
     generation_type: str,
     prompt: str,
     extra: Dict[str, Any],
+    idempotency_key: Optional[str] = None,
 ) -> ModelRunResult:
     if _should_use_volcengine_ark(ai_model, generation_type):
         return await _run_volcengine_ark(ai_model, generation_type, prompt, extra)
     if _should_use_comfly(ai_model):
-        return await _run_comfly(ai_model, generation_type, prompt, extra)
+        return await _run_comfly(ai_model, generation_type, prompt, extra, idempotency_key)
 
     raise AppException("暂不支持该模型", code=40005, status_code=400)
 
@@ -62,9 +63,15 @@ async def _run_comfly(
     generation_type: str,
     prompt: str,
     extra: Dict[str, Any],
+    idempotency_key: Optional[str],
 ) -> ModelRunResult:
     if generation_type == "text":
-        payload = await comfly.create_chat_completion(ai_model.model_id, prompt, extra)
+        payload = await comfly.create_chat_completion(
+            ai_model.model_id,
+            prompt,
+            extra,
+            idempotency_key=idempotency_key,
+        )
         content = _extract_chat_content(payload) or _extract_media_content(payload)
         if not content:
             response_summary = _chat_response_summary(payload)
@@ -87,19 +94,30 @@ async def _run_comfly(
         )
 
     if generation_type == "image":
-        payload = await comfly.create_image_generation(ai_model.model_id, prompt, extra)
+        payload = await comfly.create_image_generation(
+            ai_model.model_id,
+            prompt,
+            extra,
+            idempotency_key=idempotency_key,
+        )
         image_mode = str(extra.get("image_mode") or extra.get("capability") or "generation")
         task_id = _extract_task_id(payload)
         if task_id:
             content = f"图像生成任务已提交：{task_id}"
             return ModelRunResult(
                 content=content,
-                extra={"task_id": task_id, "task_status": _extract_status(payload), "provider_response": payload},
+                extra={
+                    "task_id": task_id, "task_status": _extract_status(payload), "provider_response": payload,
+                },
             )
         content = _extract_chat_content(payload) or _extract_media_content(payload)
         if not content:
-            raise AppException("图像模型响应格式错误：未返回 task_id 或图片结果", code=50231, status_code=502)
-        return ModelRunResult(content=content, extra={"image_mode": image_mode, "provider_response": payload})
+            raise AppException(
+                "图像模型响应格式错误：未返回 task_id 或图片结果", code=50231, status_code=502
+            )
+        return ModelRunResult(
+            content=content, extra={"image_mode": image_mode, "provider_response": payload}
+        )
 
     if generation_type == "video":
         provider_extra = dict(extra)
@@ -107,7 +125,12 @@ async def _run_comfly(
             ai_model.model_id,
             ai_model.capabilities or {},
         )
-        payload = await comfly.create_video_generation(ai_model.model_id, prompt, provider_extra)
+        payload = await comfly.create_video_generation(
+            ai_model.model_id,
+            prompt,
+            provider_extra,
+            idempotency_key=idempotency_key,
+        )
         video_mode = str(extra.get("video_mode") or extra.get("capability") or "generation")
         task_id = _extract_task_id(payload)
         if not task_id:
@@ -115,7 +138,9 @@ async def _run_comfly(
         content = f"视频生成任务已提交：{task_id}"
         return ModelRunResult(
             content=content,
-            extra={"task_id": task_id, "task_status": _extract_status(payload), "video_mode": video_mode, "provider_response": payload},
+            extra={
+                "task_id": task_id, "task_status": _extract_status(payload), "video_mode": video_mode, "provider_response": payload,
+            },
         )
 
     raise AppException("不支持的生成类型", code=40004, status_code=400)
@@ -135,7 +160,9 @@ async def _run_volcengine_ark(
         ai_model.model_id,
         ai_model.capabilities or {},
     )
-    payload = await volcengine_ark.create_video_generation(ai_model.model_id, prompt, provider_extra)
+    payload = await volcengine_ark.create_video_generation(
+        ai_model.model_id, prompt, provider_extra
+    )
     video_mode = str(extra.get("video_mode") or extra.get("capability") or "generation")
     task_id = _extract_task_id(payload)
     content = f"视频生成任务已提交：{task_id}" if task_id else "视频生成任务已提交"
@@ -158,7 +185,9 @@ async def _query_comfly_task(generation_type: str, task_id: str) -> ModelRunResu
         content = _extract_media_content(payload)
         return ModelRunResult(
             content=content,
-            extra={"task_id": _extract_task_id(payload) or task_id, "task_status": _extract_status(payload), "provider_response": payload},
+            extra={
+                "task_id": _extract_task_id(payload) or task_id, "task_status": _extract_status(payload), "provider_response": payload,
+            },
         )
 
     if generation_type == "video":
@@ -166,7 +195,9 @@ async def _query_comfly_task(generation_type: str, task_id: str) -> ModelRunResu
         content = _extract_media_content(payload)
         return ModelRunResult(
             content=content,
-            extra={"task_id": _extract_task_id(payload) or task_id, "task_status": _extract_status(payload), "provider_response": payload},
+            extra={
+                "task_id": _extract_task_id(payload) or task_id, "task_status": _extract_status(payload), "provider_response": payload,
+            },
         )
 
     raise AppException("该生成类型没有任务查询接口", code=40006, status_code=400)

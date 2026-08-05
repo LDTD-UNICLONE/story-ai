@@ -23,7 +23,12 @@ from app.services.model_points import settle_text_task_points, settle_video_task
 from app.services.model_runner import ModelRunResult, query_model_task, run_model
 from app.services.points import change_user_points
 from app.services.provider_polling import provider_poll_interval_seconds
-from app.services.task_records import refresh_task_record_interrupted
+from app.services.task_records import (
+    has_provider_task_id,
+    record_provider_task_state,
+    refresh_task_record_interrupted,
+)
+from app.services.task_execution import TaskExecutionDeferred, prepare_task_execution
 from app.worker import celery_app
 
 
@@ -42,9 +47,15 @@ def run_conversation_generation(self, task_record_id: str, assistant_message_id:
     try:
         asyncio.run(_run_conversation_generation(UUID(task_record_id), UUID(assistant_message_id)))
     except SoftTimeLimitExceeded:
-        asyncio.run(_fail_generation(UUID(task_record_id), UUID(assistant_message_id), "任务执行超时"))
+        asyncio.run(
+            _fail_generation(UUID(task_record_id), UUID(assistant_message_id), "任务执行超时")
+        )
+    except TaskExecutionDeferred as exc:
+        raise self.retry(countdown=exc.retry_after_seconds) from exc
     except Exception as exc:
-        if self.request.retries < settings.celery_task_max_retries and _is_retryable_provider_error(exc):
+        if self.request.retries < settings.celery_task_max_retries and _is_retryable_provider_error(
+            exc
+        ):
             raise self.retry(exc=exc, countdown=_retry_countdown(self.request.retries)) from exc
         asyncio.run(
             _fail_generation(
@@ -77,15 +88,17 @@ async def _fail_generation(
             return
         if task_record.status in {"success", "failed"}:
             return
-        await _mark_failed(db, task_record, assistant_message, reason, refund=True, raw_reason=raw_reason)
+        if has_provider_task_id(task_record):
+            return
+        await _mark_failed(
+            db, task_record, assistant_message, reason, refund=True, raw_reason=raw_reason
+        )
 
 
 async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) -> None:
     async with WorkerSessionLocal() as db:
         result = await db.execute(
-            select(UserTaskRecord)
-            .where(UserTaskRecord.id == task_record_id)
-            .with_for_update(skip_locked=True)
+            select(UserTaskRecord).where(UserTaskRecord.id == task_record_id).with_for_update()
         )
         task_record = result.scalar_one_or_none()
         assistant_message = await db.get(ConversationMessage, assistant_message_id)
@@ -100,7 +113,7 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
                 ),
             )
             return
-        if task_record.status != "pending":
+        if not prepare_task_execution(task_record):
             logger.info(
                 "Conversation generation skipped: task_record is not pending",
                 extra=log_extra(
@@ -108,13 +121,15 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
                     task_record_id=task_record.id,
                     assistant_message_id=assistant_message.id,
                     status=task_record.status,
-                    reason="not_pending",
+                    reason="not_executable",
                 ),
             )
             return
 
         task_record.status = "running"
         assistant_message.extra = {**(assistant_message.extra or {}), "task_status": "running"}
+        if assistant_message.message_type == "text":
+            assistant_message.status = "running"
         await db.commit()
         logger.info(
             "Conversation generation business task running",
@@ -135,7 +150,9 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
         )
         ai_model = result.scalar_one_or_none()
         if ai_model is None:
-            await _mark_failed(db, task_record, assistant_message, "模型不存在或已禁用", refund=True)
+            await _mark_failed(
+                db, task_record, assistant_message, "模型不存在或已禁用", refund=True
+            )
             return
 
         model_snapshot = SimpleNamespace(
@@ -153,14 +170,30 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
                 task_record.generation_type,
                 task_record.prompt,
                 (task_record.extra or {}).get("user_message_extra") or {},
+                idempotency_key=str(task_record.id),
             )
+            if record_provider_task_state(task_record, model_result.extra, ai_model.vendor):
+                task_record.extra = {
+                    **(task_record.extra or {}),
+                    "assistant_message_extra": model_result.extra,
+                    "assistant_message_id": str(assistant_message.id),
+                }
+                await db.commit()
             model_result = await _resolve_provider_task_result(
                 model_snapshot,
                 task_record.generation_type,
                 model_result,
             )
-            model_result = await persist_generated_media_to_oss(task_record.generation_type, model_result)
+            model_result = await persist_generated_media_to_oss(
+                task_record.generation_type, model_result
+            )
         except Exception as exc:
+            if has_provider_task_id(task_record):
+                await db.rollback()
+                await db.refresh(task_record)
+                if has_provider_task_id(task_record):
+                    _enqueue_provider_reconcile_if_needed(task_record)
+                    return
             if _is_retryable_provider_error(exc):
                 await _mark_retrying(
                     db,
@@ -191,6 +224,8 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
             "task_status": resolved_status,
             "task_record_id": str(task_record.id),
         }
+        if assistant_message.message_type == "text":
+            assistant_message.status = resolved_status
         task_record.status = resolved_status
         task_record.result = model_result.content
         task_record.extra = {
@@ -198,6 +233,7 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
             "assistant_message_extra": model_result.extra,
             "assistant_message_id": str(assistant_message.id),
         }
+        record_provider_task_state(task_record, model_result.extra, ai_model.vendor)
         if task_record.business_id:
             await db.execute(
                 Conversation.__table__.update()
@@ -218,7 +254,9 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
         )
 
         if task_record.generation_type == "text":
-            await _settle_text_points_after_success(db, task_record.id, ai_model, model_result.extra)
+            await _settle_text_points_after_success(
+                db, task_record.id, ai_model, model_result.extra
+            )
         elif task_record.generation_type == "video":
             await _settle_video_points_after_success(db, task_record.id, ai_model)
         _enqueue_provider_reconcile_if_needed(task_record)
@@ -265,6 +303,8 @@ async def _mark_failed(
         "display_message": f"任务执行失败：{reason}",
         "task_record_id": str(task_record.id),
     }
+    if assistant_message.message_type == "text":
+        assistant_message.status = "failed"
     await db.commit()
     logger.warning(
         "Conversation generation business task failed",
@@ -365,6 +405,8 @@ async def _mark_retrying(
         "retry_reason": reason,
         "task_record_id": str(task_record.id),
     }
+    if assistant_message.message_type == "text":
+        assistant_message.status = "pending"
     await db.commit()
 
 
@@ -414,8 +456,16 @@ async def _resolve_provider_task_result(
 
 
 def _is_provider_success_result(model_result: ModelRunResult, status: str) -> bool:
-    terminal_success_statuses = {"success", "succeeded", "completed", "complete", "finished", "done"}
-    pending_statuses = {"not_start", "submitted", "in_progress", "running", "pending", "processing", "queued"}
+    terminal_success_statuses = {
+        "success",
+        "succeeded", "completed", "complete", "finished",
+        "done",
+    }
+    pending_statuses = {
+        "not_start",
+        "submitted", "in_progress", "running", "pending", "processing",
+        "queued",
+    }
     if status in terminal_success_statuses:
         return True
     if status in pending_statuses:
@@ -464,11 +514,6 @@ def _user_failed_reason(exc: Exception) -> str:
 
 
 def _enqueue_provider_reconcile_if_needed(task_record: UserTaskRecord) -> None:
-    from app.services.task_records import provider_reconcile_delay_seconds, should_reconcile_provider_task
-    from app.tasks.provider_reconcile import enqueue_provider_reconcile
+    from app.tasks.provider_reconcile import enqueue_provider_reconcile_best_effort
 
-    if should_reconcile_provider_task(task_record):
-        enqueue_provider_reconcile(
-            str(task_record.id),
-            countdown=provider_reconcile_delay_seconds(task_record),
-        )
+    enqueue_provider_reconcile_best_effort(task_record)

@@ -65,7 +65,9 @@ async def create_my_recharge_order(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    order = await create_recharge_order(db, user_id=current_user.id, amount_yuan=payload.amount_yuan)
+    order = await create_recharge_order(
+        db, user_id=current_user.id, amount_yuan=payload.amount_yuan
+    )
     return success(
         data=RechargeOrderOut.model_validate(order).model_dump(mode="json"),
         message="充值订单已创建",
@@ -114,7 +116,9 @@ async def sync_my_recharge_order(
 ):
     order = await get_user_recharge_order_or_404(db, order_id=order_id, user_id=current_user.id)
     order = await sync_recharge_order_from_wechat(db, order)
-    return success(data=RechargeOrderOut.model_validate(order).model_dump(mode="json"), message="同步成功")
+    return success(
+        data=RechargeOrderOut.model_validate(order).model_dump(mode="json"), message="同步成功"
+    )
 
 
 @router.post("/wechat/notify")

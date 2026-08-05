@@ -13,7 +13,14 @@ from app.integrations.comfly import close_comfly_client
 from app.integrations.volcengine_ark import close_volcengine_ark_client
 from app.models.task_record import UserTaskRecord
 from app.services.points import change_user_points
-from app.services.project_asset_generation import _asset_image_config, run_asset_image_generation_in_worker
+from app.services.project_asset_generation import (
+    _asset_image_config,
+    _set_image_generation_state,
+    _task_asset_variant,
+    run_asset_image_generation_in_worker,
+)
+from app.services.task_records import has_provider_task_id
+from app.services.task_execution import TaskExecutionDeferred, prepare_task_execution
 from app.worker import celery_app
 
 
@@ -27,13 +34,23 @@ WorkerSessionLocal = create_worker_sessionmaker()
     soft_time_limit=settings.effective_celery_task_soft_time_limit_seconds,
     time_limit=settings.effective_celery_task_time_limit_seconds,
 )
-def run_project_asset_image_generation(self, task_record_id: str, asset_type: str, asset_id: str) -> None:
+def run_project_asset_image_generation(
+    self, task_record_id: str, asset_type: str, asset_id: str
+) -> None:
     try:
-        asyncio.run(_run_project_asset_image_generation(UUID(task_record_id), asset_type, UUID(asset_id)))
+        asyncio.run(
+            _run_project_asset_image_generation(UUID(task_record_id), asset_type, UUID(asset_id))
+        )
     except SoftTimeLimitExceeded:
-        asyncio.run(_fail_generation(UUID(task_record_id), asset_type, UUID(asset_id), "任务执行超时"))
+        asyncio.run(
+            _fail_generation(UUID(task_record_id), asset_type, UUID(asset_id), "任务执行超时")
+        )
+    except TaskExecutionDeferred as exc:
+        raise self.retry(countdown=exc.retry_after_seconds) from exc
     except Exception as exc:
-        if self.request.retries < settings.celery_task_max_retries and _is_retryable_provider_error(exc):
+        if self.request.retries < settings.celery_task_max_retries and _is_retryable_provider_error(
+            exc
+        ):
             raise self.retry(exc=exc, countdown=_retry_countdown(self.request.retries)) from exc
         asyncio.run(
             _fail_generation(
@@ -46,7 +63,9 @@ def run_project_asset_image_generation(self, task_record_id: str, asset_type: st
         )
 
 
-async def _run_project_asset_image_generation(task_record_id: UUID, asset_type: str, asset_id: UUID) -> None:
+async def _run_project_asset_image_generation(
+    task_record_id: UUID, asset_type: str, asset_id: UUID
+) -> None:
     try:
         await _execute_generation(task_record_id, asset_type, asset_id)
     finally:
@@ -58,33 +77,40 @@ async def _execute_generation(task_record_id: UUID, asset_type: str, asset_id: U
     config = _asset_image_config(asset_type)
     async with WorkerSessionLocal() as db:
         result = await db.execute(
-            select(UserTaskRecord)
-            .where(UserTaskRecord.id == task_record_id)
-            .with_for_update(skip_locked=True)
+            select(UserTaskRecord).where(UserTaskRecord.id == task_record_id).with_for_update()
         )
         task_record = result.scalar_one_or_none()
         asset = await db.get(config["model"], asset_id)
         if task_record is None or asset is None:
             return
-        if task_record.status != "pending":
+        variant = await _task_asset_variant(db, task_record)
+        if not prepare_task_execution(task_record):
             return
 
         task_record.status = "running"
-        asset.extra = {
-            **(asset.extra or {}),
-            "image_generation_status": "running",
-            "image_generation_task_record_id": str(task_record.id),
-        }
+        _set_image_generation_state(
+            asset,
+            variant,
+            status="running",
+            task_record_id=task_record.id,
+        )
         await db.commit()
 
         try:
             await run_asset_image_generation_in_worker(db, task_record, asset_type, asset_id)
         except Exception as exc:
+            if has_provider_task_id(task_record):
+                await db.rollback()
+                await db.refresh(task_record)
+                if has_provider_task_id(task_record):
+                    _enqueue_provider_reconcile_if_needed(task_record)
+                    return
             if _is_retryable_provider_error(exc):
                 await _mark_retrying(
                     db,
                     task_record,
                     asset,
+                    variant,
                     sanitize_public_message(str(exc) or "模型服务繁忙，正在重试"),
                 )
                 raise
@@ -92,6 +118,7 @@ async def _execute_generation(task_record_id: UUID, asset_type: str, asset_id: U
                 db,
                 task_record,
                 asset,
+                variant,
                 sanitize_public_message(str(exc) or "资产图像生成失败"),
                 refund=True,
                 raw_reason=str(exc) or "资产图像生成失败",
@@ -114,15 +141,27 @@ async def _fail_generation(
         asset = await db.get(config["model"], asset_id)
         if task_record is None or asset is None:
             return
+        variant = await _task_asset_variant(db, task_record)
         if task_record.status in {"success", "failed"}:
             return
-        await _mark_failed(db, task_record, asset, reason, refund=True, raw_reason=raw_reason)
+        if has_provider_task_id(task_record):
+            return
+        await _mark_failed(
+            db,
+            task_record,
+            asset,
+            variant,
+            reason,
+            refund=True,
+            raw_reason=raw_reason,
+        )
 
 
 async def _mark_failed(
     db,
     task_record: UserTaskRecord,
     asset,
+    variant,
     reason: str,
     refund: bool = False,
     raw_reason: Optional[str] = None,
@@ -149,27 +188,39 @@ async def _mark_failed(
         "raw_failed_reason": raw_reason or reason,
         "refund_transaction_id": refund_transaction_id,
     }
-    asset.extra = {
-        **(asset.extra or {}),
-        "image_generation_status": "failed",
-        "image_generation_failed_reason": reason,
-        "raw_failed_reason": raw_reason or reason,
-        "image_generation_task_record_id": str(task_record.id),
-    }
+    _set_image_generation_state(
+        asset,
+        variant,
+        status="failed",
+        task_record_id=task_record.id,
+        failed_reason=reason,
+    )
+    state = variant.extra if variant is not None else asset.extra
+    updated = {**(state or {}), "raw_failed_reason": raw_reason or reason}
+    if variant is not None:
+        variant.extra = updated
+    else:
+        asset.extra = updated
     await db.commit()
 
 
-async def _mark_retrying(db, task_record: UserTaskRecord, asset, reason: str) -> None:
+async def _mark_retrying(db, task_record: UserTaskRecord, asset, variant, reason: str) -> None:
     reason = sanitize_public_message(reason, fallback="模型服务繁忙，正在重试")
     task_record.status = "pending"
     task_record.result = reason
     task_record.extra = {**(task_record.extra or {}), "retry_reason": reason}
-    asset.extra = {
-        **(asset.extra or {}),
-        "image_generation_status": "pending",
-        "image_generation_retry_reason": reason,
-        "image_generation_task_record_id": str(task_record.id),
-    }
+    _set_image_generation_state(
+        asset,
+        variant,
+        status="pending",
+        task_record_id=task_record.id,
+    )
+    state = variant.extra if variant is not None else asset.extra
+    updated = {**(state or {}), "image_generation_retry_reason": reason}
+    if variant is not None:
+        variant.extra = updated
+    else:
+        asset.extra = updated
     await db.commit()
 
 
@@ -210,11 +261,6 @@ def _user_failed_reason(exc: Exception) -> str:
 
 
 def _enqueue_provider_reconcile_if_needed(task_record: UserTaskRecord) -> None:
-    from app.services.task_records import provider_reconcile_delay_seconds, should_reconcile_provider_task
-    from app.tasks.provider_reconcile import enqueue_provider_reconcile
+    from app.tasks.provider_reconcile import enqueue_provider_reconcile_best_effort
 
-    if should_reconcile_provider_task(task_record):
-        enqueue_provider_reconcile(
-            str(task_record.id),
-            countdown=provider_reconcile_delay_seconds(task_record),
-        )
+    enqueue_provider_reconcile_best_effort(task_record)

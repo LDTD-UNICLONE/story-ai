@@ -1,7 +1,30 @@
 from app.models.ai_model import AiModel
+from app.models.agent_core_asset import AgentCoreAssetLock
+from app.models.agent_production import (
+    AgentCheckpoint,
+    AgentControllerState,
+    AgentEvent,
+    AgentProduction,
+    AgentStep,
+    ProjectSourceDocument,
+)
+from app.models.agent_story_bible import (
+    AgentAssetCandidate,
+    AgentAssetVariant,
+    SeriesBibleVersion,
+)
+from app.models.agent_storyboard_media import AgentStoryboardMediaRequest
+from app.models.agent_workflow import AgentWorkflowStepState
+from app.models.agent_review import (
+    AgentDelivery,
+    AgentEpisodeReview,
+    AgentMediaRegeneration,
+    AgentReviewIssue,
+)
 from app.models.announcement import Announcement
 from app.models.conversation import Conversation, ConversationMessage
 from app.models.material import Material
+from app.models.oss_deletion import OssDeletionOutbox
 from app.models.points import UserPointsTransaction, UserRechargeOrder
 from app.models.project import Project
 from app.models.project_asset import ProjectCharacter, ProjectProp, ProjectScene
@@ -15,10 +38,25 @@ from app.models.work import UserWork, UserWorkLike, UserWorkMedia, UserWorkUploa
 
 __all__ = [
     "AiModel",
+    "AgentCoreAssetLock",
+    "AgentCheckpoint",
+    "AgentControllerState",
+    "AgentEvent",
+    "AgentProduction",
+    "AgentStep",
+    "AgentWorkflowStepState",
+    "AgentAssetCandidate",
+    "AgentAssetVariant",
+    "AgentDelivery",
+    "AgentEpisodeReview",
+    "AgentMediaRegeneration",
+    "AgentReviewIssue",
+    "AgentStoryboardMediaRequest",
     "Announcement",
     "Conversation",
     "ConversationMessage",
     "Material",
+    "OssDeletionOutbox",
     "Project",
     "ProjectCharacter",
     "ProjectChapter",
@@ -26,6 +64,8 @@ __all__ = [
     "ProjectProp",
     "ProjectScene",
     "ProjectStoryboard",
+    "ProjectSourceDocument",
+    "SeriesBibleVersion",
     "Style",
     "User",
     "UserPointsTransaction",

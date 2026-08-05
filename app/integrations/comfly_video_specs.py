@@ -45,7 +45,11 @@ DEFAULT_COMFLY_VIDEO_CAPABILITIES: Dict[str, Any] = {
         _field("videos", "file_list", "参考视频", multiple=True),
         _field("watermark", "boolean", "水印"),
     ],
-    "request_keys": ["aspect_ratio", "duration", "images", "resolution", "size", "videos", "watermark"],
+    "request_keys": [
+        "aspect_ratio",
+        "duration", "images", "resolution", "size", "videos",
+        "watermark",
+    ],
     "media_limits": {},
     "ratios": list(COMMON_VIDEO_RATIOS),
     "supports_async_task": True,
@@ -64,7 +68,9 @@ COMFLY_VIDEO_SPECS: Dict[str, Dict[str, Any]] = {
             "fields": [
                 _field("aspect_ratio", "select", "画面比例", options=["16:9", "9:16"]),
                 _field("hd", "boolean", "高清视频"),
-                _field("duration", "select", "视频时长", options=["4", "8", "10", "12", "15", "25"]),
+                _field(
+                    "duration", "select", "视频时长", options=["4", "8", "10", "12", "15", "25"]
+                ),
                 _field("images", "file_list", "参考图", multiple=True),
                 _field("character_url", "url", "角色视频地址"),
                 _field("character_timestamps", "array", "角色时间戳"),
@@ -104,7 +110,11 @@ COMFLY_VIDEO_SPECS: Dict[str, Dict[str, Any]] = {
                 _field("enable_upsample", "boolean", "增强分辨率"),
                 _field("images", "file_list", "参考图", multiple=True),
             ],
-            "request_keys": ["aspect_ratio", "duration", "enable_upsample", "enhance_prompt", "images"],
+            "request_keys": [
+                "aspect_ratio",
+                "duration", "enable_upsample", "enhance_prompt",
+                "images",
+            ],
             "media_limits": {"images": 3},
             "ratios": ["16:9", "9:16"],
             "supports_async_task": True,

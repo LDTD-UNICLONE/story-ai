@@ -19,9 +19,13 @@ VOLCENGINE_ARK_VIDEO_CAPABILITIES: Dict[str, Any] = {
     "task_endpoint": "/api/v3/contents/generations/tasks/{task_id}",
     "modes": ["text_to_video", "multimodal_reference", "image_to_video", "first_last_frame"],
     "fields": [
-        {"name": "ratio", "type": "select", "label": "画面比例", "required": False, "options": VOLCENGINE_ARK_VIDEO_RATIOS},
+        {
+            "name": "ratio", "type": "select", "label": "画面比例", "required": False, "options": VOLCENGINE_ARK_VIDEO_RATIOS,
+        },
         {"name": "duration", "type": "integer", "label": "视频时长", "required": False},
-        {"name": "resolution", "type": "select", "label": "分辨率", "required": False, "options": DEFAULT_VIDEO_RESOLUTIONS},
+        {
+            "name": "resolution", "type": "select", "label": "分辨率", "required": False, "options": DEFAULT_VIDEO_RESOLUTIONS,
+        },
         {"name": "generate_audio", "type": "boolean", "label": "生成音频", "required": False},
         {"name": "return_last_frame", "type": "boolean", "label": "返回尾帧", "required": False},
         {"name": "watermark", "type": "boolean", "label": "水印", "required": False},
@@ -135,7 +139,9 @@ def is_known_video_resolution(value: Any) -> bool:
     return _normalize_resolution(value) is not None
 
 
-def is_video_resolution_supported(value: Any, capabilities: Optional[Dict[str, Any]] = None) -> bool:
+def is_video_resolution_supported(
+    value: Any, capabilities: Optional[Dict[str, Any]] = None
+) -> bool:
     requested = _normalize_resolution(value)
     if requested is None:
         return True

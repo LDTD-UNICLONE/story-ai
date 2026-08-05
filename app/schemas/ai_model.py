@@ -22,6 +22,7 @@ class AiModelOut(SchemaBaseModel):
     completion_multiplier: Decimal
     platform_multiplier: Decimal
     is_enabled: bool
+    is_agent_default: bool
     capabilities: Dict[str, Any]
     created_at: datetime
     updated_at: datetime
@@ -63,6 +64,7 @@ class AiModelCreateRequest(SchemaBaseModel):
     completion_multiplier: Decimal = Field(default=Decimal("1.0000"), ge=0)
     platform_multiplier: Decimal = Field(default=Decimal("1.0000"), ge=0)
     is_enabled: bool = True
+    is_agent_default: bool = False
     capabilities: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -78,6 +80,7 @@ class AiModelUpdateRequest(SchemaBaseModel):
     completion_multiplier: Optional[Decimal] = Field(default=None, ge=0)
     platform_multiplier: Optional[Decimal] = Field(default=None, ge=0)
     is_enabled: Optional[bool] = None
+    is_agent_default: Optional[bool] = None
     capabilities: Optional[Dict[str, Any]] = None
 
 
@@ -93,6 +96,7 @@ class ProviderModelOut(SchemaBaseModel):
     completion_multiplier: Decimal = Decimal("1.0000")
     platform_multiplier: Decimal = Decimal("1.0000")
     is_enabled: bool = True
+    is_agent_default: bool = False
     capabilities: Dict[str, Any] = Field(default_factory=dict)
     object: Optional[str] = None
     owned_by: Optional[str] = None

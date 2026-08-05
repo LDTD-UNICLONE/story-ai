@@ -1,6 +1,7 @@
 import uuid
+from typing import Optional
 
-from sqlalchemy import Boolean, ForeignKey, JSON, String, Text, text
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, ForeignKey, Index, JSON, String, Text, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -9,6 +10,14 @@ from app.db.base import Base, TimestampMixin
 
 class Conversation(Base, TimestampMixin):
     __tablename__ = "conversations"
+    __table_args__ = (
+        Index(
+            "ix_conversations_user_enabled_updated_at",
+            "user_id",
+            "is_enabled",
+            "updated_at",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -35,6 +44,31 @@ class Conversation(Base, TimestampMixin):
 
 class ConversationMessage(Base, TimestampMixin):
     __tablename__ = "conversation_messages"
+    __table_args__ = (
+        CheckConstraint(
+            "status IS NULL OR status IN ('pending', 'running', 'success', 'failed')",
+            name="ck_conversation_messages_status",
+        ),
+        Index(
+            "uq_conversation_messages_conversation_sequence",
+            "conversation_id",
+            "sequence_no",
+            unique=True,
+            postgresql_where=text("sequence_no IS NOT NULL"),
+        ),
+        Index(
+            "uq_conversation_messages_conversation_client_message",
+            "conversation_id",
+            "client_message_id",
+            unique=True,
+            postgresql_where=text("client_message_id IS NOT NULL AND role = 'user'"),
+        ),
+        Index(
+            "ix_conversation_messages_conversation_created_at",
+            "conversation_id",
+            "created_at",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -64,3 +98,9 @@ class ConversationMessage(Base, TimestampMixin):
         index=True,
         nullable=False,
     )
+    turn_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), index=True, nullable=True
+    )
+    sequence_no: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    status: Mapped[Optional[str]] = mapped_column(String(32), index=True, nullable=True)
+    client_message_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)

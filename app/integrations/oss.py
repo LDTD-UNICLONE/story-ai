@@ -1,5 +1,6 @@
 from pathlib import PurePosixPath
 from typing import BinaryIO, Optional, Tuple
+from urllib.parse import quote
 from uuid import uuid4
 
 import oss2
@@ -41,7 +42,9 @@ class OssClient:
         try:
             result = self.bucket.put_object(object_key, fileobj, headers=headers)
         except Exception as exc:
-            raise AppException(f"OSS 上传失败：{_oss_exception_message(exc)}", code=50011, status_code=500) from exc
+            raise AppException(
+                f"OSS 上传失败：{_oss_exception_message(exc)}", code=50011, status_code=500
+            ) from exc
         if result.status >= 300:
             request_id = getattr(result, "request_id", "") or "-"
             raise AppException(
@@ -56,24 +59,30 @@ class OssClient:
             return f"{settings.oss_public_base_url.rstrip('/')}/{object_key.lstrip('/')}"
         return f"https://{settings.oss_bucket_name}.{settings.oss_endpoint.removeprefix('https://')}/{object_key}"
 
-    def get_object(self, object_key: str):
+    def signed_download_url(self, object_key: str, filename: str) -> str:
+        params = {
+            "response-content-disposition": (
+                f"inline; filename*=UTF-8''{quote(filename, safe='')}"
+            )
+        }
         try:
-            return self.bucket.get_object(object_key)
+            return self.bucket.sign_url(
+                "GET",
+                object_key,
+                max(1, settings.oss_signed_url_expires_seconds),
+                params=params,
+                slash_safe=True,
+            )
         except Exception as exc:
-            raise AppException("OSS 文件读取失败", code=50012, status_code=500) from exc
-
-    def get_object_range(self, object_key: str, start: int, end: Optional[int] = None):
-        byte_range = (start, end) if end is not None else (start, "")
-        try:
-            return self.bucket.get_object(object_key, byte_range=byte_range)
-        except Exception as exc:
-            raise AppException("OSS 文件读取失败", code=50012, status_code=500) from exc
+            raise AppException("OSS 文件签名失败", code=50012, status_code=500) from exc
 
     def delete_object(self, object_key: str) -> None:
         try:
             result = self.bucket.delete_object(object_key)
         except Exception as exc:
-            raise AppException(f"OSS 文件删除失败：{_oss_exception_message(exc)}", code=50014, status_code=500) from exc
+            raise AppException(
+                f"OSS 文件删除失败：{_oss_exception_message(exc)}", code=50014, status_code=500
+            ) from exc
         if result.status >= 300:
             request_id = getattr(result, "request_id", "") or "-"
             raise AppException(

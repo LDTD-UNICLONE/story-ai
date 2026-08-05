@@ -30,9 +30,13 @@ PROJECT_OWNER_TABLES = (
 
 async def main() -> None:
     args = _parse_args()
-    target_user_id = _parse_uuid(args.target_user_id, "target-user-id") if args.target_user_id else None
+    target_user_id = (
+        _parse_uuid(args.target_user_id, "target-user-id") if args.target_user_id else None
+    )
     if args.all and target_user_id:
-        raise SystemExit("--all 不能和 --target-user-id 同时使用；全量修复会以每个 projects.user_id 为准")
+        raise SystemExit(
+            "--all 不能和 --target-user-id 同时使用；全量修复会以每个 projects.user_id 为准"
+        )
     async with AsyncSessionLocal() as db:
         if args.all:
             result = await sync_all_project_owners(
@@ -90,7 +94,9 @@ async def sync_all_project_owners(
         "apply": apply,
         "mode": "all",
         "project_count": len(project_rows),
-        "mismatch_project_count": sum(1 for item in projects if _result_affected(item) or _result_updated(item)),
+        "mismatch_project_count": sum(
+            1 for item in projects if _result_affected(item) or _result_updated(item)
+        ),
         "total_affected": total_affected,
         "total_updated": total_updated,
         "projects": projects,
@@ -117,7 +123,9 @@ async def sync_project_owner(
     table_results = []
     for owner_table in PROJECT_OWNER_TABLES:
         if not await _table_exists(db, owner_table.name):
-            table_results.append({"table": owner_table.name, "skipped": True, "reason": "table_not_exists"})
+            table_results.append(
+                {"table": owner_table.name, "skipped": True, "reason": "table_not_exists"}
+            )
             continue
         affected = await _count_owner_mismatch(db, owner_table, project_id, resolved_user_id)
         updated = 0
@@ -160,7 +168,9 @@ async def sync_project_owner(
 
 
 async def _project_rows(db: AsyncSession) -> list[dict]:
-    result = await db.execute(text("SELECT id, user_id FROM projects ORDER BY created_at ASC, id ASC"))
+    result = await db.execute(
+        text("SELECT id, user_id FROM projects ORDER BY created_at ASC, id ASC")
+    )
     return [dict(row) for row in result.mappings().all()]
 
 
@@ -237,7 +247,9 @@ async def _update_owner_table(
     return int(result.rowcount or 0)
 
 
-async def _count_task_record_mismatch(db: AsyncSession, project_id: UUID, target_user_id: UUID) -> int:
+async def _count_task_record_mismatch(
+    db: AsyncSession, project_id: UUID, target_user_id: UUID
+) -> int:
     result = await db.execute(
         text(
             """
@@ -290,7 +302,9 @@ def _parse_args() -> argparse.Namespace:
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--project-id", help="项目 ID")
-    group.add_argument("--all", action="store_true", help="扫描并修复所有项目，以 projects.user_id 为准")
+    group.add_argument(
+        "--all", action="store_true", help="扫描并修复所有项目，以 projects.user_id 为准"
+    )
     parser.add_argument(
         "--target-user-id",
         default=None,

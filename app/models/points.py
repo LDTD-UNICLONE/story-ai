@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Optional
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, text
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -32,6 +32,9 @@ class UserPointsTransaction(Base, TimestampMixin):
 
 class UserRechargeOrder(Base, TimestampMixin):
     __tablename__ = "user_recharge_orders"
+    __table_args__ = (
+        Index("ix_user_recharge_orders_user_created_at", "user_id", "created_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -61,12 +64,16 @@ class UserRechargeOrder(Base, TimestampMixin):
     refund_id: Mapped[Optional[str]] = mapped_column(String(128), unique=True, nullable=True)
     amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     points_amount: Mapped[int] = mapped_column(Integer, nullable=False)
-    status: Mapped[str] = mapped_column(String(32), index=True, nullable=False, server_default=text("'pending'"))
+    status: Mapped[str] = mapped_column(
+        String(32), index=True, nullable=False, server_default=text("'pending'")
+    )
     code_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     description: Mapped[str] = mapped_column(String(128), nullable=False)
     paid_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     refunded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    extra: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, server_default=text("'{}'::json"))
+    extra: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, server_default=text("'{}'::json")
+    )
 
     @property
     def pay_type(self) -> str:

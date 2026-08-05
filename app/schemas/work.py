@@ -93,6 +93,7 @@ class WorkOut(SchemaBaseModel):
     like_count: int
     view_count: int
     liked_by_me: bool = False
+    media_count: int
     media_items: List[WorkMediaOut]
     created_at: datetime
     updated_at: datetime

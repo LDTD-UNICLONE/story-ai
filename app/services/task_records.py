@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -11,16 +11,23 @@ from app.core.exceptions import AppException
 from app.core.public_messages import sanitize_public_message
 from app.core.timezone import beijing_datetime, to_beijing_datetime
 from app.models.ai_model import AiModel
+from app.models.agent_story_bible import AgentAssetVariant
 from app.models.conversation import ConversationMessage
 from app.models.project_asset import ProjectCharacter, ProjectProp, ProjectScene
 from app.models.project_chapter import ProjectChapter
 from app.models.project_storyboard import ProjectStoryboard
 from app.models.task_record import UserTaskRecord
+from app.models.user import User
 from app.services.generated_media import persist_generated_media_to_oss
+from app.services.core_asset_change_tracking import track_core_asset_reference_change
 from app.services.model_points import settle_video_task_points
 from app.services.model_runner import ModelRunResult, query_model_task
 from app.services.points import change_user_points
-from app.services.project_generated_assets import create_project_generated_asset_history, extract_result_urls
+from app.services.project_generated_assets import (
+    create_project_generated_asset_history,
+    extract_result_urls,
+    record_storyboard_video_generation_success,
+)
 from app.services.provider_polling import provider_poll_interval_seconds
 
 TASK_RECORD_BUSINESS_TYPES = [
@@ -33,6 +40,10 @@ TASK_RECORD_GENERATION_TYPES = [
     {"label": "图像生成", "value": "image", "business_type": "conversation"},
     {"label": "视频生成", "value": "video", "business_type": "conversation"},
     {"label": "章节文本处理", "value": "chapter_text_process", "business_type": "project"},
+    {"label": "整剧分块解析", "value": "agent_source_chunk_analysis", "business_type": "project"},
+    {"label": "整剧分析合并", "value": "agent_source_global_merge", "business_type": "project"},
+    {"label": "整剧资产分析", "value": "agent_asset_analysis", "business_type": "project"},
+    {"label": "整剧分集规划", "value": "agent_episode_planning", "business_type": "project"},
     {"label": "人物资产分析", "value": "character_analysis", "business_type": "project"},
     {"label": "场景资产分析", "value": "scene_analysis", "business_type": "project"},
     {"label": "道具资产分析", "value": "prop_analysis", "business_type": "project"},
@@ -83,9 +94,13 @@ async def create_user_task_record(
     points_transaction_id: Optional[UUID] = None,
     result: Optional[str] = None,
     extra: Optional[Dict[str, Any]] = None,
+    expire_stale: bool = True,
 ) -> UserTaskRecord:
-    await expire_stale_task_records(db, user_id=user_id)
+    if expire_stale:
+        await expire_stale_task_records(db, user_id=user_id)
+    await _lock_user_task_submission(db, user_id)
     queue_snapshot = await _build_user_task_queue_snapshot(db, user_id, generation_type)
+    _enforce_user_task_limits(queue_snapshot)
     record = UserTaskRecord(
         user_id=user_id,
         ai_model_id=ai_model_id,
@@ -112,7 +127,9 @@ async def _build_user_task_queue_snapshot(
     user_id: UUID,
     generation_type: str,
 ) -> Dict[str, Any]:
-    active_since = beijing_datetime() - timedelta(hours=max(1, settings.user_pending_task_window_hours))
+    active_since = beijing_datetime() - timedelta(
+        hours=max(1, settings.user_pending_task_window_hours)
+    )
     snapshot: Dict[str, Any] = {
         "queued_at": beijing_datetime().isoformat(),
         "generation_type": generation_type,
@@ -127,7 +144,7 @@ async def _build_user_task_queue_snapshot(
         "configured_media_task_limit": max(0, settings.user_pending_media_task_limit),
         "exceeds_configured_task_limit": False,
         "exceeds_configured_media_task_limit": False,
-        "limits_block_submission": False,
+        "limits_block_submission": True,
     }
 
     total_result = await db.execute(
@@ -158,7 +175,9 @@ async def _build_user_task_queue_snapshot(
     snapshot["same_type_queue_position"] = same_type_tasks_before + 1
 
     if settings.user_pending_task_limit > 0:
-        snapshot["exceeds_configured_task_limit"] = active_tasks_before >= settings.user_pending_task_limit
+        snapshot["exceeds_configured_task_limit"] = (
+            active_tasks_before >= settings.user_pending_task_limit
+        )
 
     if generation_type in _media_generation_types():
         media_result = await db.execute(
@@ -179,6 +198,19 @@ async def _build_user_task_queue_snapshot(
                 active_media_tasks_before >= settings.user_pending_media_task_limit
             )
     return snapshot
+
+
+async def _lock_user_task_submission(db: AsyncSession, user_id: UUID) -> None:
+    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+
+
+def _enforce_user_task_limits(snapshot: Dict[str, Any]) -> None:
+    if snapshot.get("exceeds_configured_media_task_limit"):
+        limit = snapshot.get("configured_media_task_limit")
+        raise AppException(f"待处理媒体任务已达到上限（{limit} 个）", code=42920, status_code=429)
+    if snapshot.get("exceeds_configured_task_limit"):
+        limit = snapshot.get("configured_task_limit")
+        raise AppException(f"待处理任务已达到上限（{limit} 个）", code=42920, status_code=429)
 
 
 def _media_generation_types() -> Tuple[str, ...]:
@@ -312,7 +344,11 @@ async def list_user_task_records_by_ids(
         )
     )
     records_by_id = {record.id: record for record in result.scalars().all()}
-    records = [records_by_id[task_record_id] for task_record_id in unique_ids if task_record_id in records_by_id]
+    records = [
+        records_by_id[task_record_id]
+        for task_record_id in unique_ids
+        if task_record_id in records_by_id
+    ]
     for record in records:
         await expire_stale_task_record(db, record)
     return records
@@ -350,9 +386,7 @@ async def interrupt_task_record(
     reason: Optional[str] = None,
 ) -> UserTaskRecord:
     result = await db.execute(
-        select(UserTaskRecord)
-        .where(UserTaskRecord.id == task_record_id)
-        .with_for_update()
+        select(UserTaskRecord).where(UserTaskRecord.id == task_record_id).with_for_update()
     )
     record = result.scalar_one_or_none()
     if record is None:
@@ -377,7 +411,9 @@ async def interrupt_task_record(
     return record
 
 
-async def reconcile_provider_task_record(db: AsyncSession, task_record_id: UUID) -> Optional[UserTaskRecord]:
+async def reconcile_provider_task_record(
+    db: AsyncSession, task_record_id: UUID
+) -> Optional[UserTaskRecord]:
     claim = await _claim_provider_reconcile(db, task_record_id)
     if claim is None:
         return None
@@ -400,7 +436,9 @@ async def reconcile_provider_task_record(db: AsyncSession, task_record_id: UUID)
     if _is_provider_success_result(model_result, status):
         model_result.extra = {**model_result.extra, "platform_task_status": "success"}
         try:
-            model_result = await persist_generated_media_to_oss(claim.provider_generation_type, model_result)
+            model_result = await persist_generated_media_to_oss(
+                claim.provider_generation_type, model_result
+            )
         except Exception:
             return await _finish_provider_reconcile_claim(
                 db,
@@ -421,7 +459,9 @@ async def reconcile_provider_task_result(db: AsyncSession, record: UserTaskRecor
     await reconcile_provider_task_record(db, record.id)
 
 
-async def _claim_provider_reconcile(db: AsyncSession, task_record_id: UUID) -> Optional[ProviderReconcileClaim]:
+async def _claim_provider_reconcile(
+    db: AsyncSession, task_record_id: UUID
+) -> Optional[ProviderReconcileClaim]:
     result = await db.execute(
         select(UserTaskRecord)
         .where(UserTaskRecord.id == task_record_id)
@@ -442,7 +482,9 @@ async def _claim_provider_reconcile(db: AsyncSession, task_record_id: UUID) -> O
         await db.rollback()
         return None
 
-    task_id = _extract_provider_task_id(record.extra or {})
+    task_id = getattr(record, "provider_task_id", None) or _extract_provider_task_id(
+        record.extra or {}
+    )
     if not task_id or _should_skip_provider_reconcile(record):
         await db.rollback()
         return None
@@ -457,11 +499,22 @@ async def _claim_provider_reconcile(db: AsyncSession, task_record_id: UUID) -> O
 
     claim_id = str(uuid4())
     now = beijing_datetime()
+    record.provider_task_id = task_id
+    record.provider_vendor = record.provider_vendor or ai_model.vendor
+    record.provider_status = record.provider_status or "submitted"
+    record.provider_submitted_at = record.provider_submitted_at or record.updated_at or now
+    record.last_reconcile_at = now
+    record.next_reconcile_at = now + timedelta(
+        seconds=_provider_reconcile_lease_seconds()
+    )
+    record.reconcile_attempts = int(record.reconcile_attempts or 0) + 1
     record.extra = {
         **(record.extra or {}),
         "provider_reconcile_claim_id": claim_id,
         "provider_reconcile_claimed_at": now.isoformat(),
-        "provider_reconcile_claim_until": (now + timedelta(seconds=_provider_reconcile_lease_seconds())).isoformat(),
+        "provider_reconcile_claim_until": (
+            now + timedelta(seconds=_provider_reconcile_lease_seconds())
+        ).isoformat(),
     }
     await db.commit()
     return ProviderReconcileClaim(
@@ -503,13 +556,22 @@ async def _finish_provider_reconcile_claim(
 
     status = str(model_result.extra.get("task_status") or "").lower()
     if _is_provider_failed_status(status):
-        await _mark_reconciled_failed(db, record, f"模型任务执行失败：{status or 'failed'}", model_result.extra)
+        await _mark_reconciled_failed(
+            db, record, f"模型任务执行失败：{status or 'failed'}", model_result.extra
+        )
     elif not _is_provider_success_result(model_result, status):
+        now = beijing_datetime()
+        record_provider_task_state(
+            record,
+            model_result.extra,
+            provider_vendor=claim.ai_model.vendor,
+        )
+        record.last_reconcile_at = now
         record.extra = _clear_provider_reconcile_claim(
             {
                 **(record.extra or {}),
                 "last_provider_task_status": model_result.extra,
-                "provider_reconciled_at": beijing_datetime().isoformat(),
+                "provider_reconciled_at": now.isoformat(),
                 "next_poll_seconds": _provider_reconcile_interval(record),
             }
         )
@@ -524,7 +586,7 @@ def should_reconcile_provider_task(record: UserTaskRecord) -> bool:
     return (
         record.status in {"pending", "running"}
         and _provider_generation_type(record) is not None
-        and bool(_extract_provider_task_id(record.extra or {}))
+        and has_provider_task_id(record)
         and not _has_active_provider_reconcile_claim(record.extra or {})
     )
 
@@ -538,17 +600,50 @@ def provider_reconcile_delay_seconds(record: Optional[UserTaskRecord] = None) ->
     return _provider_reconcile_interval(None)
 
 
-async def list_provider_reconcile_candidates(db: AsyncSession, limit: int = 100) -> List[UserTaskRecord]:
+async def list_provider_reconcile_candidates(
+    db: AsyncSession, limit: int = 100
+) -> List[UserTaskRecord]:
+    now = beijing_datetime()
     result = await db.execute(
         select(UserTaskRecord)
         .where(
             UserTaskRecord.status.in_(("pending", "running")),
-            UserTaskRecord.generation_type.in_(("image", "video", "asset_image_generate", "storyboard_image", "storyboard_video")),
+            UserTaskRecord.generation_type.in_(
+                ("image", "video", "asset_image_generate", "storyboard_image", "storyboard_video")
+            ),
+            UserTaskRecord.provider_task_id.is_not(None),
+            or_(
+                UserTaskRecord.next_reconcile_at.is_(None),
+                UserTaskRecord.next_reconcile_at <= now,
+            ),
         )
-        .order_by(UserTaskRecord.updated_at.asc())
+        .order_by(UserTaskRecord.next_reconcile_at.asc().nullsfirst(), UserTaskRecord.id.asc())
         .limit(limit)
     )
-    return [record for record in result.scalars().all() if should_reconcile_provider_task(record)]
+    records = list(result.scalars().all())
+    remaining = max(0, limit - len(records))
+    if remaining:
+        legacy_result = await db.execute(
+            select(UserTaskRecord)
+            .where(
+                UserTaskRecord.status.in_(("pending", "running")),
+                UserTaskRecord.generation_type.in_(
+                    (
+                        "image",
+                        "video",
+                        "asset_image_generate",
+                        "storyboard_image",
+                        "storyboard_video",
+                    )
+                ),
+                UserTaskRecord.provider_task_id.is_(None),
+                _provider_task_id_sql_condition(),
+            )
+            .order_by(UserTaskRecord.updated_at.asc())
+            .limit(remaining)
+        )
+        records.extend(legacy_result.scalars().all())
+    return [record for record in records if should_reconcile_provider_task(record)]
 
 
 def _provider_generation_type(record: UserTaskRecord) -> Optional[str]:
@@ -578,6 +673,76 @@ def _extract_provider_task_id(extra: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def record_provider_task_state(
+    record: UserTaskRecord,
+    provider_extra: Dict[str, Any],
+    provider_vendor: Optional[str] = None,
+) -> bool:
+    task_id = _extract_provider_task_id(provider_extra)
+    if not task_id:
+        return False
+
+    now = beijing_datetime()
+    provider_status = _extract_provider_status(provider_extra)
+    if not provider_status:
+        provider_status = str(getattr(record, "status", "") or "submitted").lower()
+
+    record.provider_task_id = task_id
+    if provider_vendor:
+        record.provider_vendor = provider_vendor
+    if getattr(record, "provider_submitted_at", None) is None:
+        record.provider_submitted_at = now
+    record.provider_status = provider_status
+    if _is_provider_terminal_status(provider_status):
+        record.next_reconcile_at = None
+    else:
+        record.next_reconcile_at = now + timedelta(
+            seconds=_provider_reconcile_interval(record)
+        )
+    return True
+
+
+def _extract_provider_status(extra: Dict[str, Any]) -> str:
+    value = extra.get("task_status") or extra.get("platform_task_status")
+    return str(value or "").strip().lower()
+
+
+def _is_provider_terminal_status(status: str) -> bool:
+    return status in {
+        "success",
+        "succeeded",
+        "completed",
+        "complete",
+        "finished",
+        "done",
+        "failed",
+        "failure",
+        "fail",
+        "error",
+        "cancelled",
+        "canceled",
+    }
+
+
+def has_provider_task_id(record: UserTaskRecord) -> bool:
+    return bool(
+        getattr(record, "provider_task_id", None)
+        or _extract_provider_task_id(record.extra or {})
+    )
+
+
+def _provider_task_id_sql_condition():
+    extra = UserTaskRecord.extra
+    return or_(
+        extra["task_id"].as_string().is_not(None),
+        extra["provider_task_id"].as_string().is_not(None),
+        extra["model_result_extra"]["task_id"].as_string().is_not(None),
+        extra["assistant_message_extra"]["task_id"].as_string().is_not(None),
+        extra["last_provider_task_status"]["task_id"].as_string().is_not(None),
+        extra["last_provider_task_status"]["taskId"].as_string().is_not(None),
+    )
+
+
 def _video_request_extra(record: UserTaskRecord) -> Dict[str, Any]:
     extra = record.extra or {}
     for key in ("user_message_extra", "model_extra"):
@@ -592,10 +757,19 @@ async def _mark_next_reconcile(
     record: UserTaskRecord,
     provider_extra: Optional[Dict[str, Any]],
 ) -> None:
+    now = beijing_datetime()
+    record.last_reconcile_at = now
+    record.next_reconcile_at = now + timedelta(
+        seconds=_provider_reconcile_interval(record)
+    )
+    if provider_extra is not None:
+        provider_status = _extract_provider_status(provider_extra)
+        if provider_status:
+            record.provider_status = provider_status
     extra = _clear_provider_reconcile_claim(
         {
             **(record.extra or {}),
-            "provider_reconciled_at": beijing_datetime().isoformat(),
+            "provider_reconciled_at": now.isoformat(),
             "next_poll_seconds": _provider_reconcile_interval(record),
         }
     )
@@ -606,6 +780,9 @@ async def _mark_next_reconcile(
 
 
 def _should_skip_provider_reconcile(record: UserTaskRecord) -> bool:
+    next_reconcile_at = getattr(record, "next_reconcile_at", None)
+    if next_reconcile_at is not None:
+        return to_beijing_datetime(next_reconcile_at) > beijing_datetime()
     extra = record.extra or {}
     reconciled_at = extra.get("provider_reconciled_at")
     if not reconciled_at:
@@ -662,6 +839,8 @@ async def expire_stale_task_records(
     conditions = [
         UserTaskRecord.status.in_(("pending", "running")),
         UserTaskRecord.created_at <= _stale_task_cutoff(),
+        UserTaskRecord.provider_task_id.is_(None),
+        ~_provider_task_id_sql_condition(),
     ]
     if user_id:
         conditions.append(UserTaskRecord.user_id == user_id)
@@ -677,13 +856,19 @@ async def expire_stale_task_records(
         .limit(limit)
     )
     records = list(result.scalars().all())
+    expired_count = 0
     for record in records:
+        if has_provider_task_id(record):
+            continue
         await _mark_stale_failed(db, record)
-    return len(records)
+        expired_count += 1
+    return expired_count
 
 
 async def expire_stale_task_record(db: AsyncSession, record: UserTaskRecord) -> bool:
     if record.status not in {"pending", "running"}:
+        return False
+    if has_provider_task_id(record):
         return False
     if record.created_at > _stale_task_cutoff():
         return False
@@ -793,6 +978,8 @@ async def _sync_conversation_failed(db: AsyncSession, record: UserTaskRecord, re
         "failed_reason": reason,
         "task_record_id": str(record.id),
     }
+    if assistant_message.message_type == "text":
+        assistant_message.status = "failed"
 
 
 async def _sync_chapter_text_failed(db: AsyncSession, record: UserTaskRecord, reason: str) -> None:
@@ -811,7 +998,9 @@ async def _sync_chapter_text_failed(db: AsyncSession, record: UserTaskRecord, re
     }
 
 
-async def _sync_chapter_analysis_failed(db: AsyncSession, record: UserTaskRecord, reason: str) -> None:
+async def _sync_chapter_analysis_failed(
+    db: AsyncSession, record: UserTaskRecord, reason: str
+) -> None:
     chapter_id = (record.extra or {}).get("chapter_id")
     parsed_chapter_id = _parse_uuid(chapter_id)
     if parsed_chapter_id is None:
@@ -848,6 +1037,18 @@ async def _sync_chapter_analysis_failed(db: AsyncSession, record: UserTaskRecord
 
 
 async def _sync_asset_image_failed(db: AsyncSession, record: UserTaskRecord, reason: str) -> None:
+    variant_id = _parse_uuid((record.extra or {}).get("agent_asset_variant_id"))
+    if variant_id is not None:
+        variant = await db.get(AgentAssetVariant, variant_id)
+        if variant is not None:
+            variant.extra = {
+                **(variant.extra or {}),
+                "image_generation_status": "failed",
+                "image_generation_failed_reason": reason,
+                "image_generation_task_record_id": str(record.id),
+            }
+            variant.updated_at = beijing_datetime()
+        return
     asset_type = (record.extra or {}).get("asset_type")
     asset_id = (record.extra or {}).get("asset_id")
     model = {
@@ -869,7 +1070,9 @@ async def _sync_asset_image_failed(db: AsyncSession, record: UserTaskRecord, rea
     }
 
 
-async def _sync_storyboard_video_failed(db: AsyncSession, record: UserTaskRecord, reason: str) -> None:
+async def _sync_storyboard_video_failed(
+    db: AsyncSession, record: UserTaskRecord, reason: str
+) -> None:
     storyboard_id = (record.extra or {}).get("storyboard_id")
     parsed_storyboard_id = _parse_uuid(storyboard_id)
     if parsed_storyboard_id is None:
@@ -885,7 +1088,9 @@ async def _sync_storyboard_video_failed(db: AsyncSession, record: UserTaskRecord
     }
 
 
-async def _sync_storyboard_image_failed(db: AsyncSession, record: UserTaskRecord, reason: str) -> None:
+async def _sync_storyboard_image_failed(
+    db: AsyncSession, record: UserTaskRecord, reason: str
+) -> None:
     storyboard_id = (record.extra or {}).get("storyboard_id")
     parsed_storyboard_id = _parse_uuid(storyboard_id)
     if parsed_storyboard_id is None:
@@ -907,13 +1112,17 @@ async def _mark_reconciled_success(
     provider_generation_type: str,
     model_result: ModelRunResult,
 ) -> None:
+    now = beijing_datetime()
     record.status = "success"
     record.result = model_result.content
+    record.provider_status = _extract_provider_status(model_result.extra) or "success"
+    record.last_reconcile_at = now
+    record.next_reconcile_at = None
     record.extra = _clear_provider_reconcile_claim(
         {
             **(record.extra or {}),
             "model_result_extra": model_result.extra,
-            "provider_reconciled_at": beijing_datetime().isoformat(),
+            "provider_reconciled_at": now.isoformat(),
         }
     )
 
@@ -948,14 +1157,18 @@ async def _mark_reconciled_failed(
     provider_extra: Dict[str, Any],
 ) -> None:
     reason = sanitize_public_message(reason)
+    now = beijing_datetime()
     record.status = "failed"
     record.result = reason
+    record.provider_status = _extract_provider_status(provider_extra) or "failed"
+    record.last_reconcile_at = now
+    record.next_reconcile_at = None
     record.extra = _clear_provider_reconcile_claim(
         {
             **(record.extra or {}),
             "failed_reason": reason,
             "model_result_extra": provider_extra,
-            "provider_reconciled_at": beijing_datetime().isoformat(),
+            "provider_reconciled_at": now.isoformat(),
         }
     )
     await _refund_failed_task_points(db, record)
@@ -1040,6 +1253,62 @@ async def _sync_asset_image_success(
     record: UserTaskRecord,
     model_result: ModelRunResult,
 ) -> None:
+    variant_id = _parse_uuid((record.extra or {}).get("agent_asset_variant_id"))
+    if variant_id is not None:
+        variant = await db.get(AgentAssetVariant, variant_id)
+        image_url = _first_result_url(model_result.content)
+        if variant is None or not image_url:
+            return
+        asset_id = _parse_uuid((record.extra or {}).get("asset_id"))
+        asset_type = str((record.extra or {}).get("asset_type") or "")
+        if (
+            record.business_id is not None
+            and asset_id is not None
+            and asset_type in {"character", "scene", "prop"}
+        ):
+            await track_core_asset_reference_change(
+                db,
+                project_id=record.business_id,
+                user_id=record.user_id,
+                asset_type=asset_type,
+                asset_id=asset_id,
+                variant_id=variant.id,
+                previous_reference_image=variant.reference_image,
+                new_reference_image=image_url,
+                source="worker",
+            )
+        history = await create_project_generated_asset_history(
+            db,
+            task_record=record,
+            target_type="asset_variant",
+            target_id=variant.id,
+            media_type="image",
+            result_urls=extract_result_urls(model_result.content) or [image_url],
+            result_url=image_url,
+            generation_mode=(record.extra or {}).get("generation_mode"),
+            extra={
+                "variant_name": variant.canonical_name,
+                "generation_ratio": (record.extra or {}).get("generation_ratio"),
+                "model_result_extra": model_result.extra,
+            },
+        )
+        variant.reference_image = image_url
+        variant.lock_version += 1
+        variant.updated_at = beijing_datetime()
+        variant.extra = {
+            **(variant.extra or {}),
+            "image_generation_status": "success",
+            "image_generation_history_id": str(history.id),
+            "image_generation_task_record_id": str(record.id),
+            "image_generation_extra": model_result.extra,
+        }
+        record.result = image_url
+        record.extra = {
+            **(record.extra or {}),
+            "oss_image_url": image_url,
+            "generated_asset_history_id": str(history.id),
+        }
+        return
     asset_type = (record.extra or {}).get("asset_type")
     asset_id = (record.extra or {}).get("asset_id")
     model = {
@@ -1072,6 +1341,16 @@ async def _sync_asset_image_success(
             "generation_ratio": (record.extra or {}).get("generation_ratio"),
             "model_result_extra": model_result.extra,
         },
+    )
+    await track_core_asset_reference_change(
+        db,
+        project_id=asset.project_id,
+        user_id=asset.user_id,
+        asset_type=str(asset_type),
+        asset_id=asset.id,
+        previous_reference_image=asset.reference_image,
+        new_reference_image=image_url,
+        source="worker",
     )
     asset.reference_image = image_url
     asset.updated_at = beijing_datetime()
@@ -1156,42 +1435,14 @@ async def _sync_storyboard_video_success(
     if storyboard is None:
         return
     last_frame_url = _first_generated_last_frame_url(model_result.extra)
-    result_urls = extract_result_urls(model_result.content)
-    history = await create_project_generated_asset_history(
+    await record_storyboard_video_generation_success(
         db,
         task_record=record,
-        target_type="storyboard",
-        target_id=parsed_storyboard_id,
-        media_type="video",
-        result_urls=result_urls or [model_result.content],
-        result_url=result_urls[0] if result_urls else model_result.content,
+        storyboard=storyboard,
+        content=model_result.content,
+        result_extra=model_result.extra,
         last_frame_url=last_frame_url,
-        chapter_id=storyboard.chapter_id,
-        generation_mode=(record.extra or {}).get("generation_mode"),
-        extra={
-            "storyboard_title": storyboard.title,
-            "shot_number": storyboard.shot_number,
-            "resolution": (record.extra or {}).get("resolution"),
-            "return_last_frame": (record.extra or {}).get("return_last_frame"),
-            "model_result_extra": model_result.extra,
-        },
     )
-    storyboard.extra = {
-        **(storyboard.extra or {}),
-        "video_generation_status": "success",
-        "video_generation_history_id": str(history.id),
-        "video_generation_task_record_id": str(record.id),
-        "video_generation_result": model_result.content,
-        "video_generation_extra": model_result.extra,
-        **({"video_generation_last_frame_url": last_frame_url} if last_frame_url else {}),
-    }
-    storyboard.updated_at = beijing_datetime()
-    record.extra = {
-        **(record.extra or {}),
-        "storyboard_video_result": model_result.content,
-        **({"storyboard_video_last_frame_url": last_frame_url} if last_frame_url else {}),
-        "generated_asset_history_id": str(history.id),
-    }
 
 
 def _first_result_url(content: str) -> str:
@@ -1228,7 +1479,17 @@ def _is_provider_failed_status(status: str) -> bool:
 def _is_provider_success_result(model_result: ModelRunResult, status: str) -> bool:
     if status in {"success", "succeeded", "completed", "complete", "finished", "done"}:
         return True
-    if status in {"not_start", "submitted", "in_progress", "running", "pending", "processing", "queued"}:
+    if status in {
+        "not_start",
+        "submitted",
+        "in_progress",
+        "running",
+        "pending",
+        "processing",
+        "queued",
+    }:
         return False
     content = (model_result.content or "").strip()
-    return bool(content and content != "生成任务处理中" and not content.startswith("模型任务仍在生成中"))
+    return bool(
+        content and content != "生成任务处理中" and not content.startswith("模型任务仍在生成中")
+    )

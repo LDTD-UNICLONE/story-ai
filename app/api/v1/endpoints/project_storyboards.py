@@ -94,7 +94,10 @@ async def create_my_project_storyboard(
         user_id=current_user.id,
         payload=payload,
     )
-    return success(data=ProjectStoryboardOut.model_validate(storyboard).model_dump(mode="json"), message="创建成功")
+    return success(
+        data=ProjectStoryboardOut.model_validate(storyboard).model_dump(mode="json"),
+        message="创建成功",
+    )
 
 
 @router.post("/analyze")
@@ -399,7 +402,10 @@ async def update_my_project_storyboard(
         user_id=current_user.id,
         payload=payload,
     )
-    return success(data=ProjectStoryboardOut.model_validate(storyboard).model_dump(mode="json"), message="更新成功")
+    return success(
+        data=ProjectStoryboardOut.model_validate(storyboard).model_dump(mode="json"),
+        message="更新成功",
+    )
 
 
 @router.delete("/{storyboard_id}")
@@ -417,4 +423,7 @@ async def delete_my_project_storyboard(
         storyboard_id=storyboard_id,
         user_id=current_user.id,
     )
-    return success(data=ProjectStoryboardOut.model_validate(storyboard).model_dump(mode="json"), message="删除成功")
+    return success(
+        data=ProjectStoryboardOut.model_validate(storyboard).model_dump(mode="json"),
+        message="删除成功",
+    )

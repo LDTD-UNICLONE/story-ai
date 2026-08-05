@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -13,6 +13,7 @@ from app.core.exceptions import AppException
 from app.core.timezone import beijing_datetime
 from app.integrations import comfly
 from app.models.ai_model import AiModel
+from app.models.agent_story_bible import AgentAssetVariant
 from app.models.material import Material
 from app.models.project import Project
 from app.models.project_asset import ProjectCharacter, ProjectProp, ProjectScene
@@ -24,11 +25,18 @@ from app.services.generated_media import persist_generated_media_to_oss
 from app.services.model_points import calculate_submission_points_cost
 from app.services.model_runner import ModelRunResult, query_model_task, run_model
 from app.services.points import change_user_points, consume_user_points
-from app.services.project_generated_assets import create_project_generated_asset_history, extract_result_urls
+from app.services.project_generated_assets import (
+    create_project_generated_asset_history,
+    extract_result_urls,
+)
 from app.services.project_storyboards import get_project_storyboard_or_404
 from app.services.projects import get_project_or_404
 from app.services.provider_polling import provider_poll_interval_seconds
-from app.services.task_records import create_user_task_record, refresh_task_record_interrupted
+from app.services.task_records import (
+    create_user_task_record,
+    record_provider_task_state,
+    refresh_task_record_interrupted,
+)
 
 
 DEFAULT_STORYBOARD_IMAGE_MODEL_ID = "gpt-image-2"
@@ -41,16 +49,29 @@ async def submit_storyboard_image_generation(
     storyboard_id: UUID,
     user: User,
     payload: ProjectStoryboardImageGenerateRequest,
+    *,
+    agent_context: Optional[Dict[str, object]] = None,
 ) -> Tuple[UserTaskRecord, int]:
     await get_project_or_404(db, project_id, user.id)
     project = await _get_project_with_style_or_404(db, project_id, user.id)
-    storyboard = await get_project_storyboard_or_404(db, project_id, chapter_id, storyboard_id, user.id)
-    ai_model = await _get_storyboard_image_model_or_404(db)
+    storyboard = await get_project_storyboard_or_404(
+        db, project_id, chapter_id, storyboard_id, user.id
+    )
+    ai_model = await _get_storyboard_image_model_or_404(db, payload.ai_model_id)
 
     reference_assets = await _collect_reference_assets(db, project_id, user.id, storyboard, payload)
     reference_images = await _resolve_reference_image_urls(
         db,
-        _dedupe([*(payload.uploaded_images or []), *[asset["reference_image"] for asset in reference_assets if asset.get("reference_image")]]),
+        _dedupe(
+            [
+                *(payload.uploaded_images or []),
+                *[
+                    asset["reference_image"]
+                    for asset in reference_assets
+                    if asset.get("reference_image")
+                ],
+            ]
+        ),
     )
     prompt = _build_storyboard_image_prompt(project, storyboard, reference_assets, payload.prompt)
     model_extra = _build_storyboard_image_extra(payload, reference_images)
@@ -89,13 +110,16 @@ async def submit_storyboard_image_generation(
             "reference_images": reference_images,
             "reference_assets": reference_assets,
             "model_extra": model_extra,
+            **(agent_context or {}),
         },
     )
+    await db.flush()
     storyboard.extra = {
         **(storyboard.extra or {}),
         "image_generation_status": "pending",
         "image_generation_task_record_id": str(task_record.id),
         "image_generation_aspect_ratio": payload.aspect_ratio,
+        "image_reference_asset_ids": _reference_asset_ids(reference_assets),
     }
     await db.commit()
 
@@ -145,11 +169,19 @@ async def run_storyboard_image_generation_in_worker(
         "image",
         task_record.prompt,
         (task_record.extra or {}).get("model_extra") or {},
+        idempotency_key=str(task_record.id),
     )
+    if record_provider_task_state(task_record, model_result.extra, ai_model.vendor):
+        task_record.extra = {
+            **(task_record.extra or {}),
+            "model_result_extra": model_result.extra,
+        }
+        await db.commit()
     model_result = await _resolve_image_provider_task(model_snapshot, model_result)
     model_result = await persist_generated_media_to_oss("image", model_result)
     if await refresh_task_record_interrupted(db, task_record):
         return
+    record_provider_task_state(task_record, model_result.extra, ai_model.vendor)
 
     if model_result.extra.get("platform_task_status") == "running":
         storyboard.extra = {
@@ -212,7 +244,9 @@ async def run_storyboard_image_generation_in_worker(
     }
 
 
-async def _get_project_with_style_or_404(db: AsyncSession, project_id: UUID, user_id: UUID) -> Project:
+async def _get_project_with_style_or_404(
+    db: AsyncSession, project_id: UUID, user_id: UUID
+) -> Project:
     result = await db.execute(
         select(Project)
         .options(selectinload(Project.style))
@@ -224,11 +258,19 @@ async def _get_project_with_style_or_404(db: AsyncSession, project_id: UUID, use
     return project
 
 
-async def _get_storyboard_image_model_or_404(db: AsyncSession) -> AiModel:
+async def _get_storyboard_image_model_or_404(
+    db: AsyncSession,
+    ai_model_id: Optional[UUID] = None,
+) -> AiModel:
+    identity_condition = (
+        AiModel.id == ai_model_id
+        if ai_model_id is not None
+        else AiModel.model_id == DEFAULT_STORYBOARD_IMAGE_MODEL_ID
+    )
     result = await db.execute(
         select(AiModel)
         .where(
-            AiModel.model_id == DEFAULT_STORYBOARD_IMAGE_MODEL_ID,
+            identity_condition,
             AiModel.model_type == "image",
             AiModel.is_enabled.is_(True),
         )
@@ -237,7 +279,7 @@ async def _get_storyboard_image_model_or_404(db: AsyncSession) -> AiModel:
     )
     ai_model = result.scalar_one_or_none()
     if ai_model is None:
-        raise AppException("默认故事板图像模型 gpt-image-2 不存在、未启用或类型不匹配", code=40404, status_code=404)
+        raise AppException("故事板图像模型不存在、未启用或类型不匹配", code=40404, status_code=404)
     return ai_model
 
 
@@ -256,7 +298,9 @@ def _build_storyboard_image_extra(
     return extra
 
 
-def _validate_comfly_storyboard_image_request(ai_model: AiModel, prompt: str, extra: Dict[str, Any]) -> None:
+def _validate_comfly_storyboard_image_request(
+    ai_model: AiModel, prompt: str, extra: Dict[str, Any]
+) -> None:
     if ai_model.vendor not in {"comfly", "模型服务"}:
         return
     comfly.validate_image_request(ai_model.model_id, prompt, extra)
@@ -272,12 +316,15 @@ def _build_storyboard_image_prompt(
     title = _clean_prompt_part(storyboard.title)
     image_prompt = _clean_prompt_part(storyboard.image_prompt)
     if not image_prompt:
-        image_prompt = _first_prompt_part(storyboard.screen_execution, storyboard.action, storyboard.source_content)
+        image_prompt = _first_prompt_part(
+            storyboard.screen_execution, storyboard.action, storyboard.source_content
+        )
     characters = _join_names(storyboard.characters)
     scene_name = _clean_prompt_part(storyboard.scene_name)
     props = _join_names(storyboard.props)
     negative_prompt = _clean_prompt_part(storyboard.negative_prompt)
     reference_text = _format_reference_assets(reference_assets)
+    variant_text = _agent_variant_context_text(storyboard)
 
     parts = [
         "请根据当前故事版镜头和参考资产生成一张故事版图像，每一个分镜头下需要使用中文标注清楚信息，镜头时长，整体氛围，背景音乐，底部灯光，情绪，摄影机位变化等等可以根据内容多分镜头，但是要保证场景、人物等资产的真实逻辑。不能出现气泡文字，不能出现字幕等。所有的参数都是在镜头图像下面标注，每个镜头要标注清楚",
@@ -288,6 +335,8 @@ def _build_storyboard_image_prompt(
         f"绑定场景：{scene_name}",
         f"绑定道具：{props}",
     ]
+    if variant_text:
+        parts.append(f"当前选定资产变体：{variant_text}")
     if reference_text:
         parts.append(f"参考资产：\n{reference_text}")
     parts.extend(
@@ -311,6 +360,15 @@ def _build_storyboard_image_prompt(
             + "。用户补充要求只能补充当前故事版图像的表现方式，不得覆盖当前分镜剧情、绑定资产、参考图一致性和负面规避要求。"
         )
     return "\n".join(part for part in parts if part is not None)
+
+
+def _agent_variant_context_text(storyboard: ProjectStoryboard) -> str:
+    items = (storyboard.extra or {}).get("agent_asset_variant_context") or []
+    return "；".join(
+        f"{item.get('name')}（{item.get('description')}，触发：{item.get('trigger_reason')}）"
+        for item in items
+        if isinstance(item, dict) and item.get("name")
+    )
 
 
 async def _collect_reference_assets(
@@ -354,7 +412,48 @@ async def _collect_reference_assets(
             _as_name_list(storyboard.props),
         )
     )
-    return assets
+    return await _apply_agent_variant_reference_images(db, storyboard, assets)
+
+
+async def _apply_agent_variant_reference_images(
+    db: AsyncSession,
+    storyboard: ProjectStoryboard,
+    assets: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    mapping = (storyboard.extra or {}).get("agent_asset_variant_ids") or {}
+    requested: Dict[UUID, Tuple[str, str]] = {}
+    for asset_type in ("character", "scene", "prop"):
+        for asset_id, raw_variant_id in (mapping.get(asset_type) or {}).items():
+            try:
+                requested[UUID(str(raw_variant_id))] = (asset_type, str(asset_id))
+            except ValueError:
+                continue
+    if not requested:
+        return assets
+    result = await db.execute(
+        select(AgentAssetVariant).where(
+            AgentAssetVariant.id.in_(requested),
+            AgentAssetVariant.review_status == "ready",
+        )
+    )
+    variants = {variant.id: variant for variant in result.scalars().all()}
+    variant_by_asset = {
+        key: variants[variant_id]
+        for variant_id, key in requested.items()
+        if variant_id in variants and variants[variant_id].reference_image
+    }
+    return [
+        {
+            **asset,
+            "name": variant.canonical_name,
+            "description": variant.description,
+            "reference_image": variant.reference_image,
+            "variant_id": str(variant.id),
+        }
+        if (variant := variant_by_asset.get((asset["asset_type"], str(asset["id"]))))
+        else asset
+        for asset in assets
+    ]
 
 
 async def _asset_records_by_ids_or_names(
@@ -367,15 +466,12 @@ async def _asset_records_by_ids_or_names(
     names: Sequence[Any],
 ) -> List[Dict[str, Any]]:
     clean_names = [name for name in (_clean_prompt_part(item) for item in names or []) if name]
-    conditions = []
     if asset_ids:
-        conditions.append(model.id.in_(asset_ids))
-    if clean_names:
-        conditions.append(model.name.in_(clean_names))
-    if not conditions:
+        identity_condition = model.id.in_(asset_ids)
+    elif clean_names:
+        identity_condition = model.name.in_(clean_names)
+    else:
         return []
-
-    identity_condition = conditions[0] if len(conditions) == 1 else or_(*conditions)
     result = await db.execute(
         select(model).where(
             model.project_id == project_id,
@@ -400,6 +496,16 @@ def _asset_payload(asset_type: str, asset: Any) -> Dict[str, Any]:
         ),
         "reference_image": asset.reference_image,
     }
+
+
+def _reference_asset_ids(assets: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+    result: Dict[str, List[str]] = {"character": [], "scene": [], "prop": []}
+    for asset in assets:
+        asset_type = str(asset.get("asset_type") or "")
+        asset_id = str(asset.get("id") or "")
+        if asset_type in result and asset_id and asset_id not in result[asset_type]:
+            result[asset_type].append(asset_id)
+    return result
 
 
 async def _resolve_reference_image_urls(db: AsyncSession, urls: List[str]) -> List[str]:
@@ -502,7 +608,9 @@ def _first_result_url(content: str) -> str:
     return ""
 
 
-async def _resolve_image_provider_task(model_snapshot: SimpleNamespace, model_result: ModelRunResult) -> ModelRunResult:
+async def _resolve_image_provider_task(
+    model_snapshot: SimpleNamespace, model_result: ModelRunResult
+) -> ModelRunResult:
     task_id = model_result.extra.get("task_id")
     if not task_id:
         return model_result
