@@ -25,12 +25,18 @@ from app.schemas.work import (
     WorkUploadOut,
 )
 from app.services.oss_deletions import enqueue_oss_deletions, process_oss_deletion_outbox
-from app.services.uploads import detect_content_type, detect_file_type, matches_media_signature
+from app.services.uploads import (
+    detect_content_type,
+    detect_file_type,
+    detect_image_content_type,
+    matches_media_signature,
+)
 
 
 WORK_VISIBILITIES = {"public", "private"}
 WORK_STATUSES = {"draft", "published", "hidden", "deleted"}
 WORK_OWNER_STATUSES = {"draft", "published"}
+WORK_OWNER_LIST_STATUSES = {"draft", "published", "hidden"}
 WORK_MEDIA_TYPES = {"image", "video"}
 WORKS_OSS_PREFIX = "works"
 logger = logging.getLogger(__name__)
@@ -53,7 +59,17 @@ async def upload_work_file(db: AsyncSession, user: User, file: UploadFile) -> Wo
         raise AppException(
             f"上传文件不能超过 {settings.max_upload_size_mb}MB", code=41300, status_code=413
         )
-    if not matches_media_signature(file.file, content_type):
+    if media_type == "image":
+        detected_image_type = detect_image_content_type(file.file)
+        if detected_image_type is not None:
+            content_type = detected_image_type
+        else:
+            raise AppException(
+                "上传文件内容与图片或视频类型不匹配",
+                code=40050,
+                status_code=400,
+            )
+    elif not matches_media_signature(file.file, content_type):
         raise AppException("上传文件内容与图片或视频类型不匹配", code=40050, status_code=400)
 
     await _lock_user_work_storage(db, user.id)
@@ -204,7 +220,7 @@ async def list_my_works(
 ) -> Tuple[List[WorkOut], int]:
     if visibility and visibility not in WORK_VISIBILITIES:
         raise AppException("作品权限参数不正确", code=40042, status_code=400)
-    if status and status not in WORK_STATUSES:
+    if status and status not in WORK_OWNER_LIST_STATUSES:
         raise AppException("作品状态参数不正确", code=40043, status_code=400)
     conditions = [UserWork.user_id == user.id, UserWork.is_enabled.is_(True)]
     if visibility:
@@ -242,11 +258,20 @@ async def list_admin_works(
 
 
 async def get_work_detail(
-    db: AsyncSession, work_id: UUID, user: Optional[User]
+    db: AsyncSession,
+    work_id: UUID,
+    user: Optional[User],
+    *,
+    increment_view: bool = True,
 ) -> WorkOut:
     work = await _get_work_or_404(db, work_id)
     _ensure_can_view_work(work, user)
-    if work.status == "published" and work.visibility == "public" and work.is_enabled:
+    if (
+        increment_view
+        and work.status == "published"
+        and work.visibility == "public"
+        and work.is_enabled
+    ):
         await db.execute(
             update(UserWork)
             .where(UserWork.id == work.id)
@@ -268,6 +293,12 @@ async def update_work(
     data = payload.model_dump(exclude_unset=True)
     media_items = data.pop("media_items", None)
     target_status = data.get("status", work.status)
+    if work.status == "hidden" and "status" in data:
+        raise AppException(
+            "管理员下架的作品不能由作者修改发布状态",
+            code=40052,
+            status_code=409,
+        )
     if "status" in data:
         if data["status"] not in WORK_OWNER_STATUSES:
             raise AppException("作品状态参数不正确", code=40043, status_code=400)
@@ -305,6 +336,9 @@ async def admin_update_work(
         raise AppException("作品权限参数不正确", code=40042, status_code=400)
     if "status" in data and data["status"] not in WORK_STATUSES:
         raise AppException("作品状态参数不正确", code=40043, status_code=400)
+    target_status = data.get("status", work.status)
+    if target_status == "published" and not await _work_has_media(db, work.id):
+        raise AppException("发布作品至少需要一个媒体文件", code=40045, status_code=400)
     deleting = data.get("status") == "deleted" and work.status != "deleted"
     object_keys = await _work_oss_object_keys(db, work.id) if deleting else []
     for key, value in data.items():
@@ -374,9 +408,7 @@ async def delete_work(db: AsyncSession, work_id: UUID, user: User) -> WorkOut:
 
 async def like_work(db: AsyncSession, work_id: UUID, user: User) -> WorkOut:
     work = await _get_work_or_404(db, work_id)
-    _ensure_can_view_work(work, user)
-    if work.status != "published" or work.visibility != "public":
-        raise AppException("当前作品不可点赞", code=40046, status_code=400)
+    _ensure_can_like_work(work, user)
     like = UserWorkLike(work_id=work.id, user_id=user.id)
     db.add(like)
     try:
@@ -397,6 +429,7 @@ async def like_work(db: AsyncSession, work_id: UUID, user: User) -> WorkOut:
 
 async def unlike_work(db: AsyncSession, work_id: UUID, user: User) -> WorkOut:
     work = await _get_work_or_404(db, work_id)
+    _ensure_can_like_work(work, user)
     result = await db.execute(
         delete(UserWorkLike).where(UserWorkLike.work_id == work.id, UserWorkLike.user_id == user.id)
     )
@@ -560,6 +593,12 @@ def _ensure_can_view_work(work: UserWork, user: Optional[User]) -> None:
     if work.visibility == "public":
         return
     raise AppException("无权查看该作品", code=40321, status_code=403)
+
+
+def _ensure_can_like_work(work: UserWork, user: User) -> None:
+    _ensure_can_view_work(work, user)
+    if work.status != "published" or work.visibility != "public":
+        raise AppException("当前作品不可点赞", code=40046, status_code=400)
 
 
 async def _count_works(db: AsyncSession, conditions: List[Any]) -> int:

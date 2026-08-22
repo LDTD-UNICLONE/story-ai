@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.api.v1.endpoints.project_dependencies import require_standard_project
 from app.api.v1.endpoints.task_polling import set_task_poll_headers, task_next_poll_seconds
 from app.core.responses import success
 from app.db.session import get_db
@@ -12,7 +13,10 @@ from app.models.user import User
 from app.schemas.project_asset import ProjectAssetAnalyzeOut, ProjectAssetAnalyzeRequest
 from app.services.project_asset_analysis import submit_asset_analysis
 
-router = APIRouter(prefix="/projects/{project_id}/chapters/{chapter_id}/asset-analyses")
+router = APIRouter(
+    prefix="/projects/{project_id}/chapters/{chapter_id}/asset-analyses",
+    dependencies=[Depends(require_standard_project)],
+)
 
 
 @router.post("/{asset_type}")

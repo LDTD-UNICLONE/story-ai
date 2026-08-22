@@ -23,7 +23,9 @@ class AgentBatchDispatchRequest(SchemaBaseModel):
 class AgentVideoModelSelectionRequest(SchemaBaseModel):
     expected_core_asset_lock_version: int = Field(ge=1)
     video_model_id: UUID
-    video_resolution: Literal["480p", "720p", "1080p", "4k"]
+    video_resolution: Literal[
+        "360p", "480p", "540p", "720p", "768P", "1080p", "2K", "4k"
+    ]
 
 
 class AgentBatchEpisodeOut(SchemaBaseModel):

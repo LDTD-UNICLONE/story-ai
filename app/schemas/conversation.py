@@ -4,6 +4,7 @@ from uuid import UUID
 
 from pydantic import ConfigDict, Field, field_serializer, field_validator, model_validator
 
+from app.core.config import settings
 from app.core.public_messages import sanitize_public_data, sanitize_public_message
 from app.schemas.base import SchemaBaseModel
 
@@ -33,9 +34,19 @@ class ConversationCreateRequest(SchemaBaseModel):
     ai_model_id: UUID
     conversation_type: Literal["text", "image", "video"] = "text"
 
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str) -> str:
+        return _normalize_conversation_title(value)
+
 
 class ConversationUpdateRequest(SchemaBaseModel):
     title: str = Field(..., min_length=1, max_length=128)
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str) -> str:
+        return _normalize_conversation_title(value)
 
 
 class ConversationMessageOut(SchemaBaseModel):
@@ -113,6 +124,8 @@ _MESSAGE_EXTRA_COMPAT_FIELDS = {
     "lastFrameUrl",
     "media",
     "media_items",
+    "nsfw_check",
+    "private_avatar",
     "ratio",
     "reference_audio",
     "reference_audio_url",
@@ -170,10 +183,21 @@ _MESSAGE_EXTRA_COMPAT_FIELDS = {
 
 
 class ConversationSendMessageRequest(SchemaBaseModel):
-    content: str = Field(..., min_length=1)
+    content: str = Field(
+        ...,
+        min_length=1,
+        max_length=settings.conversation_message_max_characters,
+    )
     ai_model_id: Optional[UUID] = None
     client_message_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
     extra: Optional[Dict[str, Any]] = None
+
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("消息内容不能为空")
+        return value
 
     @field_validator("client_message_id")
     @classmethod
@@ -202,6 +226,13 @@ class ConversationSendMessageRequest(SchemaBaseModel):
         return data
 
 
+def _normalize_conversation_title(value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("会话标题不能为空")
+    return normalized
+
+
 class ConversationSendMessageOut(SchemaBaseModel):
     user_message: ConversationMessageOut
     assistant_message: ConversationMessageOut
@@ -224,6 +255,7 @@ class ConversationGenerationTaskOut(SchemaBaseModel):
     assistant_message: Optional[ConversationMessageOut] = None
     stop_polling: bool = False
     next_poll_seconds: Optional[int] = None
+    progress_percent: Optional[int] = Field(default=None, ge=0, le=100)
     created_at: datetime
     updated_at: datetime
 

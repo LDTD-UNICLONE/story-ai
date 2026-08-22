@@ -1,6 +1,5 @@
 import json
 import re
-from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple, Type
 from uuid import UUID
 
@@ -16,7 +15,12 @@ from app.models.project_chapter import ProjectChapter
 from app.models.task_record import UserTaskRecord
 from app.models.user import User
 from app.schemas.project_asset import ProjectAssetAnalyzeRequest
-from app.services.model_points import calculate_text_submission_points_cost, settle_text_task_points
+from app.services.model_points import (
+    calculate_text_submission_points_cost,
+    ensure_model_minimum_balance,
+    settle_text_task_points,
+)
+from app.services.model_configuration import build_model_runtime_snapshot
 from app.services.model_runner import run_model
 from app.services.points import change_user_points, consume_user_points
 from app.services.project_chapter_processing import get_enabled_text_model_or_404
@@ -70,6 +74,7 @@ async def submit_asset_analysis(
         raise AppException("章节还没有处理后的内容，无法分析资源", code=40011, status_code=400)
 
     ai_model = await get_enabled_text_model_or_404(db, payload.ai_model_id)
+    await ensure_model_minimum_balance(db, user.id, ai_model)
     points_cost = calculate_text_submission_points_cost(ai_model)
     points_transaction = None
     if points_cost > 0:
@@ -154,14 +159,7 @@ async def run_asset_analysis_in_worker(
     if ai_model is None:
         raise AppException("文本模型不存在或已禁用", code=40404, status_code=404)
 
-    model_snapshot = SimpleNamespace(
-        id=ai_model.id,
-        model_id=ai_model.model_id,
-        vendor=ai_model.vendor,
-        nickname=ai_model.nickname,
-        points_cost=ai_model.points_cost,
-        capabilities=ai_model.capabilities or {},
-    )
+    model_snapshot = build_model_runtime_snapshot(ai_model)
     model_prompt = _resolve_model_prompt(task_record, chapter, config)
     model_result = await run_model(
         model_snapshot,

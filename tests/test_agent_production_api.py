@@ -448,6 +448,25 @@ async def test_start_action_is_idempotent_after_planning_begins(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_completed_production_cannot_be_started_again(monkeypatch) -> None:
+    item = production(status="completed")
+    user = SimpleNamespace(id=item.user_id)
+    db = FakeSession()
+
+    async def get_locked(_db, _production_id, _user_id):
+        return item
+
+    monkeypatch.setattr(production_service, "_get_locked_production", get_locked)
+
+    with pytest.raises(AppException) as exc_info:
+        await production_service.apply_agent_production_action(db, item.id, user, "start")
+
+    assert exc_info.value.status_code == 409
+    assert item.status == "completed"
+    assert item.current_stage != "source_analysis"
+
+
+@pytest.mark.asyncio
 async def test_resume_does_not_bypass_approval_checkpoint(monkeypatch) -> None:
     item = production(status="waiting_approval")
     user = SimpleNamespace(id=item.user_id)

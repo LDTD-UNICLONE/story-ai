@@ -85,6 +85,7 @@ celery_app.conf.update(
         "tasks.agent_delivery.build_agent_delivery": _route("delivery"),
         "tasks.provider_reconcile.reconcile_provider_task": _route("default"),
         "tasks.provider_reconcile.enqueue_pending_provider_reconciliations": _route("default"),
+        "tasks.model_generation.settle_pending_conversation_points": _route("default"),
     },
     task_serializer="json",
     accept_content=["json"],
@@ -108,6 +109,11 @@ celery_app.conf.update(
             "schedule": _provider_reconcile_sweep_interval_seconds(),
             "args": (100,),
         },
+        "settle-pending-conversation-points": {
+            "task": "tasks.model_generation.settle_pending_conversation_points",
+            "schedule": _provider_reconcile_sweep_interval_seconds(),
+            "args": (100,),
+        },
     },
     broker_transport_options={
         "visibility_timeout": max(settings.effective_celery_task_time_limit_seconds * 2, 3600),
@@ -120,11 +126,9 @@ def close_worker_process_resources(**kwargs):
     import asyncio
 
     from app.db.session import dispose_engine, dispose_worker_engine
-    from app.integrations.comfly import close_comfly_client
-    from app.integrations.volcengine_ark import close_volcengine_ark_client
+    from app.integrations.model_providers import close_model_provider_clients
 
-    asyncio.run(close_comfly_client())
-    asyncio.run(close_volcengine_ark_client())
+    asyncio.run(close_model_provider_clients())
     asyncio.run(dispose_worker_engine())
     asyncio.run(dispose_engine())
 

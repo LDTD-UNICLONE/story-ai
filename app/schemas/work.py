@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import List, Literal, Optional
 from uuid import UUID
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from app.schemas.base import SchemaBaseModel
 
@@ -47,6 +47,16 @@ class WorkCreateRequest(SchemaBaseModel):
     status: WorkOwnerStatus = "published"
     media_items: List[WorkMediaCreateItem] = Field(default_factory=list, max_length=20)
 
+    @field_validator("title", mode="before")
+    @classmethod
+    def normalize_title(cls, value: object) -> object:
+        return _normalize_required_title(value)
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def normalize_description(cls, value: object) -> object:
+        return _normalize_optional_text(value)
+
     @model_validator(mode="after")
     def validate_published_media(self) -> "WorkCreateRequest":
         if self.status == "published" and not self.media_items:
@@ -61,10 +71,34 @@ class WorkUpdateRequest(SchemaBaseModel):
     status: Optional[WorkOwnerStatus] = None
     media_items: Optional[List[WorkMediaUpdateItem]] = Field(default=None, max_length=20)
 
+    @field_validator("title", mode="before")
+    @classmethod
+    def normalize_title(cls, value: object) -> object:
+        return _normalize_required_title(value)
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def normalize_description(cls, value: object) -> object:
+        return _normalize_optional_text(value)
+
+    @field_validator("visibility", "status", mode="before")
+    @classmethod
+    def reject_null_fields(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("字段不能为 null")
+        return value
+
 
 class AdminWorkUpdateRequest(SchemaBaseModel):
     visibility: Optional[WorkVisibility] = None
     status: Optional[WorkStatus] = None
+
+    @field_validator("visibility", "status", mode="before")
+    @classmethod
+    def reject_null_fields(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("字段不能为 null")
+        return value
 
 
 class WorkMediaOut(SchemaBaseModel):
@@ -108,3 +142,21 @@ class WorkListOut(SchemaBaseModel):
 
 class AdminWorkListOut(WorkListOut):
     pass
+
+
+def _normalize_required_title(value: object) -> object:
+    if value is None:
+        raise ValueError("作品标题不能为空")
+    if not isinstance(value, str):
+        return value
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("作品标题不能为空")
+    return normalized
+
+
+def _normalize_optional_text(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    normalized = value.strip()
+    return normalized or None

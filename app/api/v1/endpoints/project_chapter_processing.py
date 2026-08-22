@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.api.v1.endpoints.project_dependencies import require_standard_project
 from app.core.responses import success
 from app.db.session import get_db
 from app.models.user import User
@@ -15,7 +16,10 @@ from app.schemas.project_chapter import (
 )
 from app.services.project_chapter_processing import submit_project_chapter_processing
 
-router = APIRouter(prefix="/projects/{project_id}/chapters/{chapter_id}/processing")
+router = APIRouter(
+    prefix="/projects/{project_id}/chapters/{chapter_id}/processing",
+    dependencies=[Depends(require_standard_project)],
+)
 
 
 @router.post("")

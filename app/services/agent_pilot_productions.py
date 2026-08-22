@@ -32,7 +32,10 @@ from app.services.agent_storyboard_bindings import (
 )
 from app.services.agent_task_context import build_agent_task_context
 from app.services.agent_workflow import agent_pilot_episode_count
-from app.services.model_points import calculate_submission_points_cost
+from app.services.model_points import (
+    calculate_submission_points_cost,
+    model_minimum_balance_points,
+)
 from app.services.points import ensure_user_points_enough
 from app.services.project_chapter_processing import get_enabled_text_model_or_404
 from app.services.project_storyboard_images import submit_storyboard_image_generation
@@ -96,7 +99,7 @@ async def start_pilot_storyboards(
     text_model_id = _production_model_id(context.production, "text_model_id")
     text_model = await get_enabled_text_model_or_404(db, text_model_id)
     estimated_cost = len(eligible) * calculate_submission_points_cost(text_model, "text")
-    await _ensure_budget(db, context.production, user.id, estimated_cost)
+    await _ensure_budget(db, context.production, user.id, text_model, estimated_cost)
 
     if context.step is None:
         now = beijing_datetime()
@@ -244,7 +247,7 @@ async def submit_pilot_media(
     estimated_cost = sum(
         _media_submission_cost(context.production, model, kind) for _storyboard in eligible
     )
-    await _ensure_budget(db, context.production, user.id, estimated_cost)
+    await _ensure_budget(db, context.production, user.id, model, estimated_cost)
 
     if kind == "image":
         if context.storyboard_checkpoint is None:
@@ -787,6 +790,7 @@ async def _ensure_budget(
     db: AsyncSession,
     production: AgentProduction,
     user_id: UUID,
+    model: AiModel,
     estimated_cost: int,
 ) -> None:
     if (
@@ -794,7 +798,11 @@ async def _ensure_budget(
         and production.consumed_points + estimated_cost > production.max_points
     ):
         raise AppException("整剧任务已达到积分预算上限", code=40052, status_code=400)
-    await ensure_user_points_enough(db, user_id, estimated_cost)
+    await ensure_user_points_enough(
+        db,
+        user_id,
+        max(estimated_cost, model_minimum_balance_points(model)),
+    )
 
 
 def _media_submission_cost(production: AgentProduction, model: AiModel, kind: MediaKind) -> int:

@@ -6,6 +6,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from fastapi import UploadFile
+from pydantic import ValidationError
 
 from app.api.v1.endpoints import works as works_endpoint
 from app.core.config import settings
@@ -13,6 +14,7 @@ from app.core.exceptions import AppException
 from app.db.session import get_db
 from app.integrations.oss import OssClient
 from app.main import app
+from app.schemas.work import AdminWorkUpdateRequest, WorkUpdateRequest
 from app.services import material_streaming, work_streaming, works as works_service
 from app.services.works import _ensure_can_view_work, _media_out, _work_upload_preview_url
 
@@ -248,6 +250,52 @@ async def test_work_upload_sets_private_object_acl(monkeypatch) -> None:
     }
 
 
+@pytest.mark.asyncio
+async def test_work_upload_uses_detected_image_type(monkeypatch) -> None:
+    captured = {}
+
+    class FakeBucket:
+        def put_object(self, _object_key, _file_obj, *, headers):
+            captured["headers"] = headers
+            return SimpleNamespace(status=200)
+
+    class FakeOssClient:
+        def __init__(self):
+            self.bucket = FakeBucket()
+
+        def public_url(self, object_key):
+            return f"https://bucket.example/{object_key}"
+
+    class FakeDb:
+        def add(self, _record):
+            return None
+
+        async def commit(self):
+            return None
+
+        async def refresh(self, _record):
+            return None
+
+    async def no_op(*_args):
+        return None
+
+    monkeypatch.setattr(works_service, "OssClient", FakeOssClient)
+    monkeypatch.setattr(works_service, "_lock_user_work_storage", no_op)
+    monkeypatch.setattr(works_service, "_enforce_user_work_storage_limit", no_op)
+    file = UploadFile(
+        filename="cover.png",
+        file=BytesIO(b"\xff\xd8\xff\xe0" + b"image-data"),
+        headers={"content-type": "image/png"},
+    )
+
+    result = await works_service.upload_work_file(
+        FakeDb(), SimpleNamespace(id=uuid4()), file
+    )
+
+    assert result.content_type == "image/jpeg"
+    assert captured["headers"]["Content-Type"] == "image/jpeg"
+
+
 def test_oss_signed_download_url_uses_configured_expiry(monkeypatch) -> None:
     class FakeBucket:
         def sign_url(self, method, key, expires, *, params, slash_safe):
@@ -307,6 +355,13 @@ def test_public_work_reads_are_anonymous_but_likes_require_login() -> None:
     assert paths[f"{prefix}/works/{{work_id}}/like"]["post"]["security"]
     assert paths[f"{prefix}/works/{{work_id}}/like"]["delete"]["security"]
 
+    for path in (
+        f"{prefix}/works/uploads/{{upload_id}}/preview",
+        f"{prefix}/works/{{work_id}}/media/{{media_id}}/stream",
+        f"{prefix}/works/{{work_id}}/media/{{media_id}}/thumbnail",
+    ):
+        assert "307" in paths[path]["get"]["responses"]
+
 
 @pytest.mark.asyncio
 async def test_anonymous_list_succeeds_but_anonymous_like_is_rejected(monkeypatch) -> None:
@@ -332,6 +387,135 @@ async def test_anonymous_list_succeeds_but_anonymous_like_is_rejected(monkeypatc
 
     assert list_response.status_code == 200
     assert like_response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_unlike_does_not_disclose_another_users_private_work(monkeypatch) -> None:
+    owner_id = uuid4()
+    work = SimpleNamespace(
+        id=uuid4(),
+        is_enabled=True,
+        user_id=owner_id,
+        status="published",
+        visibility="private",
+    )
+    user = SimpleNamespace(id=uuid4(), is_admin=False)
+
+    async def get_work(_db, _work_id):
+        return work
+
+    class FailOnExecuteDb:
+        async def execute(self, _statement):
+            raise AssertionError("不可见作品不应执行取消点赞写操作")
+
+    monkeypatch.setattr(works_service, "_get_work_or_404", get_work)
+
+    with pytest.raises(AppException) as exc_info:
+        await works_service.unlike_work(FailOnExecuteDb(), work.id, user)
+
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_unlike_requires_a_published_public_work(monkeypatch) -> None:
+    user = SimpleNamespace(id=uuid4(), is_admin=False)
+    work = SimpleNamespace(
+        id=uuid4(),
+        is_enabled=True,
+        user_id=user.id,
+        status="published",
+        visibility="private",
+    )
+
+    async def get_work(_db, _work_id):
+        return work
+
+    class FailOnExecuteDb:
+        async def execute(self, _statement):
+            raise AssertionError("私有作品不应执行取消点赞写操作")
+
+    monkeypatch.setattr(works_service, "_get_work_or_404", get_work)
+
+    with pytest.raises(AppException) as exc_info:
+        await works_service.unlike_work(FailOnExecuteDb(), work.id, user)
+
+    assert exc_info.value.code == 40046
+
+
+@pytest.mark.asyncio
+async def test_owner_cannot_republish_admin_hidden_work(monkeypatch) -> None:
+    user = SimpleNamespace(id=uuid4(), is_admin=False)
+    work = SimpleNamespace(
+        id=uuid4(),
+        user_id=user.id,
+        status="hidden",
+        visibility="public",
+        is_enabled=True,
+    )
+
+    async def get_work(_db, _work_id):
+        return work
+
+    monkeypatch.setattr(works_service, "_get_work_or_404", get_work)
+
+    with pytest.raises(AppException, match="下架"):
+        await works_service.update_work(
+            SimpleNamespace(),
+            work.id,
+            user,
+            WorkUpdateRequest(status="published"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_admin_patch_cannot_publish_work_without_media(monkeypatch) -> None:
+    work = SimpleNamespace(
+        id=uuid4(),
+        user_id=uuid4(),
+        status="draft",
+        visibility="public",
+        is_enabled=True,
+    )
+
+    async def get_work(_db, _work_id):
+        return work
+
+    async def has_media(_db, _work_id):
+        return False
+
+    monkeypatch.setattr(works_service, "_get_work_or_404", get_work)
+    monkeypatch.setattr(works_service, "_work_has_media", has_media)
+
+    with pytest.raises(AppException, match="至少需要一个媒体文件"):
+        await works_service.admin_update_work(
+            SimpleNamespace(),
+            work.id,
+            SimpleNamespace(id=uuid4(), is_admin=True),
+            AdminWorkUpdateRequest(status="published"),
+        )
+
+
+@pytest.mark.parametrize("field", ["title", "visibility", "status"])
+def test_work_update_rejects_null_required_fields(field: str) -> None:
+    with pytest.raises(ValidationError):
+        WorkUpdateRequest.model_validate({field: None})
+
+
+def test_work_update_normalizes_title() -> None:
+    assert WorkUpdateRequest(title="  我的作品  ").title == "我的作品"
+
+    with pytest.raises(ValidationError):
+        WorkUpdateRequest(title="   ")
+
+
+def test_owner_work_list_does_not_advertise_deleted_filter() -> None:
+    operation = app.openapi()["paths"][f"{settings.api_prefix}/works/mine"]["get"]
+    status_parameter = next(
+        item for item in operation["parameters"] if item["name"] == "status"
+    )
+    assert status_parameter["schema"]["anyOf"][0]["pattern"] == (
+        "^(draft|published|hidden)$"
+    )
 
 
 @pytest.mark.asyncio

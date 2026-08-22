@@ -45,7 +45,7 @@ from app.services.model_points import calculate_submission_points_cost
 from app.services.points import change_user_points, consume_user_points, ensure_user_points_enough
 from app.services.provider_polling import provider_next_poll_seconds
 from app.services.project_asset_generation import (
-    _validate_comfly_asset_image_request,
+    _validate_asset_image_request,
     build_asset_image_prompt,
     get_enabled_image_model_or_404,
     get_project_with_style_or_404,
@@ -500,7 +500,7 @@ async def submit_core_asset_variant_image_generation(
         "images": [base_reference_image],
         "image_urls": [base_reference_image],
     }
-    _validate_comfly_asset_image_request(ai_model, prompt, model_extra)
+    _validate_asset_image_request(ai_model, prompt, model_extra)
     points_cost = calculate_submission_points_cost(ai_model, "image", model_extra)
     await ensure_user_points_enough(db, user.id, points_cost)
     transaction = None
@@ -1491,7 +1491,7 @@ def _all_asset_snapshot(context: CoreAssetContext) -> List[Dict[str, Any]]:
         for (asset_type, asset_id), entry in context.entries.items()
         if entry.asset is not None
     ]
-    return _selection_snapshot(context, refs, require_character_scene=False)
+    return _selection_snapshot(context, refs)
 
 
 async def _attach_variant_snapshots(

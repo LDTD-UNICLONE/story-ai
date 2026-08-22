@@ -7,15 +7,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.responses import success
 from app.db.session import get_db
 from app.schemas.ai_model import AiModelOptionOut, AiModelOut
-from app.services.ai_models import ( get_ai_model_or_404, list_ai_model_options,
-    resolve_ai_model_capabilities,
+from app.services.ai_models import (
+    get_ai_model_or_404,
+    list_ai_model_options,
+    resolve_ai_model_configuration,
 )
 
 
 def dump_ai_model(model, schema):
     data = schema.model_validate(model).model_dump(mode="json")
-    data["capabilities"] = resolve_ai_model_capabilities(model)
+    data["configuration"] = resolve_ai_model_configuration(model)
     return data
+
 
 router = APIRouter(prefix="/models")
 

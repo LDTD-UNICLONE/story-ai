@@ -174,6 +174,24 @@ def test_core_asset_confirmation_does_not_require_reference_images() -> None:
     assert [item["reference_image"] for item in snapshot] == [None, None]
 
 
+def test_confirm_all_core_assets_still_requires_character_and_scene() -> None:
+    character_id = uuid4()
+    context = core_asset_service.CoreAssetContext(
+        production=SimpleNamespace(id=uuid4()),
+        bible=SimpleNamespace(),
+        entries={
+            ("character", character_id): core_asset_service.CoreAssetEntry(
+                candidate=SimpleNamespace(id=uuid4()),
+                asset=SimpleNamespace(name="沈砚", reference_image=None),
+            )
+        },
+        active_lock=None,
+    )
+
+    with pytest.raises(AppException, match="至少需要选择一个角色和一个场景"):
+        core_asset_service._all_asset_snapshot(context)
+
+
 def test_confirmed_core_assets_still_allow_image_changes_only() -> None:
     context = SimpleNamespace(
         production=SimpleNamespace(

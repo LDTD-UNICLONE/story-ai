@@ -12,7 +12,9 @@ class AgentEpisodeVideoGenerationRequest(SchemaBaseModel):
     expected_episode_revision: int = Field(ge=1)
     idempotency_key: str = Field(min_length=8, max_length=128)
     video_model_id: UUID
-    video_resolution: Literal["480p", "720p", "1080p", "4k"] = "720p"
+    video_resolution: Literal[
+        "360p", "480p", "540p", "720p", "768P", "1080p", "2K", "4k"
+    ] = "720p"
 
     @field_validator("idempotency_key")
     @classmethod
@@ -45,7 +47,9 @@ class AgentStoryboardVideoConfigRequest(SchemaBaseModel):
     expected_storyboard_revision: int = Field(ge=1)
     expected_config_version: int = Field(ge=0)
     video_model_id: UUID
-    video_resolution: Literal["480p", "720p", "1080p", "4k"] = "720p"
+    video_resolution: Literal[
+        "360p", "480p", "540p", "720p", "768P", "1080p", "2K", "4k"
+    ] = "720p"
     estimated_duration_seconds: int = Field(ge=4, le=15)
 
 

@@ -4,6 +4,7 @@ import pytest
 
 from app.core.timezone import beijing_datetime
 from app.services.task_execution import TaskExecutionDeferred, prepare_task_execution
+from app.worker import celery_app
 
 
 def task(status: str, extra=None):
@@ -55,3 +56,10 @@ def test_running_provider_task_column_is_not_submitted_again() -> None:
     record.provider_task_id = "provider-column-123"
 
     assert prepare_task_execution(record) is False
+
+
+def test_successful_conversation_points_have_periodic_recovery() -> None:
+    schedule = celery_app.conf.beat_schedule["settle-pending-conversation-points"]
+
+    assert schedule["task"] == "tasks.model_generation.settle_pending_conversation_points"
+    assert celery_app.conf.task_routes[schedule["task"]]["queue"] == "story_ai_default"

@@ -21,7 +21,7 @@ from app.services.recharges import (
     get_recharge_order_or_404,
     list_all_recharge_orders,
     refund_recharge_order,
-    sync_recharge_order_from_wechat,
+    sync_recharge_order_status,
 )
 
 router = APIRouter(prefix="/admin/recharges")
@@ -30,7 +30,10 @@ router = APIRouter(prefix="/admin/recharges")
 @router.get("")
 async def admin_recharge_orders(
     user_id: Optional[UUID] = Query(default=None),
-    status: Optional[str] = Query(default=None, max_length=32),
+    status: Optional[str] = Query(
+        default=None,
+        pattern="^(pending|paid|refunding|refunded)$",
+    ),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -72,7 +75,7 @@ async def admin_sync_recharge_order(
     current_admin: User = Depends(get_current_admin_user),
 ):
     order = await get_recharge_order_or_404(db, order_id)
-    order = await sync_recharge_order_from_wechat(db, order)
+    order = await sync_recharge_order_status(db, order)
     users = await _load_order_users(db, [order])
     data = _build_admin_recharge_order(order, users[order.user_id])
     return success(data=data.model_dump(mode="json"), message="同步成功")

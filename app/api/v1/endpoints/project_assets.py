@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, Path, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.api.v1.endpoints.project_dependencies import require_standard_project
 from app.api.v1.endpoints.task_polling import set_task_poll_headers, task_next_poll_seconds
 from app.core.responses import success
 from app.db.session import get_db
@@ -47,7 +48,10 @@ from app.services.project_assets import (
 )
 from app.services.project_asset_generation import submit_asset_image_generation
 
-router = APIRouter(prefix="/projects/{project_id}")
+router = APIRouter(
+    prefix="/projects/{project_id}",
+    dependencies=[Depends(require_standard_project)],
+)
 
 
 @router.get("/characters")

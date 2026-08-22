@@ -1,7 +1,11 @@
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from uuid import uuid4
+
 import pytest
 
 from app.core.exceptions import AppException
-from app.services.task_records import _enforce_user_task_limits
+from app.services.task_records import _enforce_user_task_limits, _lock_user_task_submission
 
 
 def test_media_task_limit_blocks_submission() -> None:
@@ -24,3 +28,16 @@ def test_task_below_limits_is_allowed() -> None:
             "exceeds_configured_task_limit": False,
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_outstanding_actual_cost_blocks_new_model_task() -> None:
+    user = SimpleNamespace(points_balance=-1)
+    result = SimpleNamespace(scalar_one_or_none=lambda: user)
+    db = SimpleNamespace(execute=AsyncMock(return_value=result))
+
+    with pytest.raises(AppException) as exc_info:
+        await _lock_user_task_submission(db, uuid4())
+
+    assert exc_info.value.code == 40003
+    assert "未结清" in exc_info.value.message

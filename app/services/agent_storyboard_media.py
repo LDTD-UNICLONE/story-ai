@@ -34,6 +34,10 @@ from app.services.agent_storyboard_bindings import (
 )
 from app.services.agent_storyboard_episode_state import effective_storyboard_episode_status
 from app.services.agent_storyboard_video_inputs import build_agent_storyboard_video_input
+from app.services.agent_video_settings import (
+    provider_video_duration,
+    require_agent_video_defaults,
+)
 from app.services.project_storyboard_videos import (
     storyboard_video_image_limit,
     submit_storyboard_video_generation,
@@ -338,6 +342,11 @@ async def _submit_agent_videos(
     custom_prompt: Optional[str] = None,
     regenerate_success: bool = False,
 ) -> Dict[str, Any]:
+    require_agent_video_defaults(
+        context.production,
+        payload.video_model_id,
+        payload.video_resolution,
+    )
     request = await _existing_request(
         db,
         context.production.id,
@@ -447,6 +456,11 @@ async def _submit_agent_videos(
                     expected_config_version=getattr(
                         payload, "expected_video_config_version", None
                     ),
+                )
+                require_agent_video_defaults(
+                    context.production,
+                    model.id,
+                    resolution,
                 )
                 task_record, points_cost = await _submit_storyboard_video(
                     db,
@@ -562,6 +576,7 @@ async def _submit_storyboard_video(
     custom_prompt: Optional[str] = None,
 ):
     asset_ids = storyboard_asset_ids(storyboard)
+    submitted_duration_seconds = provider_video_duration(model, duration_seconds)
     video_input = await build_agent_storyboard_video_input(
         db,
         context.production,
@@ -585,7 +600,11 @@ async def _submit_storyboard_video(
             scene_ids=asset_ids["scene"],
             prop_ids=asset_ids["prop"],
             extra={
-                "duration_seconds": duration_seconds,
+                **(
+                    {"duration_seconds": submitted_duration_seconds}
+                    if submitted_duration_seconds is not None
+                    else {}
+                ),
                 "generate_audio": False,
             },
         ),
@@ -611,7 +630,11 @@ async def _submit_storyboard_video(
                 "model_id": str(model.id),
                 "resolution": resolution,
                 "ratio": context.project.generation_ratio,
-                "duration_seconds": duration_seconds,
+                **(
+                    {"duration_seconds": submitted_duration_seconds}
+                    if submitted_duration_seconds is not None
+                    else {}
+                ),
                 "generate_audio": False,
                 "return_last_frame": True,
             },

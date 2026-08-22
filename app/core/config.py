@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     comfly_max_connections: int = 100
     comfly_max_keepalive_connections: int = 20
 
+    apimart_base_url: str = "https://api.apib.ai/v1"
+    apimart_api_key: str = ""
+    apimart_timeout_seconds: int = 30
+    apimart_max_connections: int = 100
+    apimart_max_keepalive_connections: int = 20
+
     volcengine_ark_base_url: str = "https://ark.cn-beijing.volces.com"
     volcengine_ark_api_key: str = ""
     volcengine_ark_timeout_seconds: int = 30
@@ -78,6 +84,7 @@ class Settings(BaseSettings):
     user_pending_task_limit: int = 20
     user_pending_media_task_limit: int = 5
     user_pending_task_window_hours: int = 24
+    conversation_message_max_characters: int = 100_000
     agent_source_max_characters: int = 100_000
     agent_source_max_file_size_mb: int = 20
     agent_source_chunk_characters: int = 12_000
@@ -164,7 +171,11 @@ class Settings(BaseSettings):
 
     @cached_property
     def provider_request_timeout_ceiling_seconds(self) -> int:
-        return max(self.comfly_timeout_seconds, self.volcengine_ark_timeout_seconds)
+        return max(
+            self.comfly_timeout_seconds,
+            self.volcengine_ark_timeout_seconds,
+            self.apimart_timeout_seconds,
+        )
 
     @cached_property
     def effective_celery_task_soft_time_limit_seconds(self) -> int:

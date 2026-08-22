@@ -3,7 +3,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, field_validator
 from app.schemas.base import SchemaBaseModel
 
 
@@ -59,7 +59,22 @@ class AdminPointsRecordListOut(SchemaBaseModel):
 
 class AdminPointsAdjustRequest(SchemaBaseModel):
     amount: int = Field(..., description="正数增加积分，负数扣减积分")
-    remark: Optional[str] = Field(default=None, max_length=500)
+    remark: str = Field(..., min_length=1, max_length=500)
+
+    @field_validator("amount")
+    @classmethod
+    def reject_zero_amount(cls, value: int) -> int:
+        if value == 0:
+            raise ValueError("积分变动数量不能为 0")
+        return value
+
+    @field_validator("remark")
+    @classmethod
+    def normalize_remark(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("积分调整原因不能为空")
+        return normalized
 
 
 class PointsConsumeRequest(SchemaBaseModel):

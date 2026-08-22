@@ -7,20 +7,51 @@ from sqlalchemy import Index
 import app.models  # noqa: F401
 from app.core.exceptions import AppException
 from app.db.base import Base
-from app.schemas.conversation import ConversationSendMessageRequest
+from app.core.config import settings
+from app.schemas.conversation import (
+    ConversationCreateRequest,
+    ConversationSendMessageRequest,
+    ConversationUpdateRequest,
+)
 from app.services.conversations import (
     _build_message_extra_with_context,
     _completed_text_context_messages,
 )
 
 
-def _message(role: str, content: str, *, turn_id=None, status=None, task_status=None):
+class _EmptyScalars:
+    def all(self):
+        return []
+
+
+class _EmptyResult:
+    def scalars(self):
+        return _EmptyScalars()
+
+
+class _EmptyHistoryDb:
+    async def execute(self, statement):
+        return _EmptyResult()
+
+
+def _message(
+    role: str,
+    content: str,
+    *,
+    turn_id=None,
+    status=None,
+    task_status=None,
+    extra=None,
+):
+    message_extra = dict(extra or {})
+    if task_status:
+        message_extra["task_status"] = task_status
     return SimpleNamespace(
         role=role,
         content=content,
         turn_id=turn_id,
         status=status,
-        extra={"task_status": task_status} if task_status else {},
+        extra=message_extra,
     )
 
 
@@ -50,6 +81,35 @@ def test_send_request_keeps_client_message_id_outside_provider_extra() -> None:
 
     assert payload.client_message_id == "web-turn-001"
     assert payload.extra == {"temperature": 0.5}
+
+
+@pytest.mark.parametrize(
+    ("schema", "payload"),
+    [
+        (ConversationCreateRequest, {"title": "   ", "ai_model_id": uuid4()}),
+        (ConversationUpdateRequest, {"title": "\t\n"}),
+        (ConversationSendMessageRequest, {"content": "   \n"}),
+    ],
+)
+def test_conversation_requests_reject_blank_text(schema, payload) -> None:
+    with pytest.raises(ValueError):
+        schema.model_validate(payload)
+
+
+def test_conversation_title_is_trimmed() -> None:
+    payload = ConversationCreateRequest(
+        title="  新会话  ",
+        ai_model_id=uuid4(),
+    )
+
+    assert payload.title == "新会话"
+
+
+def test_conversation_message_rejects_oversized_content() -> None:
+    with pytest.raises(ValueError):
+        ConversationSendMessageRequest(
+            content="x" * (settings.conversation_message_max_characters + 1)
+        )
 
 
 def test_context_contains_only_complete_successful_text_turns() -> None:
@@ -97,6 +157,33 @@ def test_legacy_messages_without_turn_id_remain_compatible() -> None:
     ]
 
 
+def test_context_preserves_images_from_successful_user_turns() -> None:
+    turn_id = uuid4()
+    history = [
+        _message(
+            "user",
+            "这张图里有什么？",
+            turn_id=turn_id,
+            status="success",
+            extra={"uploaded_images": [{"url": "https://cdn.example/scene.png"}]},
+        ),
+        _message("assistant", "一座古城。", turn_id=turn_id, status="success"),
+    ]
+
+    assert _completed_text_context_messages(history) == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "这张图里有什么？"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://cdn.example/scene.png"},
+                },
+            ],
+        },
+        {"role": "assistant", "content": "一座古城。"},
+    ]
+
 @pytest.mark.asyncio
 async def test_client_cannot_supply_text_history_messages() -> None:
     with pytest.raises(AppException) as exc_info:
@@ -110,3 +197,31 @@ async def test_client_cannot_supply_text_history_messages() -> None:
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.code == 40013
+
+
+@pytest.mark.asyncio
+async def test_apimart_image_analysis_keeps_backend_managed_messages() -> None:
+    extra = await _build_message_extra_with_context(
+        _EmptyHistoryDb(),
+        conversation_id=uuid4(),
+        conversation_type="text",
+        content="分析这张图",
+        extra={
+            "capability": "analyze_image",
+            "uploaded_images": [{"url": "https://cdn.example/scene.png"}],
+        },
+        ai_model=SimpleNamespace(vendor="apimart"),
+    )
+
+    assert extra["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "分析这张图"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://cdn.example/scene.png"},
+                },
+            ],
+        }
+    ]

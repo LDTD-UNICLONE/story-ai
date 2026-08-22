@@ -372,6 +372,8 @@ async def _start_production(
     production: AgentProduction,
     user_id: UUID,
 ) -> Optional[AgentStep]:
+    if production.status == "completed":
+        raise InvalidAgentStateTransition("production", production.status, "planning")
     if production.status in {
         "planning",
         "running",

@@ -75,7 +75,7 @@ async def list_materials(
     total_result = await db.execute(count_query)
     total = total_result.scalar_one()
     result = await db.execute(
-        query.order_by(Material.sort_order.asc(), Material.created_at.desc())
+        query.order_by(Material.sort_order.asc(), Material.created_at.desc(), Material.id.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )

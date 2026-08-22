@@ -64,9 +64,7 @@ async def test_post_accept_failure_does_not_mark_video_failed_or_refund(monkeypa
     async def mark_failed(*args, **kwargs):
         failed_calls.append((args, kwargs))
 
-    monkeypatch.setattr(
-        project_storyboard_video, "WorkerSessionLocal", lambda: SessionContext()
-    )
+    monkeypatch.setattr(project_storyboard_video, "WorkerSessionLocal", lambda: SessionContext())
     monkeypatch.setattr(project_storyboard_video, "_mark_failed", mark_failed)
 
     await project_storyboard_video._fail_generation(
@@ -129,9 +127,7 @@ async def test_post_accept_processing_error_is_handed_to_reconciler(monkeypatch)
     async def mark_failed(*args, **kwargs):
         failed_calls.append((args, kwargs))
 
-    monkeypatch.setattr(
-        project_storyboard_video, "WorkerSessionLocal", lambda: SessionContext()
-    )
+    monkeypatch.setattr(project_storyboard_video, "WorkerSessionLocal", lambda: SessionContext())
     monkeypatch.setattr(
         project_storyboard_video,
         "run_storyboard_video_generation_in_worker",
@@ -187,6 +183,7 @@ def test_provider_task_state_is_promoted_to_reconcile_fields() -> None:
             "task_id": "provider-task-789",
             "task_status": "in_progress",
             "platform_task_status": "running",
+            "provider_response": {"progress": 46},
         },
         provider_vendor="volcengine_ark",
     )
@@ -195,8 +192,20 @@ def test_provider_task_state_is_promoted_to_reconcile_fields() -> None:
     assert record.provider_task_id == "provider-task-789"
     assert record.provider_vendor == "volcengine_ark"
     assert record.provider_status == "in_progress"
+    assert record.extra["progress_percent"] == 46
+    assert task_records.task_record_progress_percent(record) == 46
     assert record.provider_submitted_at >= before
     assert record.next_reconcile_at > record.provider_submitted_at
+
+
+def test_successful_media_task_progress_is_100() -> None:
+    record = SimpleNamespace(
+        status="success",
+        generation_type="video",
+        extra={"progress_percent": 87},
+    )
+
+    assert task_records.task_record_progress_percent(record) == 100
 
 
 def test_terminal_provider_state_clears_next_reconcile_time() -> None:

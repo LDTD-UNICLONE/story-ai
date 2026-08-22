@@ -21,7 +21,11 @@ def validate_runtime_config() -> None:
     if not settings.enforce_production_config:
         return
 
-    if not settings.comfly_api_key and not settings.volcengine_ark_api_key:
+    if (
+        not settings.comfly_api_key
+        and not settings.volcengine_ark_api_key
+        and not settings.apimart_api_key
+    ):
         errors.append("At least one model provider API key must be configured")
     if (
         not settings.oss_bucket_name

@@ -20,8 +20,11 @@ async def get_user_points_balance(db: AsyncSession, user_id: UUID) -> int:
 async def ensure_user_points_enough(db: AsyncSession, user_id: UUID, amount: int) -> None:
     if amount <= 0:
         return
-    balance = await get_user_points_balance(db, user_id)
-    if balance < amount:
+    result = await db.execute(select(User).where(User.id == user_id).with_for_update())
+    user = result.scalar_one_or_none()
+    if user is None:
+        raise AppException("用户不存在", code=40401, status_code=404)
+    if user.points_balance < amount:
         raise AppException("积分不足，请充值", code=40003, status_code=400)
 
 
@@ -41,7 +44,7 @@ async def list_user_points_transactions(
     result = await db.execute(
         select(UserPointsTransaction)
         .where(UserPointsTransaction.user_id == user_id)
-        .order_by(UserPointsTransaction.created_at.desc())
+        .order_by(UserPointsTransaction.created_at.desc(), UserPointsTransaction.id.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
@@ -87,7 +90,7 @@ async def list_all_points_transactions(
     count_result = await db.execute(select(func.count()).select_from(query.subquery()))
     total = count_result.scalar_one()
     result = await db.execute(
-        query.order_by(UserPointsTransaction.created_at.desc())
+        query.order_by(UserPointsTransaction.created_at.desc(), UserPointsTransaction.id.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
@@ -101,6 +104,7 @@ async def change_user_points(
     transaction_type: str,
     remark: Optional[str] = None,
     auto_commit: bool = True,
+    allow_negative_balance: bool = False,
 ) -> UserPointsTransaction:
     if amount == 0:
         raise AppException("积分变动数量不能为 0", code=40002, status_code=400)
@@ -111,7 +115,7 @@ async def change_user_points(
         raise AppException("用户不存在", code=40401, status_code=404)
 
     new_balance = user.points_balance + amount
-    if new_balance < 0:
+    if new_balance < 0 and not allow_negative_balance:
         raise AppException("积分不足，请充值", code=40003, status_code=400)
 
     user.points_balance = new_balance

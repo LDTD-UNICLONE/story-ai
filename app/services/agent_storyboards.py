@@ -49,6 +49,7 @@ from app.services.agent_storyboard_prompts import (
     tokenize_asset_text,
     tokenize_storyboard_shots,
 )
+from app.services.agent_video_settings import require_agent_video_defaults
 from app.services.project_storyboards import (
     build_agent_storyboard_prompt,
     estimate_agent_shot_group_duration,
@@ -297,6 +298,11 @@ async def update_agent_storyboard_video_config(
     await _require_storyboard_episode_ready(db, production, chapter.id)
     _check_storyboard_revision(storyboard, payload.expected_storyboard_revision)
     _assert_storyboard_idle(storyboard)
+    require_agent_video_defaults(
+        production,
+        payload.video_model_id,
+        payload.video_resolution,
+    )
     model = (
         await db.execute(
             select(AiModel).where(

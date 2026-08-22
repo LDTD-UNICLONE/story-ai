@@ -13,6 +13,7 @@ from app.schemas.project_chapter import (
     ProjectChapterUpdateRequest,
 )
 from app.services.projects import get_project_or_404
+from app.services.task_records import cancel_project_resource_task_records
 
 
 async def list_project_chapters(
@@ -37,7 +38,11 @@ async def list_project_chapters(
     result = await db.execute(
         select(ProjectChapter)
         .where(*conditions)
-        .order_by(ProjectChapter.sort_order.asc(), ProjectChapter.created_at.asc())
+        .order_by(
+            ProjectChapter.sort_order.asc(),
+            ProjectChapter.created_at.asc(),
+            ProjectChapter.id.asc(),
+        )
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
@@ -121,6 +126,13 @@ async def delete_project_chapter(
     user_id: UUID,
 ) -> ProjectChapter:
     chapter = await get_project_chapter_or_404(db, project_id, chapter_id, user_id)
+    await cancel_project_resource_task_records(
+        db,
+        project_id,
+        user_id,
+        match_extra={"chapter_id": chapter_id},
+        reason="章节已删除",
+    )
     chapter.is_enabled = False
     chapter.updated_at = beijing_datetime()
     await db.commit()

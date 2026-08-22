@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
-from pydantic import ConfigDict, Field, field_serializer, model_validator
+from pydantic import ConfigDict, Field, field_serializer, field_validator, model_validator
 
 from app.core.public_messages import sanitize_public_data
 from app.schemas.base import SchemaBaseModel
@@ -180,6 +180,32 @@ class ProjectStoryboardUpdateRequest(ProjectStoryboardRequestModel):
             key: item for key, item in value.items() if key not in _IGNORED_STORYBOARD_UPDATE_FIELDS
         }
 
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: Optional[str]) -> str:
+        if value is None:
+            raise ValueError("分镜标题不能为 null")
+        value = value.strip()
+        if not value:
+            raise ValueError("分镜标题不能为空")
+        return value
+
+    @field_validator("source_content")
+    @classmethod
+    def validate_source_content(cls, value: Optional[str]) -> str:
+        if value is None:
+            raise ValueError("分镜原文不能为 null")
+        if not value.strip():
+            raise ValueError("分镜原文不能为空")
+        return value
+
+    @field_validator("shot_number", "characters", "props", "extra")
+    @classmethod
+    def reject_null_required_fields(cls, value):
+        if value is None:
+            raise ValueError("字段不能为 null")
+        return value
+
 
 class ProjectStoryboardCreateRequest(ProjectStoryboardRequestModel):
     insert_after_storyboard_id: Optional[UUID] = None
@@ -209,6 +235,14 @@ class ProjectStoryboardCreateRequest(ProjectStoryboardRequestModel):
     ending_frame: Optional[str] = None
     split_reason: Optional[str] = None
     extra: Optional[Dict[str, Any]] = None
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("分镜标题不能为空")
+        return value
 
 
 class ProjectStoryboardAnalyzeRequest(ProjectStoryboardRequestModel):
@@ -298,7 +332,9 @@ class ProjectStoryboardVideoGenerateRequest(ProjectStoryboardRequestModel):
     generation_mode: Literal["text_to_video", "reference", "first_last_frame", "storyboard"] = (
         "reference"
     )
-    resolution: Literal["480p", "720p", "1080p", "4k"] = "720p"
+    resolution: Literal[
+        "360p", "480p", "540p", "720p", "768P", "1080p", "2K", "4k"
+    ] = "720p"
     return_last_frame: bool = False
     prompt: Optional[str] = Field(default=None, min_length=1)
     character_ids: List[UUID] = Field(default_factory=list)

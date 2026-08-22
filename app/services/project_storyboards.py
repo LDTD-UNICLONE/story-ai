@@ -3,20 +3,17 @@ import json
 import logging
 import math
 import re
-from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import AppException
 from app.core.logging import log_extra
 from app.core.timezone import beijing_datetime
 from app.models.agent_story_bible import AgentAssetCandidate, AgentAssetVariant
 from app.models.ai_model import AiModel
-from app.models.project import Project
 from app.models.project_asset import ProjectCharacter, ProjectProp, ProjectScene
 from app.models.project_chapter import ProjectChapter
 from app.models.project_generated_asset import ProjectGeneratedAsset
@@ -32,14 +29,20 @@ from app.schemas.project_storyboard import (
     ProjectStoryboardSplitRequest,
     ProjectStoryboardUpdateRequest,
 )
-from app.services.model_points import calculate_text_submission_points_cost, settle_text_task_points
+from app.services.model_points import (
+    calculate_text_submission_points_cost,
+    ensure_model_minimum_balance,
+    settle_text_task_points,
+)
+from app.services.model_configuration import build_model_runtime_snapshot
 from app.services.model_runner import run_model
 from app.services.points import change_user_points, consume_user_points
 from app.services.project_chapter_processing import get_enabled_text_model_or_404
 from app.services.project_chapters import get_project_chapter_or_404
 from app.services.prompts import render_system_prompt
-from app.services.projects import get_project_or_404
+from app.services.projects import get_owned_enabled_project_with_style_or_404, get_project_or_404
 from app.services.task_records import (
+    cancel_project_resource_task_records,
     create_user_task_record,
     expire_stale_task_record,
     refresh_task_record_interrupted,
@@ -48,26 +51,6 @@ from app.services.text_model_extra import normalize_text_analysis_extra
 
 
 logger = logging.getLogger(__name__)
-
-
-async def _get_owned_enabled_project_or_404(
-    db: AsyncSession,
-    project_id: UUID,
-    user_id: UUID,
-) -> Project:
-    result = await db.execute(
-        select(Project)
-        .options(selectinload(Project.style))
-        .where(
-            Project.id == project_id,
-            Project.user_id == user_id,
-            Project.is_enabled.is_(True),
-        )
-    )
-    project = result.scalar_one_or_none()
-    if project is None:
-        raise AppException("项目不存在", code=40407, status_code=404)
-    return project
 
 
 async def list_project_storyboards(
@@ -92,7 +75,11 @@ async def list_project_storyboards(
     result = await db.execute(
         select(ProjectStoryboard)
         .where(*conditions)
-        .order_by(ProjectStoryboard.shot_number.asc(), ProjectStoryboard.created_at.asc())
+        .order_by(
+            ProjectStoryboard.shot_number.asc(),
+            ProjectStoryboard.created_at.asc(),
+            ProjectStoryboard.id.asc(),
+        )
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
@@ -166,6 +153,7 @@ async def create_project_storyboard(
     payload: ProjectStoryboardCreateRequest,
 ) -> ProjectStoryboard:
     await get_project_chapter_or_404(db, project_id, chapter_id, user_id)
+    await _lock_storyboard_order(db, project_id, chapter_id, user_id)
     storyboards = await _list_enabled_storyboards(db, project_id, chapter_id, user_id)
     insert_index = _resolve_storyboard_insert_index(storyboards, payload)
 
@@ -202,7 +190,9 @@ async def update_project_storyboard(
     storyboard = await get_project_storyboard_or_404(
         db, project_id, chapter_id, storyboard_id, user_id
     )
+    await _lock_storyboard_order(db, project_id, chapter_id, user_id)
     update_data = payload.model_dump(exclude_unset=True)
+    requested_shot_number = update_data.pop("shot_number", None)
     event_goal = update_data.pop("event_goal", None)
     split_reason = update_data.pop("split_reason", None)
     changed = bool(update_data) or event_goal is not None or split_reason is not None
@@ -237,6 +227,13 @@ async def update_project_storyboard(
                 "invalidated_by": "storyboard_edit",
                 "invalidated_at": now.isoformat(),
             }
+    if requested_shot_number is not None:
+        storyboards = await _list_enabled_storyboards(db, project_id, chapter_id, user_id)
+        remaining = [item for item in storyboards if item.id != storyboard.id]
+        insert_index = min(max(requested_shot_number - 1, 0), len(remaining))
+        _assign_shot_numbers(
+            remaining[:insert_index] + [storyboard] + remaining[insert_index:]
+        )
     storyboard.updated_at = now
     await db.commit()
     await db.refresh(storyboard)
@@ -253,8 +250,18 @@ async def delete_project_storyboard(
     storyboard = await get_project_storyboard_or_404(
         db, project_id, chapter_id, storyboard_id, user_id
     )
+    await _lock_storyboard_order(db, project_id, chapter_id, user_id)
+    await cancel_project_resource_task_records(
+        db,
+        project_id,
+        user_id,
+        match_extra={"storyboard_id": storyboard_id},
+        reason="分镜已删除",
+    )
     storyboard.is_enabled = False
     storyboard.updated_at = beijing_datetime()
+    storyboards = await _list_enabled_storyboards(db, project_id, chapter_id, user_id)
+    _assign_shot_numbers([item for item in storyboards if item.id != storyboard.id])
     await db.commit()
     await db.refresh(storyboard)
     return storyboard
@@ -268,6 +275,7 @@ async def merge_project_storyboards(
     payload: ProjectStoryboardMergeRequest,
 ) -> List[ProjectStoryboard]:
     await get_project_chapter_or_404(db, project_id, chapter_id, user_id)
+    await _lock_storyboard_order(db, project_id, chapter_id, user_id)
     storyboard_ids = _unique_uuids(payload.storyboard_ids)
     if len(storyboard_ids) < 2:
         raise AppException("至少选择两个分镜进行合并", code=40031, status_code=400)
@@ -333,6 +341,7 @@ async def split_project_storyboard(
     storyboard = await get_project_storyboard_or_404(
         db, project_id, chapter_id, storyboard_id, user_id
     )
+    await _lock_storyboard_order(db, project_id, chapter_id, user_id)
     storyboards = await _list_enabled_storyboards(db, project_id, chapter_id, user_id)
     original_index = next(
         (index for index, item in enumerate(storyboards) if item.id == storyboard.id), None
@@ -465,7 +474,9 @@ async def submit_storyboard_analysis(
 ) -> Tuple[UserTaskRecord, int]:
     agent_project = None
     if agent_context:
-        agent_project = await _get_owned_enabled_project_or_404(db, project_id, user.id)
+        agent_project = await get_owned_enabled_project_with_style_or_404(
+            db, project_id, user.id
+        )
     else:
         await get_project_or_404(db, project_id, user.id)
     chapter = await get_project_chapter_or_404(db, project_id, chapter_id, user.id)
@@ -473,6 +484,7 @@ async def submit_storyboard_analysis(
         raise AppException("章节还没有处理后的内容，无法分析分镜", code=40011, status_code=400)
 
     ai_model = await get_enabled_text_model_or_404(db, payload.ai_model_id)
+    await ensure_model_minimum_balance(db, user.id, ai_model)
     points_cost = calculate_text_submission_points_cost(ai_model)
     points_transaction = None
     if points_cost > 0:
@@ -609,6 +621,7 @@ async def _submit_storyboard_text_stage(
     task_key: str,
 ) -> Tuple[UserTaskRecord, int]:
     ai_model = await get_enabled_text_model_or_404(db, ai_model_id)
+    await ensure_model_minimum_balance(db, user.id, ai_model)
     points_cost = calculate_text_submission_points_cost(ai_model)
     points_transaction = None
     if points_cost > 0:
@@ -713,14 +726,7 @@ async def run_storyboard_analysis_in_worker(
     if ai_model is None:
         raise AppException("文本模型不存在或已禁用", code=40404, status_code=404)
 
-    model_snapshot = SimpleNamespace(
-        id=ai_model.id,
-        model_id=ai_model.model_id,
-        vendor=ai_model.vendor,
-        nickname=ai_model.nickname,
-        points_cost=ai_model.points_cost,
-        capabilities=ai_model.capabilities or {},
-    )
+    model_snapshot = build_model_runtime_snapshot(ai_model)
     model_result = await run_model(
         model_snapshot,
         "text",
@@ -918,14 +924,7 @@ async def run_storyboard_stage_in_worker(
     if ai_model is None:
         raise AppException("文本模型不存在或已禁用", code=40404, status_code=404)
 
-    model_snapshot = SimpleNamespace(
-        id=ai_model.id,
-        model_id=ai_model.model_id,
-        vendor=ai_model.vendor,
-        nickname=ai_model.nickname,
-        points_cost=ai_model.points_cost,
-        capabilities=ai_model.capabilities or {},
-    )
+    model_snapshot = build_model_runtime_snapshot(ai_model)
     model_result = await run_model(
         model_snapshot,
         "text",
@@ -1513,9 +1512,33 @@ async def _list_enabled_storyboards(
             ProjectStoryboard.user_id == user_id,
             ProjectStoryboard.is_enabled.is_(True),
         )
-        .order_by(ProjectStoryboard.shot_number.asc(), ProjectStoryboard.created_at.asc())
+        .order_by(
+            ProjectStoryboard.shot_number.asc(),
+            ProjectStoryboard.created_at.asc(),
+            ProjectStoryboard.id.asc(),
+        )
     )
     return list(result.scalars().all())
+
+
+async def _lock_storyboard_order(
+    db: AsyncSession,
+    project_id: UUID,
+    chapter_id: UUID,
+    user_id: UUID,
+) -> None:
+    result = await db.execute(
+        select(ProjectChapter.id)
+        .where(
+            ProjectChapter.id == chapter_id,
+            ProjectChapter.project_id == project_id,
+            ProjectChapter.user_id == user_id,
+            ProjectChapter.is_enabled.is_(True),
+        )
+        .with_for_update()
+    )
+    if result.scalar_one_or_none() is None:
+        raise AppException("项目章节不存在", code=40408, status_code=404)
 
 
 def _storyboard_asset_payload(asset: Any) -> Dict[str, Any]:

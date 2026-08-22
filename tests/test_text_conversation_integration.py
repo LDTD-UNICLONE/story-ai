@@ -64,9 +64,8 @@ async def text_conversation_db():
                 model_id=f"text-chat-model-{uuid4().hex}",
                 vendor="integration",
                 model_type="text",
-                points_cost=0,
                 is_enabled=True,
-                capabilities={},
+                configuration={},
             )
             conversation = Conversation(
                 id=uuid4(),
@@ -209,3 +208,132 @@ async def test_text_turn_is_idempotent_serialized_and_retryable(
         {"role": "assistant", "content": "女主角是一名律师。"},
         {"role": "user", "content": "继续"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_text_base_points_only_gate_minimum_balance(
+    text_conversation_db,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        conversation_service.run_conversation_generation,
+        "apply_async",
+        lambda **_kwargs: None,
+    )
+    db = text_conversation_db.session
+    user = text_conversation_db.user
+    model = text_conversation_db.model
+    model.configuration = {
+        "version": 1,
+        "billing": {"base_points": 10},
+    }
+    user.points_balance = 9
+    await db.commit()
+
+    with pytest.raises(AppException) as insufficient:
+        await conversation_service.send_conversation_message(
+            db,
+            text_conversation_db.conversation.id,
+            user,
+            ConversationSendMessageRequest(
+                content="余额不足时不能提交",
+                client_message_id="minimum-balance-rejected",
+            ),
+        )
+    assert insufficient.value.code == 40003
+
+    user.points_balance = 10
+    await db.commit()
+    _, assistant_message, points_cost = await conversation_service.send_conversation_message(
+        db,
+        text_conversation_db.conversation.id,
+        user,
+        ConversationSendMessageRequest(
+            content="余额达到门槛后可以提交",
+            client_message_id="minimum-balance-accepted",
+        ),
+    )
+
+    task_record = await db.get(
+        UserTaskRecord,
+        UUID(assistant_message.extra["task_record_id"]),
+    )
+    await db.refresh(user)
+    assert points_cost == 0
+    assert task_record.points_cost == 0
+    assert task_record.points_transaction_id is None
+    assert user.points_balance == 10
+
+
+@pytest.mark.asyncio
+async def test_deleting_conversation_interrupts_active_generation(
+    text_conversation_db,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        conversation_service.run_conversation_generation,
+        "apply_async",
+        lambda **kwargs: None,
+    )
+    db = text_conversation_db.session
+    _, assistant_message, _ = await conversation_service.send_conversation_message(
+        db,
+        text_conversation_db.conversation.id,
+        text_conversation_db.user,
+        ConversationSendMessageRequest(
+            content="生成一段介绍",
+            client_message_id="delete-active-turn",
+        ),
+    )
+    task_record_id = UUID(assistant_message.extra["task_record_id"])
+
+    deleted = await conversation_service.delete_conversation(
+        db,
+        text_conversation_db.conversation.id,
+        text_conversation_db.user.id,
+    )
+
+    await db.refresh(assistant_message)
+    task_record = await db.get(UserTaskRecord, task_record_id)
+    assert deleted.is_enabled is False
+    assert task_record.status == "failed"
+    assert task_record.extra["interrupted"] is True
+    assert assistant_message.status == "failed"
+    assert assistant_message.extra["task_status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_deleting_user_message_interrupts_its_active_generation(
+    text_conversation_db,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        conversation_service.run_conversation_generation,
+        "apply_async",
+        lambda **kwargs: None,
+    )
+    db = text_conversation_db.session
+    user_message, assistant_message, _ = await conversation_service.send_conversation_message(
+        db,
+        text_conversation_db.conversation.id,
+        text_conversation_db.user,
+        ConversationSendMessageRequest(
+            content="这条消息立即删除",
+            client_message_id="delete-user-message-turn",
+        ),
+    )
+    task_record_id = UUID(assistant_message.extra["task_record_id"])
+
+    await conversation_service.delete_conversation_message(
+        db,
+        text_conversation_db.conversation.id,
+        user_message.id,
+        text_conversation_db.user.id,
+    )
+
+    await db.refresh(assistant_message)
+    task_record = await db.get(UserTaskRecord, task_record_id)
+    assert task_record.status == "failed"
+    assert task_record.extra["interrupted"] is True
+    assert assistant_message.status == "failed"
+    assert assistant_message.extra["task_status"] == "failed"

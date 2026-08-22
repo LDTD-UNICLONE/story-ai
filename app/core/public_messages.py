@@ -5,6 +5,7 @@ from typing import Any
 
 
 INTERNAL_EXTRA_KEYS = {
+    "provider_cost_billing",
     "raw_failed_reason",
     "provider_response",
 }
@@ -28,6 +29,7 @@ PUBLIC_LITERAL_KEYS = {
 }
 
 _VENDOR_REPLACEMENTS = (
+    (re.compile(r"apimart", re.IGNORECASE), "模型服务"),
     (re.compile(r"comfly", re.IGNORECASE), "模型服务"),
     (re.compile(r"volcengine[_-]?ark", re.IGNORECASE), "模型服务"),
     (re.compile(r"\bark\b", re.IGNORECASE), "模型服务"),

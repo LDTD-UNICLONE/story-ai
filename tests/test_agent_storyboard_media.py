@@ -20,6 +20,10 @@ from app.services.agent_storyboard_media import (
     _storyboard_video_parameters,
     _video_item,
 )
+from app.services.agent_video_settings import (
+    provider_video_duration,
+    require_agent_video_defaults,
+)
 from app.services.agent_storyboard_video_inputs import (
     _compile_prompt,
     build_agent_storyboard_video_input,
@@ -139,6 +143,51 @@ def test_storyboard_video_config_and_primary_selection_contracts() -> None:
         history_id=uuid4(),
     )
     assert selection.expected_selection_revision == 1
+
+
+def test_automatic_mode_video_request_must_match_project_defaults() -> None:
+    selected_model_id = uuid4()
+    production = SimpleNamespace(
+        mode="automatic",
+        production_spec={
+            "video_model_id": str(selected_model_id),
+            "video_resolution": "1080p",
+        },
+    )
+
+    require_agent_video_defaults(production, selected_model_id, "1080p")
+
+    with pytest.raises(AppException, match="自动模式视频配置") as model_error:
+        require_agent_video_defaults(production, uuid4(), "1080p")
+    assert model_error.value.code == 40987
+
+    with pytest.raises(AppException, match="自动模式视频配置") as resolution_error:
+        require_agent_video_defaults(production, selected_model_id, "720p")
+    assert resolution_error.value.code == 40987
+
+
+def test_supervised_mode_can_select_video_settings_per_storyboard() -> None:
+    production = SimpleNamespace(mode="supervised", production_spec={})
+
+    require_agent_video_defaults(production, uuid4(), "720p")
+
+
+def test_provider_managed_video_duration_is_not_sent_to_apimart() -> None:
+    gemini = SimpleNamespace(
+        vendor="apimart",
+        model_id="gemini-omni-flash-preview",
+        capabilities={},
+    )
+    seedance = SimpleNamespace(
+        vendor="apimart",
+        model_id="seedance-2.5",
+        capabilities={},
+    )
+    other = SimpleNamespace(vendor="other", model_id="video-model", capabilities={})
+
+    assert provider_video_duration(gemini, 8) is None
+    assert provider_video_duration(seedance, 8) == 8
+    assert provider_video_duration(other, 8) == 8
 
 
 def test_episode_video_signature_changes_with_model_resolution_or_episode_revision() -> None:

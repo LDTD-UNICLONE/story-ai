@@ -9,8 +9,7 @@ from app.core.config import settings
 from app.core.exceptions import AppException
 from app.core.public_messages import sanitize_public_message
 from app.db.session import create_worker_sessionmaker
-from app.integrations.comfly import close_comfly_client
-from app.integrations.volcengine_ark import close_volcengine_ark_client
+from app.integrations.model_providers import close_model_provider_clients
 from app.models.project_chapter import ProjectChapter
 from app.models.task_record import UserTaskRecord
 from app.services.points import change_user_points
@@ -60,8 +59,7 @@ async def _run_project_asset_analysis(
     try:
         await _execute_analysis(task_record_id, chapter_id, asset_type)
     finally:
-        await close_comfly_client()
-        await close_volcengine_ark_client()
+        await close_model_provider_clients()
 
 
 async def _execute_analysis(task_record_id: UUID, chapter_id: UUID, asset_type: str) -> None:

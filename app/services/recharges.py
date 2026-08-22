@@ -81,7 +81,7 @@ async def list_my_recharge_orders(
     count_result = await db.execute(select(func.count()).select_from(query.subquery()))
     total = count_result.scalar_one()
     result = await db.execute(
-        query.order_by(UserRechargeOrder.created_at.desc())
+        query.order_by(UserRechargeOrder.created_at.desc(), UserRechargeOrder.id.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
@@ -96,9 +96,6 @@ async def list_all_recharge_orders(
     page: int,
     page_size: int,
 ) -> Tuple[List[UserRechargeOrder], int]:
-    await purge_expired_pending_recharge_orders(db, limit=200)
-    await sync_pending_recharge_orders(db, limit=10)
-
     query = select(UserRechargeOrder)
     if user_id:
         query = query.where(UserRechargeOrder.user_id == user_id)
@@ -108,7 +105,7 @@ async def list_all_recharge_orders(
     count_result = await db.execute(select(func.count()).select_from(query.subquery()))
     total = count_result.scalar_one()
     result = await db.execute(
-        query.order_by(UserRechargeOrder.created_at.desc())
+        query.order_by(UserRechargeOrder.created_at.desc(), UserRechargeOrder.id.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
@@ -147,10 +144,17 @@ async def get_recharge_order_or_404(db: AsyncSession, order_id: UUID) -> UserRec
     order = await resolve_expired_pending_recharge_order(db, order)
     if order is None:
         raise AppException("充值订单不存在", code=40440, status_code=404)
+    return order
+
+
+async def sync_recharge_order_status(
+    db: AsyncSession,
+    order: UserRechargeOrder,
+) -> UserRechargeOrder:
     if order.status == "pending":
-        order = await sync_recharge_order_from_wechat(db, order)
-    elif order.status == "refunding":
-        order = await sync_refund_order_from_wechat(db, order)
+        return await sync_recharge_order_from_wechat(db, order)
+    if order.status == "refunding":
+        return await sync_refund_order_from_wechat(db, order)
     return order
 
 
@@ -187,27 +191,6 @@ async def sync_user_pending_recharge_orders(
     refund_result = await db.execute(
         select(UserRechargeOrder)
         .where(UserRechargeOrder.user_id == user_id, UserRechargeOrder.status == "refunding")
-        .order_by(UserRechargeOrder.updated_at.asc())
-        .limit(limit)
-    )
-    for order in refund_result.scalars().all():
-        await sync_refund_order_from_wechat(db, order)
-
-
-async def sync_pending_recharge_orders(db: AsyncSession, *, limit: int = 10) -> None:
-    await purge_expired_pending_recharge_orders(db, limit=max(limit, 200))
-    result = await db.execute(
-        select(UserRechargeOrder)
-        .where(UserRechargeOrder.status == "pending")
-        .order_by(UserRechargeOrder.created_at.desc())
-        .limit(limit)
-    )
-    for order in result.scalars().all():
-        await sync_recharge_order_from_wechat(db, order)
-
-    refund_result = await db.execute(
-        select(UserRechargeOrder)
-        .where(UserRechargeOrder.status == "refunding")
         .order_by(UserRechargeOrder.updated_at.asc())
         .limit(limit)
     )

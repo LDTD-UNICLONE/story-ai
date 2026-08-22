@@ -85,7 +85,12 @@ async def admin_update_user(
     db: AsyncSession = Depends(get_db),
     current_admin: User = Depends(get_current_admin_user),
 ):
-    user = await update_user(db, user_id, payload)
+    user = await update_user(
+        db,
+        user_id,
+        payload,
+        current_admin_id=current_admin.id,
+    )
     return success(data=UserOut.model_validate(user).model_dump(mode="json"), message="更新成功")
 
 

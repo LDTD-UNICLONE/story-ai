@@ -53,6 +53,15 @@ class UserTaskRecord(Base, TimestampMixin):
                 "provider_task_id IS NOT NULL AND status IN ('pending', 'running')"
             ),
         ),
+        Index(
+            "ix_user_task_records_success_points_unsettled",
+            "updated_at",
+            "id",
+            postgresql_where=text(
+                "status = 'success' AND business_type = 'conversation' "
+                "AND extra ->> 'points_settled' = 'false'"
+            ),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

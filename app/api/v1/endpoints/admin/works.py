@@ -44,7 +44,7 @@ async def admin_work_detail(
     db: AsyncSession = Depends(get_db),
     current_admin: User = Depends(get_current_admin_user),
 ):
-    work = await get_work_detail(db, work_id, current_admin)
+    work = await get_work_detail(db, work_id, current_admin, increment_view=False)
     return success(data=work.model_dump(mode="json"))
 
 

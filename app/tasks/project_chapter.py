@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from types import SimpleNamespace
 from typing import Optional
 from uuid import UUID
 
@@ -13,12 +12,12 @@ from app.core.logging import log_extra
 from app.core.public_messages import sanitize_public_message
 from app.core.timezone import beijing_datetime
 from app.db.session import create_worker_sessionmaker
-from app.integrations.comfly import close_comfly_client
-from app.integrations.volcengine_ark import close_volcengine_ark_client
+from app.integrations.model_providers import close_model_provider_clients
 from app.models.ai_model import AiModel
 from app.models.project_chapter import ProjectChapter
 from app.models.task_record import UserTaskRecord
 from app.services.model_points import settle_text_task_points
+from app.services.model_configuration import build_model_runtime_snapshot
 from app.services.model_runner import run_model
 from app.services.points import change_user_points
 from app.services.prompts import render_system_prompt
@@ -71,8 +70,7 @@ async def _run_project_chapter_processing(task_record_id: UUID, chapter_id: UUID
             timeout=_chapter_processing_timeout_seconds(),
         )
     finally:
-        await close_comfly_client()
-        await close_volcengine_ark_client()
+        await close_model_provider_clients()
 
 
 def _chapter_processing_timeout_seconds() -> int:
@@ -111,14 +109,7 @@ async def _execute_processing(task_record_id: UUID, chapter_id: UUID) -> None:
             await _mark_failed(db, task_record, chapter, "文本模型不存在或已禁用", refund=True)
             return
 
-        model_snapshot = SimpleNamespace(
-            id=ai_model.id,
-            model_id=ai_model.model_id,
-            vendor=ai_model.vendor,
-            nickname=ai_model.nickname,
-            points_cost=ai_model.points_cost,
-            capabilities=ai_model.capabilities or {},
-        )
+        model_snapshot = build_model_runtime_snapshot(ai_model)
         try:
             model_prompt = _resolve_model_prompt(task_record, chapter)
             task_record.extra = {

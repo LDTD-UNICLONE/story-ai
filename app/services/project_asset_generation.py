@@ -5,11 +5,10 @@ from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import AppException
 from app.core.timezone import beijing_datetime
-from app.integrations import comfly
+from app.integrations import apimart, comfly
 from app.models.ai_model import AiModel
 from app.models.agent_story_bible import AgentAssetVariant
 from app.models.project import Project
@@ -20,7 +19,11 @@ from app.schemas.project_asset import ProjectAssetImageGenerateRequest
 from app.services.generated_media import persist_generated_media_to_oss
 from app.services.core_asset_change_tracking import track_core_asset_reference_change
 from app.core.config import settings
-from app.services.model_points import calculate_submission_points_cost
+from app.services.model_points import (
+    calculate_submission_points_cost,
+    settle_image_task_points,
+)
+from app.services.model_configuration import build_model_runtime_snapshot
 from app.services.model_runner import ModelRunResult, query_model_task, run_model
 from app.services.points import change_user_points, consume_user_points
 from app.services.prompts import load_constant_prompt
@@ -29,6 +32,9 @@ from app.services.project_generated_assets import (
     extract_result_urls,
 )
 from app.services.project_assets import get_project_asset_or_404
+from app.services.projects import (
+    get_owned_enabled_project_with_style_or_404 as get_project_with_style_or_404,
+)
 from app.services.provider_polling import provider_poll_interval_seconds
 from app.services.task_records import (
     create_user_task_record,
@@ -97,7 +103,7 @@ async def submit_asset_image_generation(
         "aspect_ratio": generation_ratio,
         "generation_mode": generation_mode,
     }
-    _validate_comfly_asset_image_request(ai_model, prompt, extra)
+    _validate_asset_image_request(ai_model, prompt, extra)
     points_cost = calculate_submission_points_cost(ai_model, "image", extra)
 
     points_transaction = None
@@ -157,9 +163,12 @@ async def submit_asset_image_generation(
     return asset, task_record, points_cost
 
 
-def _validate_comfly_asset_image_request(
+def _validate_asset_image_request(
     ai_model: AiModel, prompt: str, extra: Dict[str, Any]
 ) -> None:
+    if ai_model.vendor == apimart.APIMART_VENDOR:
+        apimart.validate_image_request(ai_model.model_id, prompt, extra)
+        return
     if ai_model.vendor not in {"comfly", "模型服务"}:
         return
     comfly.validate_image_request(ai_model.model_id, prompt, extra)
@@ -188,14 +197,7 @@ async def run_asset_image_generation_in_worker(
     if ai_model is None:
         raise AppException("图像模型不存在或已禁用", code=40404, status_code=404)
 
-    model_snapshot = SimpleNamespace(
-        id=ai_model.id,
-        model_id=ai_model.model_id,
-        vendor=ai_model.vendor,
-        nickname=ai_model.nickname,
-        points_cost=ai_model.points_cost,
-        capabilities=ai_model.capabilities or {},
-    )
+    model_snapshot = build_model_runtime_snapshot(ai_model)
     model_result = await run_model(
         model_snapshot,
         "image",
@@ -301,6 +303,13 @@ async def run_asset_image_generation_in_worker(
         "oss_image_url": image_url,
         "generated_asset_history_id": str(history.id),
     }
+    await settle_image_task_points(
+        db,
+        task_record,
+        ai_model,
+        model_result.extra,
+        remark_prefix="资产图像生成",
+    )
 
 
 async def _task_asset_variant(
@@ -345,26 +354,6 @@ def _set_image_generation_state(
     else:
         asset.extra = updated
     target.updated_at = beijing_datetime()
-
-
-async def get_project_with_style_or_404(
-    db: AsyncSession, project_id: UUID, user_id: UUID
-) -> Project:
-    result = await db.execute(
-        select(Project)
-        .options(selectinload(Project.style))
-        .where(
-            Project.id == project_id,
-            Project.user_id == user_id,
-            Project.is_enabled.is_(True),
-        )
-    )
-    project = result.scalar_one_or_none()
-    if project is None:
-        raise AppException("项目不存在", code=40407, status_code=404)
-    if project.style is None or not project.style.is_enabled:
-        raise AppException("项目风格不存在或未启用", code=40403, status_code=404)
-    return project
 
 
 async def get_enabled_image_model_or_404(db: AsyncSession, ai_model_id: UUID) -> AiModel:

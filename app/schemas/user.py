@@ -46,6 +46,13 @@ class AdminUserCreateRequest(SchemaBaseModel):
     is_enabled: bool = True
     points_balance: int = Field(default=0, ge=0)
 
+    @field_validator("account", "nickname", mode="before")
+    @classmethod
+    def normalize_required_strings(cls, value: object) -> object:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("字段不能为空")
+        return value.strip()
+
     @field_validator("avatar", "phone", "email", mode="before")
     @classmethod
     def normalize_optional_strings(cls, value: object) -> object:
@@ -60,6 +67,22 @@ class AdminUserUpdateRequest(SchemaBaseModel):
     email: Optional[str] = Field(default=None, max_length=255)
     is_admin: Optional[bool] = None
     is_enabled: Optional[bool] = None
+
+    @field_validator("account", "nickname", mode="before")
+    @classmethod
+    def normalize_present_required_strings(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("字段不能为 null")
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("字段不能为空")
+        return value.strip()
+
+    @field_validator("is_admin", "is_enabled", mode="before")
+    @classmethod
+    def reject_null_flags(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("字段不能为 null")
+        return value
 
     @field_validator("avatar", "phone", "email", mode="before")
     @classmethod

@@ -6,12 +6,11 @@ from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
 from app.core.exceptions import AppException
 from app.core.timezone import beijing_datetime
-from app.integrations import comfly
+from app.integrations import apimart, comfly
 from app.models.ai_model import AiModel
 from app.models.agent_story_bible import AgentAssetVariant
 from app.models.material import Material
@@ -22,7 +21,11 @@ from app.models.task_record import UserTaskRecord
 from app.models.user import User
 from app.schemas.project_storyboard import ProjectStoryboardImageGenerateRequest
 from app.services.generated_media import persist_generated_media_to_oss
-from app.services.model_points import calculate_submission_points_cost
+from app.services.model_points import (
+    calculate_submission_points_cost,
+    settle_image_task_points,
+)
+from app.services.model_configuration import build_model_runtime_snapshot
 from app.services.model_runner import ModelRunResult, query_model_task, run_model
 from app.services.points import change_user_points, consume_user_points
 from app.services.project_generated_assets import (
@@ -30,7 +33,9 @@ from app.services.project_generated_assets import (
     extract_result_urls,
 )
 from app.services.project_storyboards import get_project_storyboard_or_404
-from app.services.projects import get_project_or_404
+from app.services.projects import (
+    get_owned_enabled_project_with_style_or_404,
+)
 from app.services.provider_polling import provider_poll_interval_seconds
 from app.services.task_records import (
     create_user_task_record,
@@ -52,8 +57,7 @@ async def submit_storyboard_image_generation(
     *,
     agent_context: Optional[Dict[str, object]] = None,
 ) -> Tuple[UserTaskRecord, int]:
-    await get_project_or_404(db, project_id, user.id)
-    project = await _get_project_with_style_or_404(db, project_id, user.id)
+    project = await get_owned_enabled_project_with_style_or_404(db, project_id, user.id)
     storyboard = await get_project_storyboard_or_404(
         db, project_id, chapter_id, storyboard_id, user.id
     )
@@ -75,7 +79,7 @@ async def submit_storyboard_image_generation(
     )
     prompt = _build_storyboard_image_prompt(project, storyboard, reference_assets, payload.prompt)
     model_extra = _build_storyboard_image_extra(payload, reference_images)
-    _validate_comfly_storyboard_image_request(ai_model, prompt, model_extra)
+    _validate_storyboard_image_request(ai_model, prompt, model_extra)
     points_cost = calculate_submission_points_cost(ai_model, "image", model_extra)
 
     points_transaction = None
@@ -156,14 +160,7 @@ async def run_storyboard_image_generation_in_worker(
     if ai_model is None:
         raise AppException("图像模型不存在或已禁用", code=40404, status_code=404)
 
-    model_snapshot = SimpleNamespace(
-        id=ai_model.id,
-        model_id=ai_model.model_id,
-        vendor=ai_model.vendor,
-        nickname=ai_model.nickname,
-        points_cost=ai_model.points_cost,
-        capabilities=ai_model.capabilities or {},
-    )
+    model_snapshot = build_model_runtime_snapshot(ai_model)
     model_result = await run_model(
         model_snapshot,
         "image",
@@ -242,20 +239,13 @@ async def run_storyboard_image_generation_in_worker(
         "storyboard_image_result": image_url,
         "generated_asset_history_id": str(history.id),
     }
-
-
-async def _get_project_with_style_or_404(
-    db: AsyncSession, project_id: UUID, user_id: UUID
-) -> Project:
-    result = await db.execute(
-        select(Project)
-        .options(selectinload(Project.style))
-        .where(Project.id == project_id, Project.user_id == user_id, Project.is_enabled.is_(True))
+    await settle_image_task_points(
+        db,
+        task_record,
+        ai_model,
+        model_result.extra,
+        remark_prefix="分镜图像生成",
     )
-    project = result.scalar_one_or_none()
-    if project is None:
-        raise AppException("项目不存在", code=40407, status_code=404)
-    return project
 
 
 async def _get_storyboard_image_model_or_404(
@@ -274,7 +264,11 @@ async def _get_storyboard_image_model_or_404(
             AiModel.model_type == "image",
             AiModel.is_enabled.is_(True),
         )
-        .order_by(AiModel.created_at.desc())
+        .order_by(
+            AiModel.is_agent_default.desc(),
+            AiModel.created_at.desc(),
+            AiModel.id.desc(),
+        )
         .limit(1)
     )
     ai_model = result.scalar_one_or_none()
@@ -298,9 +292,12 @@ def _build_storyboard_image_extra(
     return extra
 
 
-def _validate_comfly_storyboard_image_request(
+def _validate_storyboard_image_request(
     ai_model: AiModel, prompt: str, extra: Dict[str, Any]
 ) -> None:
+    if ai_model.vendor == apimart.APIMART_VENDOR:
+        apimart.validate_image_request(ai_model.model_id, prompt, extra)
+        return
     if ai_model.vendor not in {"comfly", "模型服务"}:
         return
     comfly.validate_image_request(ai_model.model_id, prompt, extra)
@@ -327,7 +324,7 @@ def _build_storyboard_image_prompt(
     variant_text = _agent_variant_context_text(storyboard)
 
     parts = [
-        "请根据当前故事版镜头和参考资产生成一张故事版图像，每一个分镜头下需要使用中文标注清楚信息，镜头时长，整体氛围，背景音乐，底部灯光，情绪，摄影机位变化等等可以根据内容多分镜头，但是要保证场景、人物等资产的真实逻辑。不能出现气泡文字，不能出现字幕等。所有的参数都是在镜头图像下面标注，每个镜头要标注清楚",
+        "请根据当前故事版镜头和参考资产生成一张纯画面的故事版图像。按当前图像提示词中的镜头顺序呈现必要画格，每个画格只包含视觉内容，不添加说明文字、时长、参数、字幕或气泡文字。保持场景、人物和道具符合剧情逻辑。",
         f"整体画面风格：{style_prompt}",
         f"当前分镜标题：{title}",
         f"当前镜头图像提示词：{image_prompt}",
@@ -348,7 +345,7 @@ def _build_storyboard_image_prompt(
             "4. 不生成连续视频动作。",
             "5. 不新增当前分镜之外的人物、场景、道具或剧情。",
             "6. 不生成角色设定图、场景设定图、道具设定图、封面图或海报图。",
-            "7. 画面中不得出现字幕、气泡文字、台词文字、屏幕文字、水印、标志或界面元素。",
+            "7. 画面及画格边缘不得出现参数说明、镜头编号、时长、字幕、气泡文字、台词文字、屏幕文字、水印、标志或界面元素。",
             "负面规避：",
             negative_prompt,
         ]

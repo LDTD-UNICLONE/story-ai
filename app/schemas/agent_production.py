@@ -10,7 +10,9 @@ from app.schemas.style import StyleBaseOut
 
 
 AgentProductionMode = Literal["supervised", "automatic"]
-AgentVideoResolution = Literal["480p", "720p", "1080p", "4k"]
+AgentVideoResolution = Literal[
+    "360p", "480p", "540p", "720p", "768P", "1080p", "2K", "4k"
+]
 AgentProductionAction = Literal["start", "pause", "resume", "cancel"]
 AgentProductionStatus = Literal[
     "draft",

@@ -44,7 +44,9 @@ async def list_users(
     total = total_result.scalar_one()
 
     result = await db.execute(
-        query.order_by(User.created_at.asc()).offset((page - 1) * page_size).limit(page_size)
+        query.order_by(User.created_at.asc(), User.id.asc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
     )
     return list(result.scalars().all()), total
 
@@ -99,9 +101,23 @@ async def create_user(db: AsyncSession, payload: AdminUserCreateRequest) -> User
     return user
 
 
-async def update_user(db: AsyncSession, user_id: UUID, payload: AdminUserUpdateRequest) -> User:
+async def update_user(
+    db: AsyncSession,
+    user_id: UUID,
+    payload: AdminUserUpdateRequest,
+    *,
+    current_admin_id: UUID,
+) -> User:
     user = await get_user_or_404(db, user_id)
     update_data = payload.model_dump(exclude_unset=True)
+    if user_id == current_admin_id and (
+        update_data.get("is_admin") is False or update_data.get("is_enabled") is False
+    ):
+        raise AppException(
+            "不能取消当前登录管理员的权限或禁用其账号",
+            code=40001,
+            status_code=400,
+        )
 
     unique_conditions = []
     if "account" in update_data and update_data["account"] != user.account:

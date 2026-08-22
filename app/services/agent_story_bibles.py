@@ -1211,17 +1211,33 @@ async def _get_context(
 ) -> StoryBibleContext:
     production = await _get_production(db, production_id, user_id, lock=lock)
     source_result = await db.execute(
-        select(AgentStep).where(
+        select(AgentStep)
+        .where(
             AgentStep.production_id == production.id,
             AgentStep.stage == "source_analysis",
         )
+        .order_by(
+            AgentStep.input_version.desc(),
+            AgentStep.created_at.desc(),
+            AgentStep.id.desc(),
+        )
+        .limit(1)
     )
     source_step = source_result.scalar_one_or_none()
     if source_step is None:
         raise AppException("全剧分析步骤不存在", code=40928, status_code=409)
-    story_query = select(AgentStep).where(
-        AgentStep.production_id == production.id,
-        AgentStep.stage == "story_bible",
+    story_query = (
+        select(AgentStep)
+        .where(
+            AgentStep.production_id == production.id,
+            AgentStep.stage == "story_bible",
+        )
+        .order_by(
+            AgentStep.input_version.desc(),
+            AgentStep.created_at.desc(),
+            AgentStep.id.desc(),
+        )
+        .limit(1)
     )
     if lock:
         story_query = story_query.with_for_update(of=AgentStep)

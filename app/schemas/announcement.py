@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from app.core.announcement_security import (
     safe_announcement_url,
@@ -66,6 +66,20 @@ class AnnouncementCreateRequest(SchemaBaseModel):
     end_at: Optional[datetime] = None
     is_enabled: bool = True
 
+    @field_validator("title", "announcement_type", "display_position", mode="before")
+    @classmethod
+    def normalize_required_text(cls, value: object) -> object:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("字段不能为空")
+        return value.strip()
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def reject_blank_content(cls, value: object) -> object:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("公告内容不能为空")
+        return value
+
 
 class AnnouncementUpdateRequest(SchemaBaseModel):
     title: Optional[str] = Field(default=None, min_length=1, max_length=128)
@@ -80,6 +94,33 @@ class AnnouncementUpdateRequest(SchemaBaseModel):
     start_at: Optional[datetime] = None
     end_at: Optional[datetime] = None
     is_enabled: Optional[bool] = None
+
+    @field_validator("title", "announcement_type", "display_position", mode="before")
+    @classmethod
+    def normalize_present_required_text(cls, value: object) -> object:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("字段不能为空")
+        return value.strip()
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def reject_present_blank_content(cls, value: object) -> object:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("公告内容不能为空")
+        return value
+
+    @field_validator(
+        "content_format",
+        "style_config",
+        "sort_order",
+        "is_enabled",
+        mode="before",
+    )
+    @classmethod
+    def reject_null_non_nullable_fields(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("字段不能为 null")
+        return value
 
 
 class AnnouncementPreviewOut(AnnouncementBaseOut):

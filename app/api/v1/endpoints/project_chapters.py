@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.api.v1.endpoints.project_dependencies import require_standard_project
 from app.core.responses import success
 from app.db.session import get_db
 from app.models.user import User
@@ -21,7 +22,10 @@ from app.services.project_chapters import (
     update_project_chapter,
 )
 
-router = APIRouter(prefix="/projects/{project_id}/chapters")
+router = APIRouter(
+    prefix="/projects/{project_id}/chapters",
+    dependencies=[Depends(require_standard_project)],
+)
 
 
 @router.get("")

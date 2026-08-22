@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from types import SimpleNamespace
 from typing import Optional
 from uuid import UUID
@@ -13,13 +14,19 @@ from app.core.logging import log_extra
 from app.core.public_messages import sanitize_public_message
 from app.core.timezone import beijing_datetime
 from app.db.session import create_worker_sessionmaker
-from app.integrations.comfly import close_comfly_client
-from app.integrations.volcengine_ark import close_volcengine_ark_client
+from app.integrations.model_providers import close_model_provider_clients
+from app.integrations.apimart import APIMART_VENDOR, TextDeltaCallback
 from app.models.ai_model import AiModel
 from app.models.conversation import Conversation, ConversationMessage
 from app.models.task_record import UserTaskRecord
 from app.services.generated_media import persist_generated_media_to_oss
-from app.services.model_points import settle_text_task_points, settle_video_task_points
+from app.services.apimart_private_avatars import prepare_private_avatar_references
+from app.services.model_points import (
+    settle_image_task_points,
+    settle_text_task_points,
+    settle_video_task_points,
+)
+from app.services.model_configuration import build_model_runtime_snapshot
 from app.services.model_runner import ModelRunResult, query_model_task, run_model
 from app.services.points import change_user_points
 from app.services.provider_polling import provider_poll_interval_seconds
@@ -34,6 +41,8 @@ from app.worker import celery_app
 
 WorkerSessionLocal = create_worker_sessionmaker()
 logger = logging.getLogger(__name__)
+APIMART_STREAM_FLUSH_CHARACTERS = 128
+APIMART_STREAM_FLUSH_SECONDS = 0.5
 
 
 @celery_app.task(
@@ -67,12 +76,68 @@ def run_conversation_generation(self, task_record_id: str, assistant_message_id:
         )
 
 
+@celery_app.task(
+    name="tasks.model_generation.settle_pending_conversation_points",
+    soft_time_limit=settings.effective_celery_task_soft_time_limit_seconds,
+    time_limit=settings.effective_celery_task_time_limit_seconds,
+)
+def settle_pending_conversation_points(limit: int = 100) -> int:
+    return asyncio.run(_settle_pending_conversation_points(max(1, limit)))
+
+
 async def _run_conversation_generation(task_record_id: UUID, assistant_message_id: UUID) -> None:
     try:
         await _execute_generation(task_record_id, assistant_message_id)
     finally:
-        await close_comfly_client()
-        await close_volcengine_ark_client()
+        await close_model_provider_clients()
+
+
+async def _settle_pending_conversation_points(limit: int) -> int:
+    async with WorkerSessionLocal() as db:
+        result = await db.execute(
+            select(UserTaskRecord.id)
+            .where(
+                UserTaskRecord.business_type == "conversation",
+                UserTaskRecord.status == "success",
+                UserTaskRecord.ai_model_id.is_not(None),
+                UserTaskRecord.extra["points_settled"].as_boolean().is_(False),
+            )
+            .order_by(UserTaskRecord.updated_at.asc(), UserTaskRecord.id.asc())
+            .limit(limit)
+        )
+        task_record_ids = list(result.scalars().all())
+
+    settled_count = 0
+    for task_record_id in task_record_ids:
+        async with WorkerSessionLocal() as db:
+            try:
+                result = await db.execute(
+                    select(UserTaskRecord)
+                    .where(UserTaskRecord.id == task_record_id)
+                    .with_for_update(skip_locked=True)
+                )
+                task_record = result.scalar_one_or_none()
+                if (
+                    task_record is None
+                    or task_record.status != "success"
+                    or (task_record.extra or {}).get("points_settled") is not False
+                ):
+                    await db.rollback()
+                    continue
+                ai_model = await db.get(AiModel, task_record.ai_model_id)
+                if ai_model is None:
+                    await db.rollback()
+                    continue
+                await _settle_completed_conversation_task(db, task_record, ai_model)
+                await db.commit()
+                settled_count += 1
+            except Exception:
+                await db.rollback()
+                logger.exception(
+                    "Conversation points settlement recovery failed: task_record_id=%s",
+                    task_record_id,
+                )
+    return settled_count
 
 
 async def _fail_generation(
@@ -112,6 +177,17 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
                     reason="missing_task_or_message",
                 ),
             )
+            return
+        if task_record.status == "success":
+            if not (task_record.extra or {}).get("points_settled"):
+                ai_model = await db.get(AiModel, task_record.ai_model_id)
+                if ai_model is not None:
+                    await _settle_completed_conversation_task(
+                        db,
+                        task_record,
+                        ai_model,
+                    )
+                    await db.commit()
             return
         if not prepare_task_execution(task_record):
             logger.info(
@@ -155,26 +231,56 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
             )
             return
 
-        model_snapshot = SimpleNamespace(
-            id=ai_model.id,
-            model_id=ai_model.model_id,
-            vendor=ai_model.vendor,
-            nickname=ai_model.nickname,
-            points_cost=ai_model.points_cost,
-            capabilities=ai_model.capabilities or {},
-        )
+        model_snapshot = build_model_runtime_snapshot(ai_model)
 
         try:
+            run_kwargs = {"idempotency_key": str(task_record.id)}
+            if (
+                ai_model.vendor == APIMART_VENDOR
+                and task_record.generation_type == "text"
+            ):
+                run_kwargs["text_stream"] = True
+                run_kwargs["on_text_delta"] = _build_apimart_text_delta_callback(
+                    db,
+                    assistant_message,
+                )
+            generation_extra = (task_record.extra or {}).get("user_message_extra") or {}
+            if (
+                ai_model.vendor == APIMART_VENDOR
+                and task_record.generation_type == "video"
+            ):
+                prepared_extra = await prepare_private_avatar_references(
+                    db,
+                    task_record,
+                    ai_model.model_id,
+                    generation_extra,
+                )
+                if prepared_extra is None:
+                    assistant_message.extra = {
+                        **(assistant_message.extra or {}),
+                        "task_status": "running",
+                        "provider_stage": "private_avatar_review",
+                        "private_avatar": (task_record.extra or {}).get("private_avatar") or {},
+                    }
+                    await db.commit()
+                    _enqueue_provider_reconcile_if_needed(task_record)
+                    return
+                generation_extra = prepared_extra
             model_result = await run_model(
                 model_snapshot,
                 task_record.generation_type,
                 task_record.prompt,
-                (task_record.extra or {}).get("user_message_extra") or {},
-                idempotency_key=str(task_record.id),
+                generation_extra,
+                **run_kwargs,
             )
             if record_provider_task_state(task_record, model_result.extra, ai_model.vendor):
                 task_record.extra = {
                     **(task_record.extra or {}),
+                    **(
+                        {"provider_stage": "video_generation"}
+                        if task_record.generation_type == "video"
+                        else {}
+                    ),
                     "assistant_message_extra": model_result.extra,
                     "assistant_message_id": str(assistant_message.id),
                 }
@@ -253,13 +359,42 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
             ),
         )
 
-        if task_record.generation_type == "text":
-            await _settle_text_points_after_success(
-                db, task_record.id, ai_model, model_result.extra
-            )
-        elif task_record.generation_type == "video":
-            await _settle_video_points_after_success(db, task_record.id, ai_model)
+        await _settle_points_after_success(db, task_record.id, ai_model)
         _enqueue_provider_reconcile_if_needed(task_record)
+
+
+def _build_apimart_text_delta_callback(
+    db,
+    assistant_message: ConversationMessage,
+) -> TextDeltaCallback:
+    content_parts: list[str] = []
+    pending_characters = 0
+    last_flush_at = time.monotonic()
+
+    async def persist_delta(delta: str) -> None:
+        nonlocal pending_characters, last_flush_at
+        content_parts.append(delta)
+        pending_characters += len(delta)
+        now = time.monotonic()
+        if (
+            pending_characters < APIMART_STREAM_FLUSH_CHARACTERS
+            and now - last_flush_at < APIMART_STREAM_FLUSH_SECONDS
+        ):
+            return
+
+        content = "".join(content_parts)
+        assistant_message.content = content
+        assistant_message.extra = {
+            **(assistant_message.extra or {}),
+            "task_status": "running",
+            "stream_started": True,
+            "streamed_character_count": len(content),
+        }
+        await db.commit()
+        pending_characters = 0
+        last_flush_at = now
+
+    return persist_delta
 
 
 async def _mark_failed(
@@ -326,45 +461,65 @@ def _failure_extra(exc: Exception) -> dict:
     return {}
 
 
-async def _settle_text_points_after_success(
+async def _settle_points_after_success(
     db,
     task_record_id: UUID,
     ai_model: AiModel,
-    model_result_extra: dict,
 ) -> None:
-    task_record = await db.get(UserTaskRecord, task_record_id)
+    result = await db.execute(
+        select(UserTaskRecord)
+        .where(UserTaskRecord.id == task_record_id)
+        .with_for_update()
+    )
+    task_record = result.scalar_one_or_none()
     if task_record is None or task_record.status != "success":
         return
     try:
-        await settle_text_task_points(
-            db,
-            task_record,
-            ai_model,
-            model_result_extra,
-            remark_prefix="对话模型调用",
-        )
+        await _settle_completed_conversation_task(db, task_record, ai_model)
         await db.commit()
     except Exception:
         await db.rollback()
-        task_record = await db.get(UserTaskRecord, task_record_id)
+        result = await db.execute(
+            select(UserTaskRecord)
+            .where(UserTaskRecord.id == task_record_id)
+            .with_for_update()
+        )
+        task_record = result.scalar_one_or_none()
         if task_record is None or task_record.status != "success":
             return
         task_record.extra = {
             **(task_record.extra or {}),
             "points_settlement_failed": "积分结算失败，已保留生成结果",
+            "points_settled": False,
         }
         await db.commit()
 
 
-async def _settle_video_points_after_success(
+async def _settle_completed_conversation_task(
     db,
-    task_record_id: UUID,
+    task_record: UserTaskRecord,
     ai_model: AiModel,
 ) -> None:
-    task_record = await db.get(UserTaskRecord, task_record_id)
-    if task_record is None or task_record.status != "success":
+    if (task_record.extra or {}).get("points_settled"):
         return
-    try:
+    result_extra = _conversation_model_result_extra(task_record)
+    if task_record.generation_type == "text":
+        await settle_text_task_points(
+            db,
+            task_record,
+            ai_model,
+            result_extra,
+            remark_prefix="对话模型调用",
+        )
+    elif task_record.generation_type == "image":
+        await settle_image_task_points(
+            db,
+            task_record,
+            ai_model,
+            result_extra,
+            remark_prefix="对话图像生成",
+        )
+    elif task_record.generation_type == "video":
         await settle_video_task_points(
             db,
             task_record,
@@ -372,17 +527,15 @@ async def _settle_video_points_after_success(
             (task_record.extra or {}).get("user_message_extra") or {},
             remark_prefix="对话视频生成",
         )
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        task_record = await db.get(UserTaskRecord, task_record_id)
-        if task_record is None or task_record.status != "success":
-            return
-        task_record.extra = {
-            **(task_record.extra or {}),
-            "points_settlement_failed": "积分结算失败，已保留生成结果",
-        }
-        await db.commit()
+
+
+def _conversation_model_result_extra(task_record: UserTaskRecord) -> dict:
+    extra = task_record.extra or {}
+    for key in ("assistant_message_extra", "model_result_extra"):
+        value = extra.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
 
 
 async def _mark_retrying(

@@ -8,11 +8,16 @@ from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
 from app.core.exceptions import AppException
 from app.core.timezone import beijing_datetime
+from app.integrations.apimart import APIMART_VENDOR
+from app.integrations.apimart_video_specs import (
+    merge_video_capabilities as merge_apimart_video_capabilities,
+    normalize_video_duration as normalize_apimart_video_duration,
+    normalize_video_resolution as normalize_apimart_video_resolution,
+)
 from app.integrations.comfly_video_specs import (
     merge_video_capabilities as merge_comfly_video_capabilities,
 )
@@ -33,7 +38,16 @@ from app.models.task_record import UserTaskRecord
 from app.models.user import User
 from app.schemas.project_storyboard import ProjectStoryboardVideoGenerateRequest
 from app.services.generated_media import persist_generated_media_to_oss
-from app.services.model_points import calculate_submission_points_cost, settle_video_task_points
+from app.services.apimart_private_avatars import prepare_private_avatar_references
+from app.services.model_points import (
+    calculate_submission_points_cost,
+    ensure_model_minimum_balance,
+    settle_video_task_points,
+)
+from app.services.model_configuration import (
+    build_model_runtime_snapshot,
+    model_request_capabilities,
+)
 from app.services.model_runner import ModelRunResult, query_model_task, run_model
 from app.services.points import change_user_points, consume_user_points
 from app.services.project_generated_assets import (
@@ -41,7 +55,9 @@ from app.services.project_generated_assets import (
 )
 from app.services.project_storyboards import get_project_storyboard_or_404
 from app.services.provider_polling import provider_poll_interval_seconds
-from app.services.projects import get_project_or_404
+from app.services.projects import (
+    get_owned_enabled_project_with_style_or_404,
+)
 from app.services.task_records import (
     create_user_task_record,
     record_provider_task_state,
@@ -67,12 +83,10 @@ async def submit_storyboard_video_generation(
     *,
     agent_context: Optional[Dict[str, object]] = None,
 ) -> Tuple[UserTaskRecord, int]:
-    if not agent_context:
-        await get_project_or_404(db, project_id, user.id)
     storyboard = await get_project_storyboard_or_404(
         db, project_id, chapter_id, storyboard_id, user.id
     )
-    project = await _get_project_with_style_or_404(db, project_id, user.id)
+    project = await get_owned_enabled_project_with_style_or_404(db, project_id, user.id)
     ai_model = await _get_enabled_video_model_or_404(db, payload.ai_model_id)
     resolution = _normalize_storyboard_video_resolution(ai_model, payload.resolution)
     previous_ending_frame = await _previous_storyboard_ending_frame(
@@ -123,6 +137,18 @@ async def submit_storyboard_video_generation(
         reference_images,
         resolution,
     )
+    if ai_model.vendor == APIMART_VENDOR and not agent_context and payload.character_ids:
+        character_reference_images = await _asset_reference_images(
+            db,
+            ProjectCharacter,
+            project_id,
+            user.id,
+            payload.character_ids,
+        )
+        model_extra["private_avatar_image_urls"] = await resolve_storyboard_reference_image_urls(
+            db,
+            _dedupe(character_reference_images),
+        )
     compiled_agent_prompt = str(
         (agent_context or {}).get("agent_compiled_prompt") or ""
     ).strip()
@@ -136,6 +162,7 @@ async def submit_storyboard_video_generation(
         previous_ending_frame,
         model_extra,
     )
+    await ensure_model_minimum_balance(db, user.id, ai_model)
     points_cost = calculate_submission_points_cost(ai_model, "video", model_extra)
 
     points_transaction = None
@@ -226,24 +253,36 @@ async def run_storyboard_video_generation_in_worker(
     if ai_model is None:
         raise AppException("视频模型不存在或已禁用", code=40404, status_code=404)
 
-    model_snapshot = SimpleNamespace(
-        id=ai_model.id,
-        model_id=ai_model.model_id,
-        vendor=ai_model.vendor,
-        nickname=ai_model.nickname,
-        points_cost=ai_model.points_cost,
-        capabilities=ai_model.capabilities or {},
-    )
+    model_snapshot = build_model_runtime_snapshot(ai_model)
+    generation_extra = (task_record.extra or {}).get("model_extra") or {}
+    if ai_model.vendor == APIMART_VENDOR:
+        prepared_extra = await prepare_private_avatar_references(
+            db,
+            task_record,
+            ai_model.model_id,
+            generation_extra,
+        )
+        if prepared_extra is None:
+            storyboard.extra = {
+                **(storyboard.extra or {}),
+                "video_generation_status": "running",
+                "video_generation_stage": "private_avatar_review",
+                "video_generation_task_record_id": str(task_record.id),
+                "private_avatar": (task_record.extra or {}).get("private_avatar") or {},
+            }
+            return
+        generation_extra = prepared_extra
     model_result = await run_model(
         model_snapshot,
         "video",
         task_record.prompt,
-        (task_record.extra or {}).get("model_extra") or {},
+        generation_extra,
         idempotency_key=str(task_record.id),
     )
     if record_provider_task_state(task_record, model_result.extra, ai_model.vendor):
         task_record.extra = {
             **(task_record.extra or {}),
+            "provider_stage": "video_generation",
             "model_result_extra": model_result.extra,
         }
         await db.commit()
@@ -293,20 +332,6 @@ async def run_storyboard_video_generation_in_worker(
         (task_record.extra or {}).get("model_extra") or {},
         remark_prefix="分镜视频生成",
     )
-
-
-async def _get_project_with_style_or_404(
-    db: AsyncSession, project_id: UUID, user_id: UUID
-) -> Project:
-    result = await db.execute(
-        select(Project)
-        .options(selectinload(Project.style))
-        .where(Project.id == project_id, Project.user_id == user_id, Project.is_enabled.is_(True))
-    )
-    project = result.scalar_one_or_none()
-    if project is None:
-        raise AppException("项目不存在", code=40407, status_code=404)
-    return project
 
 
 async def _previous_storyboard_ending_frame(
@@ -550,12 +575,13 @@ def _limit_reference_images_for_model(
 
 
 def storyboard_video_image_limit(ai_model: AiModel) -> Optional[int]:
+    saved = model_request_capabilities(ai_model)
     if ai_model.vendor == VOLCENGINE_ARK_VENDOR or is_volcengine_ark_video_model(ai_model.model_id):
-        capabilities = merge_ark_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
+        capabilities = merge_ark_video_capabilities(ai_model.model_id, saved)
+    elif ai_model.vendor == APIMART_VENDOR:
+        capabilities = merge_apimart_video_capabilities(ai_model.model_id, saved)
     else:
-        capabilities = merge_comfly_video_capabilities(
-            ai_model.model_id, ai_model.capabilities or {}
-        )
+        capabilities = merge_comfly_video_capabilities(ai_model.model_id, saved)
     media_limits = (capabilities or {}).get("media_limits") or {}
     raw_limit = media_limits.get("images")
     if isinstance(raw_limit, int) and raw_limit >= 0:
@@ -566,8 +592,13 @@ def storyboard_video_image_limit(ai_model: AiModel) -> Optional[int]:
 
 
 def _normalize_storyboard_video_resolution(ai_model: AiModel, resolution: str) -> str:
+    if ai_model.vendor == APIMART_VENDOR:
+        return normalize_apimart_video_resolution(ai_model.model_id, resolution)
     if ai_model.vendor == VOLCENGINE_ARK_VENDOR or is_volcengine_ark_video_model(ai_model.model_id):
-        capabilities = merge_ark_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
+        capabilities = merge_ark_video_capabilities(
+            ai_model.model_id,
+            model_request_capabilities(ai_model),
+        )
         if not is_video_resolution_supported(resolution, capabilities):
             raise AppException(
                 "当前火山方舟视频模型不支持该 resolution 参数", code=40012, status_code=400
@@ -612,12 +643,31 @@ def _build_storyboard_video_extra(
     extra["return_last_frame"] = payload.return_last_frame
     extra.setdefault("aspect_ratio", project.generation_ratio)
     extra.setdefault("ratio", project.generation_ratio)
-    min_duration_seconds = _video_min_duration_seconds(ai_model)
-    explicit_duration_seconds = _explicit_duration_seconds(extra, min_duration_seconds)
-    suggested_duration_seconds = _storyboard_duration_seconds(storyboard, min_duration_seconds)
-    if explicit_duration_seconds:
+    duration_capability = _video_duration_capability(ai_model)
+    explicit_duration_seconds = _explicit_duration_seconds(
+        extra,
+        ai_model,
+        duration_capability,
+        payload.generation_mode,
+    )
+    suggested_duration_seconds = (
+        _storyboard_duration_seconds(
+            storyboard,
+            duration_capability["min"],
+            duration_capability["max"],
+        )
+        if duration_capability["controllable"]
+        else None
+    )
+    if suggested_duration_seconds is not None and ai_model.vendor == APIMART_VENDOR:
+        suggested_duration_seconds = normalize_apimart_video_duration(
+            ai_model.model_id,
+            suggested_duration_seconds,
+            mode=payload.generation_mode,
+        )
+    if explicit_duration_seconds is not None:
         _set_video_duration_extra(extra, explicit_duration_seconds, "request_extra")
-    elif suggested_duration_seconds:
+    elif suggested_duration_seconds is not None:
         _set_video_duration_extra(
             extra, suggested_duration_seconds, "storyboard_duration_suggestion"
         )
@@ -925,38 +975,74 @@ def _as_list(value: Any) -> List[Any]:
 
 
 def _storyboard_duration_seconds(
-    storyboard: ProjectStoryboard, min_seconds: int = 5
+    storyboard: ProjectStoryboard,
+    min_seconds: int = 5,
+    max_seconds: int = 15,
 ) -> Optional[int]:
-    return _parse_duration_suggestion_seconds(storyboard.duration_suggestion, min_seconds)
+    return _parse_duration_suggestion_seconds(
+        storyboard.duration_suggestion,
+        min_seconds,
+        max_seconds,
+    )
 
 
-def _parse_duration_suggestion_seconds(value: Optional[str], min_seconds: int = 5) -> Optional[int]:
+def _parse_duration_suggestion_seconds(
+    value: Optional[str],
+    min_seconds: int = 5,
+    max_seconds: int = 15,
+) -> Optional[int]:
     if not value:
         return None
-    return _parse_duration_value_seconds(value, min_seconds)
+    return _parse_duration_value_seconds(value, min_seconds, max_seconds)
 
 
-def _explicit_duration_seconds(extra: Dict[str, Any], min_seconds: int = 5) -> Optional[int]:
+def _explicit_duration_seconds(
+    extra: Dict[str, Any],
+    ai_model: AiModel,
+    capability: Dict[str, Any],
+    generation_mode: str,
+) -> Optional[int]:
     for key in _duration_extra_keys():
-        seconds = _parse_duration_value_seconds(extra.get(key), min_seconds)
-        if seconds:
+        value = extra.get(key)
+        if value in (None, ""):
+            continue
+        if ai_model.vendor == APIMART_VENDOR:
+            return normalize_apimart_video_duration(
+                ai_model.model_id,
+                value,
+                mode=generation_mode,
+            )
+        seconds = _parse_duration_value_seconds(
+            value,
+            capability["min"],
+            capability["max"],
+        )
+        if seconds is not None:
             return seconds
     return None
 
 
-def _parse_duration_value_seconds(value: Any, min_seconds: int = 5) -> Optional[int]:
+def _parse_duration_value_seconds(
+    value: Any,
+    min_seconds: int = 5,
+    max_seconds: int = 15,
+) -> Optional[int]:
     if isinstance(value, bool) or value in (None, ""):
         return None
     if isinstance(value, (int, float)):
         if value <= 0:
             return None
-        return _clamp_video_duration_seconds(math.ceil(float(value)), min_seconds)
+        return _clamp_video_duration_seconds(
+            math.ceil(float(value)), min_seconds, max_seconds
+        )
     normalized = _normalize_duration_text(value)
     values = [float(item) for item in re.findall(r"\d+(?:\.\d+)?", normalized)]
     values.extend(_chinese_duration_numbers(normalized))
     if not values:
         return None
-    return _clamp_video_duration_seconds(math.ceil(max(values)), min_seconds)
+    return _clamp_video_duration_seconds(
+        math.ceil(max(values)), min_seconds, max_seconds
+    )
 
 
 def _normalize_duration_text(value: str) -> str:
@@ -999,8 +1085,12 @@ def _parse_chinese_number(value: str) -> Optional[int]:
     return None
 
 
-def _clamp_video_duration_seconds(seconds: int, min_seconds: int = 5) -> int:
-    return min(max(seconds, min_seconds), 15)
+def _clamp_video_duration_seconds(
+    seconds: int,
+    min_seconds: int = 5,
+    max_seconds: int = 15,
+) -> int:
+    return min(max(seconds, min_seconds), max_seconds)
 
 
 def _set_video_duration_extra(extra: Dict[str, Any], seconds: int, source: str) -> None:
@@ -1024,6 +1114,24 @@ def _video_min_duration_seconds(ai_model: AiModel) -> int:
     if ai_model.vendor == VOLCENGINE_ARK_VENDOR or is_volcengine_ark_video_model(ai_model.model_id):
         return 4
     return 5
+
+
+def _video_duration_capability(ai_model: AiModel) -> Dict[str, Any]:
+    if ai_model.vendor == APIMART_VENDOR:
+        duration = merge_apimart_video_capabilities(
+            ai_model.model_id,
+            model_request_capabilities(ai_model),
+        )["duration"]
+        return {
+            "min": int(duration["min"]),
+            "max": int(duration["max"]),
+            "controllable": bool(duration.get("controllable", True)),
+        }
+    return {
+        "min": _video_min_duration_seconds(ai_model),
+        "max": 15,
+        "controllable": True,
+    }
 
 
 def _first_generated_last_frame_url(extra: Dict[str, Any]) -> str:

@@ -1,12 +1,20 @@
-from typing import Any, Optional
+import asyncio
+import json
+import time
+from typing import Any, AsyncIterator, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.core.config import settings
+from app.core.public_messages import sanitize_public_message
 from app.core.responses import success
-from app.db.session import get_db
+from app.db.session import AsyncSessionLocal, get_db
+from app.models.conversation import ConversationMessage
+from app.models.task_record import UserTaskRecord
 from app.models.user import User
 from app.schemas.conversation import (
     ConversationCreateRequest,
@@ -34,8 +42,15 @@ from app.services.conversations import (
     send_conversation_message,
     update_conversation,
 )
+from app.services.task_records import task_record_progress_percent
 
 router = APIRouter(prefix="/conversations")
+SSE_POLL_INTERVAL_SECONDS = 0.5
+SSE_HEARTBEAT_SECONDS = 15
+SSE_MAX_CONNECTION_SECONDS = max(
+    60,
+    settings.effective_celery_task_time_limit_seconds + 30,
+)
 
 
 @router.get("")
@@ -190,15 +205,160 @@ async def my_conversation_generation_task(
         message=content,
         failed_reason=failed_reason,
         extra=task_record.extra or {},
-        assistant_message=ConversationMessageOut.model_validate(assistant_message) if assistant_message else None,
+        assistant_message=ConversationMessageOut.model_validate(assistant_message)
+        if assistant_message
+        else None,
         stop_polling=task_record.status in {"success", "failed"},
         next_poll_seconds=next_poll_seconds,
+        progress_percent=task_record_progress_percent(task_record),
         created_at=task_record.created_at,
         updated_at=task_record.updated_at,
     )
     if next_poll_seconds:
         response.headers["X-Next-Poll-Seconds"] = str(next_poll_seconds)
     return success(data=data.model_dump(mode="json"))
+
+
+@router.get("/{conversation_id}/generation-tasks/{task_record_id}/stream")
+async def stream_my_conversation_generation_task(
+    conversation_id: UUID,
+    task_record_id: UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    task_record, assistant_message = await get_conversation_generation_task_status(
+        db,
+        conversation_id=conversation_id,
+        user_id=current_user.id,
+        task_record_id=task_record_id,
+    )
+    assistant_message_id = assistant_message.id if assistant_message is not None else None
+    return StreamingResponse(
+        _conversation_generation_event_stream(
+            request,
+            task_record_id=task_record.id,
+            assistant_message_id=assistant_message_id,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _conversation_generation_event_stream(
+    request: Request,
+    *,
+    task_record_id: UUID,
+    assistant_message_id: Optional[UUID],
+) -> AsyncIterator[str]:
+    sent_content = ""
+    last_status: Optional[str] = None
+    last_progress_percent: Optional[int] = None
+    progress_sent = False
+    last_emit_at = time.monotonic()
+    connected_at = last_emit_at
+
+    while not await request.is_disconnected():
+        if time.monotonic() - connected_at >= SSE_MAX_CONNECTION_SECONDS:
+            yield _sse_event(
+                "reconnect",
+                {"status": last_status or "running", "stop_streaming": False},
+            )
+            return
+        async with AsyncSessionLocal() as stream_db:
+            task_record = await stream_db.get(UserTaskRecord, task_record_id)
+            assistant_message = (
+                await stream_db.get(ConversationMessage, assistant_message_id)
+                if assistant_message_id is not None
+                else None
+            )
+
+        if task_record is None:
+            yield _sse_event(
+                "failed",
+                {"status": "failed", "message": "任务记录不存在", "stop_streaming": True},
+            )
+            return
+
+        status = str(task_record.status or "pending")
+        stream_started = bool(
+            assistant_message is not None and (assistant_message.extra or {}).get("stream_started")
+        )
+        raw_content = conversation_task_content(task_record, assistant_message) or ""
+        content = sanitize_public_message(raw_content, fallback=raw_content)
+        progress_percent = task_record_progress_percent(task_record)
+
+        if status != last_status:
+            yield _sse_event(
+                "status",
+                {
+                    "task_record_id": str(task_record.id),
+                    "assistant_message_id": (
+                        str(assistant_message_id) if assistant_message_id else None
+                    ),
+                    "status": status,
+                },
+            )
+            last_status = status
+            last_emit_at = time.monotonic()
+
+        if progress_percent is not None and (
+            not progress_sent or progress_percent != last_progress_percent
+        ):
+            yield _sse_event(
+                "progress",
+                {
+                    "task_record_id": str(task_record.id),
+                    "assistant_message_id": (
+                        str(assistant_message_id) if assistant_message_id else None
+                    ),
+                    "status": status,
+                    "progress_percent": progress_percent,
+                },
+            )
+            last_progress_percent = progress_percent
+            progress_sent = True
+            last_emit_at = time.monotonic()
+
+        if stream_started and content != sent_content:
+            if sent_content and content.startswith(sent_content):
+                delta = content[len(sent_content) :]
+                event_name = "delta"
+                event_data = {"delta": delta, "content": content, "status": status}
+            else:
+                event_name = "snapshot"
+                event_data = {"content": content, "status": status}
+            sent_content = content
+            yield _sse_event(event_name, event_data)
+            last_emit_at = time.monotonic()
+
+        if status in {"success", "failed"}:
+            yield _sse_event(
+                "completed" if status == "success" else "failed",
+                {
+                    "task_record_id": str(task_record.id),
+                    "assistant_message_id": (
+                        str(assistant_message_id) if assistant_message_id else None
+                    ),
+                    "status": status,
+                    "progress_percent": progress_percent,
+                    "content": content,
+                    "stop_streaming": True,
+                },
+            )
+            return
+
+        if time.monotonic() - last_emit_at >= SSE_HEARTBEAT_SECONDS:
+            yield ": keep-alive\n\n"
+            last_emit_at = time.monotonic()
+        await asyncio.sleep(SSE_POLL_INTERVAL_SECONDS)
+
+
+def _sse_event(event: str, data: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def _parse_uuid(value: Any) -> Optional[UUID]:

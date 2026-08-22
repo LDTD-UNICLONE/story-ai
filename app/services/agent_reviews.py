@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from uuid import UUID, uuid4
 
 import httpx
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
@@ -18,47 +18,24 @@ from app.core.outbound_url import open_safe_http_response, trusted_oss_hosts
 from app.core.public_messages import sanitize_public_message
 from app.core.timezone import beijing_datetime
 from app.integrations.oss import OssClient
-from app.models.agent_production import AgentEvent, AgentProduction, AgentStep
-from app.models.agent_review import (
-    AgentDelivery,
-    AgentEpisodeReview,
-    AgentMediaRegeneration,
-    AgentReviewIssue,
-)
-from app.models.ai_model import AiModel
+from app.models.agent_production import AgentEvent, AgentProduction
+from app.models.agent_review import AgentDelivery, AgentEpisodeReview, AgentReviewIssue
 from app.models.project import Project
 from app.models.project_chapter import ProjectChapter
 from app.models.project_generated_asset import ProjectGeneratedAsset
 from app.models.project_storyboard import ProjectStoryboard
-from app.models.task_record import UserTaskRecord
 from app.models.user import User
 from app.schemas.agent_review import (
     AgentDeliveryCreateRequest,
     AgentEpisodeApproveRequest,
     AgentJianyingExportCreateRequest,
-    AgentMediaRegeneratePreviewRequest,
-    AgentMediaRegenerateRequest,
-    AgentMediaVersionSelectRequest,
     AgentReviewIssueCreateRequest,
     AgentReviewIssueUpdateRequest,
 )
-from app.schemas.project_storyboard import (
-    ProjectStoryboardImageGenerateRequest,
-    ProjectStoryboardVideoGenerateRequest,
-)
-from app.services.agent_storyboard_bindings import (
-    storyboard_asset_ids,
-    storyboard_estimated_duration_seconds,
-)
+from app.services.agent_storyboard_bindings import storyboard_estimated_duration_seconds
 from app.services.agent_storyboard_episode_state import (
     effective_storyboard_episode_status,
 )
-from app.services.agent_task_context import build_agent_task_context
-from app.services.model_points import calculate_submission_points_cost
-from app.services.points import ensure_user_points_enough
-from app.services.project_generated_assets import select_project_generated_asset_history
-from app.services.project_storyboard_images import submit_storyboard_image_generation
-from app.services.project_storyboard_videos import submit_storyboard_video_generation
 from app.services.agent_productions import get_agent_production_or_404
 from app.services.agent_production_state import transition_production_status
 
@@ -292,205 +269,6 @@ async def update_agent_review_issue(
     await db.commit()
     await db.refresh(issue)
     return issue
-
-
-async def preview_agent_media_regeneration(
-    db: AsyncSession,
-    production_id: UUID,
-    user_id: UUID,
-    payload: AgentMediaRegeneratePreviewRequest,
-) -> Dict[str, Any]:
-    production, _chapters, storyboards = await _review_scope(db, production_id, user_id)
-    selected = _select_storyboards(storyboards, payload.storyboard_ids)
-    model = await _production_media_model(db, production, payload.media_type)
-    unit_cost = _regeneration_unit_cost(production, model, payload.media_type)
-    chapter_ids = list(dict.fromkeys(item.chapter_id for item in selected))
-    reviews = await _episode_reviews(db, production.id)
-    review_by_chapter = {review.chapter_id: review for review in reviews}
-    invalidated_count = 0
-    for chapter_id in chapter_ids:
-        chapter_storyboards = [item for item in storyboards if item.chapter_id == chapter_id]
-        if _effective_review_status(
-            review_by_chapter.get(chapter_id),
-            _media_snapshot_hash(chapter_storyboards),
-        ) == "approved":
-            invalidated_count += 1
-    return {
-        "production_id": production.id,
-        "media_type": payload.media_type,
-        "storyboard_ids": [item.id for item in selected],
-        "affected_chapter_ids": chapter_ids,
-        "invalidated_approval_count": invalidated_count,
-        "estimated_points": unit_cost * len(selected),
-    }
-
-
-async def regenerate_agent_media(
-    db: AsyncSession,
-    production_id: UUID,
-    user: User,
-    payload: AgentMediaRegenerateRequest,
-) -> AgentMediaRegeneration:
-    preview = await preview_agent_media_regeneration(db, production_id, user.id, payload)
-    production, _chapters, storyboards = await _review_scope(db, production_id, user.id)
-    selected = _select_storyboards(storyboards, payload.storyboard_ids)
-    signature = _request_signature(payload)
-    selected_chapter_ids = {item.chapter_id for item in selected}
-    selected_chapters = [item for item in _chapters if item.id in selected_chapter_ids]
-    await _lock_review_scope(db, production, selected_chapters, selected)
-    result = await db.execute(
-        select(AgentMediaRegeneration).where(
-            AgentMediaRegeneration.production_id == production.id,
-            AgentMediaRegeneration.idempotency_key == payload.idempotency_key,
-        )
-    )
-    request = result.scalar_one_or_none()
-    if request is not None:
-        if (request.extra or {}).get("request_signature") != signature:
-            raise AppException("幂等键已用于其他重生成请求", code=40971, status_code=409)
-        if request.status == "submitted":
-            return request
-        request.status = "pending"
-        request.error_summary = None
-    else:
-        request = AgentMediaRegeneration(
-            production_id=production.id,
-            user_id=user.id,
-            media_type=payload.media_type,
-            idempotency_key=payload.idempotency_key,
-            status="pending",
-            items=[],
-            estimated_points=int(preview["estimated_points"]),
-            submitted_points=0,
-            extra={"request_signature": signature},
-        )
-        db.add(request)
-    await db.execute(
-        update(AgentEpisodeReview)
-        .where(
-            AgentEpisodeReview.production_id == production.id,
-            AgentEpisodeReview.chapter_id.in_([item.chapter_id for item in selected]),
-            AgentEpisodeReview.status == "approved",
-        )
-        .values(status="invalidated")
-    )
-    await db.commit()
-    await db.refresh(request)
-
-    submitted_ids = {str(item.get("storyboard_id")) for item in request.items or []}
-    try:
-        for storyboard in selected:
-            if str(storyboard.id) in submitted_ids:
-                continue
-            task_record, points_cost = await _submit_regeneration(
-                db,
-                production,
-                storyboard,
-                user,
-                payload,
-                request.id,
-            )
-            request.items = [
-                *(request.items or []),
-                {
-                    "storyboard_id": str(storyboard.id),
-                    "chapter_id": str(storyboard.chapter_id),
-                    "task_record_id": str(task_record.id),
-                    "points_cost": points_cost,
-                },
-            ]
-            request.submitted_points += points_cost
-            await db.execute(
-                update(AgentProduction)
-                .where(AgentProduction.id == production.id)
-                .values(
-                    estimated_points=AgentProduction.estimated_points + points_cost,
-                    consumed_points=AgentProduction.consumed_points + points_cost,
-                    lock_version=AgentProduction.lock_version + 1,
-                )
-            )
-            await db.commit()
-            await db.refresh(production)
-        request.status = "submitted"
-        db.add(
-            AgentEvent(
-                production_id=production.id,
-                actor_user_id=user.id,
-                event_type="review.media_regenerated",
-                source="user",
-                payload={
-                    "regeneration_id": str(request.id),
-                    "media_type": request.media_type,
-                    "storyboard_ids": [str(item.id) for item in selected],
-                    "points_cost": request.submitted_points,
-                    "idempotency_key": request.idempotency_key,
-                },
-            )
-        )
-        await db.commit()
-    except Exception as exc:
-        request.status = "failed"
-        request.error_summary = sanitize_public_message(str(exc) or "局部重生成提交失败")
-        await db.commit()
-        raise
-    await db.refresh(request)
-    return request
-
-
-async def select_agent_media_version(
-    db: AsyncSession,
-    production_id: UUID,
-    history_id: UUID,
-    user: User,
-    payload: AgentMediaVersionSelectRequest,
-) -> Dict[str, Any]:
-    production, _chapters, storyboards = await _review_scope(db, production_id, user.id)
-    history = await db.get(ProjectGeneratedAsset, history_id)
-    storyboard = next(
-        (
-            item
-            for item in storyboards
-            if history is not None
-            and history.target_type == "storyboard"
-            and history.target_id == item.id
-        ),
-        None,
-    )
-    if history is None or storyboard is None or history.project_id != production.project_id:
-        raise AppException("整剧媒体版本不存在", code=40443, status_code=404)
-    chapter = next(item for item in _chapters if item.id == storyboard.chapter_id)
-    await _lock_review_scope(db, production, [chapter], [storyboard])
-    selected, selected_url, _last_frame = await select_project_generated_asset_history(
-        db,
-        project_id=production.project_id,
-        user_id=user.id,
-        history_id=history.id,
-        target_type="storyboard",
-        target_id=storyboard.id,
-        media_type=history.media_type,
-        result_url=payload.result_url,
-    )
-    db.add(
-        AgentEvent(
-            production_id=production.id,
-            actor_user_id=user.id,
-            event_type="review.media_version_selected",
-            source="user",
-            payload={
-                "history_id": str(selected.id),
-                "storyboard_id": str(storyboard.id),
-                "media_type": selected.media_type,
-            },
-        )
-    )
-    await db.commit()
-    return {
-        "history_id": selected.id,
-        "storyboard_id": storyboard.id,
-        "media_type": selected.media_type,
-        "selected_url": selected_url,
-        "invalidated_chapter_id": storyboard.chapter_id,
-    }
 
 
 async def approve_agent_episode(
@@ -1075,149 +853,6 @@ def _require_reviewable_chapter(
             "chapter_id": str(chapter.id),
             "storyboard_analysis_status": status,
         },
-    )
-
-
-def _select_storyboards(
-    storyboards: Sequence[ProjectStoryboard], storyboard_ids: Sequence[UUID]
-) -> List[ProjectStoryboard]:
-    mapping = {item.id: item for item in storyboards}
-    selected = [mapping[value] for value in storyboard_ids if value in mapping]
-    if len(selected) != len(storyboard_ids):
-        raise AppException("部分重生成分镜不存在", code=40441, status_code=404)
-    return selected
-
-
-async def _production_media_model(
-    db: AsyncSession,
-    production: AgentProduction,
-    media_type: str,
-) -> AiModel:
-    model_id = _optional_uuid(
-        (production.production_spec or {}).get(
-            "image_model_id" if media_type == "image" else "video_model_id"
-        )
-    )
-    model = await db.get(AiModel, model_id) if model_id else None
-    if model is None or model.model_type != media_type or not model.is_enabled:
-        raise AppException(f"{media_type} 模型不存在、未启用或类型不匹配", code=40404, status_code=404)
-    return model
-
-
-def _regeneration_unit_cost(
-    production: AgentProduction,
-    model: AiModel,
-    media_type: str,
-) -> int:
-    extra = None
-    if media_type == "video":
-        extra = {
-            "duration_seconds": int(
-                (production.production_spec or {}).get("default_shot_duration_seconds") or 5
-            ),
-            "resolution": str(
-                (production.production_spec or {}).get("video_resolution") or "720p"
-            ),
-            "generate_audio": bool(
-                (production.production_spec or {}).get("generate_audio", False)
-            ),
-        }
-    return calculate_submission_points_cost(model, media_type, extra)
-
-
-async def _submit_regeneration(
-    db: AsyncSession,
-    production: AgentProduction,
-    storyboard: ProjectStoryboard,
-    user: User,
-    payload: AgentMediaRegenerateRequest,
-    regeneration_id: UUID,
-):
-    model = await _production_media_model(db, production, payload.media_type)
-    cost = _regeneration_unit_cost(production, model, payload.media_type)
-    if production.max_points is not None and production.consumed_points + cost > production.max_points:
-        raise AppException("整剧任务已达到积分预算上限", code=40052, status_code=400)
-    await ensure_user_points_enough(db, user.id, cost)
-    step_result = await db.execute(
-        select(AgentStep)
-        .where(AgentStep.production_id == production.id)
-        .order_by(AgentStep.created_at.desc())
-        .limit(1)
-    )
-    step = step_result.scalar_one_or_none()
-    if step is None:
-        raise AppException("整剧生产步骤不存在", code=40978, status_code=409)
-    attempt_result = await db.execute(
-        select(func.count())
-        .select_from(UserTaskRecord)
-        .where(
-            UserTaskRecord.user_id == user.id,
-            UserTaskRecord.business_id == production.project_id,
-            UserTaskRecord.extra["agent_production_id"].as_string() == str(production.id),
-            UserTaskRecord.extra["agent_scope_id"].as_string() == str(storyboard.id),
-            UserTaskRecord.generation_type
-            == ("storyboard_image" if payload.media_type == "image" else "storyboard_video"),
-        )
-    )
-    attempt_number = int(attempt_result.scalar_one() or 0) + 1
-    asset_ids = storyboard_asset_ids(storyboard)
-    context = build_agent_task_context(
-        production_id=production.id,
-        step_id=step.id,
-        stage=f"review_{payload.media_type}_regeneration",
-        scope_type="storyboard",
-        scope_id=storyboard.id,
-        attempt_number=attempt_number,
-    )
-    context["agent_regeneration_id"] = str(regeneration_id)
-    context["agent_regeneration_key"] = payload.idempotency_key
-    if payload.media_type == "image":
-        project = await db.get(Project, production.project_id)
-        return await submit_storyboard_image_generation(
-            db,
-            production.project_id,
-            storyboard.chapter_id,
-            storyboard.id,
-            user,
-            ProjectStoryboardImageGenerateRequest(
-                ai_model_id=model.id,
-                aspect_ratio=_image_aspect_ratio(project.generation_ratio if project else "16:9"),
-                prompt=payload.prompt,
-                character_ids=asset_ids["character"],
-                scene_ids=asset_ids["scene"],
-                prop_ids=asset_ids["prop"],
-            ),
-            agent_context=context,
-        )
-    image_url = _media_url(storyboard, "image")
-    if not image_url:
-        raise AppException("故事板图片结果不存在", code=40953, status_code=409)
-    return await submit_storyboard_video_generation(
-        db,
-        production.project_id,
-        storyboard.chapter_id,
-        storyboard.id,
-        user,
-        ProjectStoryboardVideoGenerateRequest(
-            ai_model_id=model.id,
-            generation_mode="reference",
-            resolution=str((production.production_spec or {}).get("video_resolution") or "720p"),
-            return_last_frame=True,
-            prompt=payload.prompt,
-            character_ids=asset_ids["character"],
-            scene_ids=asset_ids["scene"],
-            prop_ids=asset_ids["prop"],
-            uploaded_images=[image_url],
-            extra={
-                "duration_seconds": int(
-                    (production.production_spec or {}).get("default_shot_duration_seconds") or 5
-                ),
-                "generate_audio": bool(
-                    (production.production_spec or {}).get("generate_audio", False)
-                ),
-            },
-        ),
-        agent_context=context,
     )
 
 

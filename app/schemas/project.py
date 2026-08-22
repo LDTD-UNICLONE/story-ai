@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import List, Literal, Optional
 from uuid import UUID
 
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, field_validator
 from app.schemas.base import SchemaBaseModel
 
 from app.schemas.style import StyleBaseOut
@@ -42,6 +42,14 @@ class ProjectCreateRequest(SchemaBaseModel):
     generation_ratio: ProjectGenerationRatio
     style_id: UUID
 
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("项目名称不能为空")
+        return value
+
 
 class ProjectUpdateRequest(SchemaBaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=128)
@@ -49,3 +57,20 @@ class ProjectUpdateRequest(SchemaBaseModel):
     description: Optional[str] = Field(default=None)
     generation_ratio: Optional[ProjectGenerationRatio] = None
     style_id: Optional[UUID] = None
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: Optional[str]) -> str:
+        if value is None:
+            raise ValueError("项目名称不能为 null")
+        value = value.strip()
+        if not value:
+            raise ValueError("项目名称不能为空")
+        return value
+
+    @field_validator("cover", "description", "generation_ratio", "style_id")
+    @classmethod
+    def reject_null_required_fields(cls, value):
+        if value is None:
+            raise ValueError("字段不能为 null")
+        return value

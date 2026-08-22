@@ -100,9 +100,18 @@ def test_agent_projects_and_default_models_have_isolation_constraints() -> None:
         constraint.name for constraint in project_table.constraints
     }
     assert project_table.c.project_kind.server_default is not None
-    assert "uq_ai_models_agent_default_type" in {
-        index.name for index in ai_model_table.indexes
-    }
+    assert "uq_ai_models_agent_default_type" in {index.name for index in ai_model_table.indexes}
+    vendor_identity = next(
+        constraint
+        for constraint in ai_model_table.constraints
+        if isinstance(constraint, UniqueConstraint)
+        and constraint.name == "uq_ai_models_vendor_model_id"
+    )
+    assert [column.name for column in vendor_identity.columns] == ["vendor", "model_id"]
+    model_id_index = next(
+        index for index in ai_model_table.indexes if index.name == "ix_ai_models_model_id"
+    )
+    assert model_id_index.unique is False
 
 
 def test_active_task_lookup_index_matches_migration() -> None:

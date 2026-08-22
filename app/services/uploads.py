@@ -26,6 +26,13 @@ GENERIC_CONTENT_TYPES = {
     "application/force-download",
 }
 
+CONTENT_TYPE_ALIASES = {
+    "image/jpg": "image/jpeg",
+    "image/x-png": "image/png",
+    "image/apng": "image/png",
+    "audio/x-m4a": "audio/mp4",
+}
+
 EXTENSION_CONTENT_TYPES = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -70,6 +77,7 @@ MEDIA_PROBE_TIMEOUT_SECONDS = 15
 
 def detect_content_type(filename: str, content_type: str = "") -> str:
     normalized = (content_type or "").strip().lower()
+    normalized = CONTENT_TYPE_ALIASES.get(normalized, normalized)
     guessed_type = _guess_content_type(filename)
     if normalized not in GENERIC_CONTENT_TYPES:
         if (
@@ -96,6 +104,13 @@ def detect_file_type(content_type: str) -> str:
 
 
 def matches_media_signature(file_obj: Any, content_type: str) -> bool:
+    normalized = (content_type or "").strip().lower()
+    if normalized.startswith("image/"):
+        detected = detect_image_content_type(file_obj)
+        if normalized in {"image/heic", "image/heif"}:
+            return detected in {"image/heic", "image/heif"}
+        return detected == normalized
+
     current_pos = file_obj.tell()
     try:
         file_obj.seek(0)
@@ -103,28 +118,6 @@ def matches_media_signature(file_obj: Any, content_type: str) -> bool:
     finally:
         file_obj.seek(current_pos)
 
-    normalized = (content_type or "").strip().lower()
-    if normalized == "image/jpeg":
-        return header.startswith(b"\xff\xd8\xff")
-    if normalized == "image/png":
-        return header.startswith(b"\x89PNG\r\n\x1a\n")
-    if normalized == "image/webp":
-        return header.startswith(b"RIFF") and header[8:12] == b"WEBP"
-    if normalized == "image/gif":
-        return header.startswith((b"GIF87a", b"GIF89a"))
-    if normalized == "image/bmp":
-        return header.startswith(b"BM")
-    if normalized == "image/tiff":
-        return header.startswith((b"II*\x00", b"MM\x00*"))
-    if normalized in {"image/heic", "image/heif"}:
-        return header[4:8] == b"ftyp" and header[8:12] in {
-            b"heic",
-            b"heix",
-            b"hevc",
-            b"hevx",
-            b"mif1",
-            b"msf1",
-        }
     if normalized in {
         "video/mp4",
         "video/quicktime",
@@ -134,7 +127,12 @@ def matches_media_signature(file_obj: Any, content_type: str) -> bool:
         "audio/mp4",
     }:
         return header[4:8] == b"ftyp"
-    if normalized in {"video/webm", "video/x-matroska", "application/x-matroska"}:
+    if normalized in {
+        "video/webm",
+        "audio/webm",
+        "video/x-matroska",
+        "application/x-matroska",
+    }:
         return header.startswith(b"\x1aE\xdf\xa3")
     if normalized == "video/x-msvideo":
         return header.startswith(b"RIFF") and header[8:12] == b"AVI "
@@ -153,6 +151,35 @@ def matches_media_signature(file_obj: Any, content_type: str) -> bool:
     if normalized == "audio/flac":
         return header.startswith(b"fLaC")
     return False
+
+
+def detect_image_content_type(file_obj: Any) -> Optional[str]:
+    current_pos = file_obj.tell()
+    try:
+        file_obj.seek(0)
+        header = file_obj.read(32)
+    finally:
+        file_obj.seek(current_pos)
+
+    if header.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+        return "image/webp"
+    if header.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if header.startswith(b"BM"):
+        return "image/bmp"
+    if header.startswith((b"II*\x00", b"MM\x00*")):
+        return "image/tiff"
+    if header[4:8] == b"ftyp":
+        brand = header[8:12]
+        if brand in {b"heic", b"heix", b"hevc", b"hevx"}:
+            return "image/heic"
+        if brand in {b"mif1", b"msf1"}:
+            return "image/heif"
+    return None
 
 
 def _guess_content_type(filename: str) -> str:
@@ -362,7 +389,8 @@ async def upload_story_file(
     media_only: bool = False,
 ) -> UploadFileOut:
     filename = file.filename or "file"
-    content_type = detect_content_type(filename, file.content_type or "")
+    declared_content_type = (file.content_type or "").strip().lower()
+    content_type = detect_content_type(filename, declared_content_type)
     if not content_type:
         raise AppException("上传文件类型不能为空", code=40008, status_code=400)
 
@@ -380,8 +408,34 @@ async def upload_story_file(
     file_type = detect_file_type(content_type)
     if media_only and file_type not in {"image", "video", "audio"}:
         raise AppException("仅支持上传图片、视频或音频", code=40049, status_code=400)
-    if media_only and not matches_media_signature(file.file, content_type):
-        raise AppException("上传文件内容与媒体类型不匹配", code=40050, status_code=400)
+    if file_type == "image":
+        detected_image_type = detect_image_content_type(file.file)
+        if detected_image_type is not None:
+            content_type = detected_image_type
+        else:
+            raise AppException(
+                "上传文件内容与媒体类型不匹配",
+                code=40050,
+                status_code=400,
+                data={
+                    "filename": filename,
+                    "declared_content_type": declared_content_type or None,
+                    "normalized_content_type": content_type,
+                },
+            )
+    elif file_type in {"video", "audio"} and not matches_media_signature(
+        file.file, content_type
+    ):
+        raise AppException(
+            "上传文件内容与媒体类型不匹配",
+            code=40050,
+            status_code=400,
+            data={
+                "filename": filename,
+                "declared_content_type": declared_content_type or None,
+                "normalized_content_type": content_type,
+            },
+        )
     media_info = await run_in_threadpool(extract_media_info, file.file, file_type, filename)
     file.file.seek(0)
 

@@ -534,10 +534,9 @@ async def agent_api():
                 model_id="gpt-5.5",
                 vendor="integration",
                 model_type="text",
-                points_cost=7,
                 is_enabled=True,
                 is_agent_default=True,
-                capabilities={},
+                configuration={"billing": {"base_points": 7}},
             )
             image_model = AiModel(
                 id=uuid4(),
@@ -545,10 +544,9 @@ async def agent_api():
                 model_id="gpt-image-2",
                 vendor="integration",
                 model_type="image",
-                points_cost=3,
                 is_enabled=True,
                 is_agent_default=True,
-                capabilities={},
+                configuration={"billing": {"base_points": 3}},
             )
             video_model = AiModel(
                 id=uuid4(),
@@ -556,10 +554,9 @@ async def agent_api():
                 model_id=f"integration-video-{uuid4().hex}",
                 vendor="integration",
                 model_type="video",
-                points_cost=2,
                 is_enabled=True,
                 is_agent_default=True,
-                capabilities={},
+                configuration={"billing": {"base_points": 2}},
             )
             source = ProjectSourceDocument(
                 id=uuid4(),

@@ -118,58 +118,6 @@ class AgentProductionReviewOut(SchemaBaseModel):
     episodes: List[AgentReviewEpisodeOut]
 
 
-class AgentMediaRegeneratePreviewRequest(SchemaBaseModel):
-    media_type: Literal["image", "video"]
-    storyboard_ids: List[UUID] = Field(min_length=1, max_length=20)
-    prompt: Optional[str] = Field(default=None, min_length=1, max_length=4000)
-
-    @field_validator("storyboard_ids")
-    @classmethod
-    def unique_storyboard_ids(cls, value: List[UUID]) -> List[UUID]:
-        return list(dict.fromkeys(value))
-
-
-class AgentMediaRegenerateRequest(AgentMediaRegeneratePreviewRequest):
-    idempotency_key: str = Field(min_length=8, max_length=128)
-
-
-class AgentMediaRegeneratePreviewOut(SchemaBaseModel):
-    production_id: UUID
-    media_type: str
-    storyboard_ids: List[UUID]
-    affected_chapter_ids: List[UUID]
-    invalidated_approval_count: int
-    estimated_points: int
-
-
-class AgentMediaRegenerationOut(SchemaBaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: UUID
-    production_id: UUID
-    media_type: str
-    idempotency_key: str
-    status: str
-    items: List[Dict[str, Any]]
-    estimated_points: int
-    submitted_points: int
-    error_summary: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
-
-
-class AgentMediaVersionSelectRequest(SchemaBaseModel):
-    result_url: Optional[str] = Field(default=None, max_length=2048)
-
-
-class AgentMediaVersionSelectOut(SchemaBaseModel):
-    history_id: UUID
-    storyboard_id: UUID
-    media_type: str
-    selected_url: Optional[str] = None
-    invalidated_chapter_id: UUID
-
-
 class AgentEpisodeApproveRequest(SchemaBaseModel):
     expected_lock_version: int = Field(ge=0)
     idempotency_key: str = Field(min_length=8, max_length=128)

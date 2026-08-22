@@ -17,6 +17,5 @@ async def upload_file(
     result = await upload_story_file(
         file,
         category=f"user-uploads/{current_user.id}/{category}",
-        media_only=True,
     )
     return success(data=result.model_dump(mode="json"), message="上传成功")

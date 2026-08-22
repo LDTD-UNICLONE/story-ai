@@ -2,6 +2,7 @@ from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile
+from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_optional_current_user
@@ -9,7 +10,9 @@ from app.core.responses import success
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.work import WorkCreateRequest, WorkListOut, WorkUpdateRequest
-from app.services.work_streaming import ( stream_work_media, stream_work_media_thumbnail,
+from app.services.work_streaming import (
+    stream_work_media,
+    stream_work_media_thumbnail,
     stream_work_upload_preview,
 )
 from app.services.works import (
@@ -39,7 +42,11 @@ async def upload_my_work_file(
     return success(data=result.model_dump(mode="json"), message="上传成功")
 
 
-@router.get("/uploads/{upload_id}/preview")
+@router.get(
+    "/uploads/{upload_id}/preview",
+    response_class=RedirectResponse,
+    status_code=307,
+)
 async def preview_my_work_upload(
     upload_id: UUID,
     db: AsyncSession = Depends(get_db),
@@ -65,7 +72,7 @@ async def public_works(
 @router.get("/mine")
 async def my_works(
     visibility: Optional[str] = Query(default=None, pattern="^(public|private)$"),
-    status: Optional[str] = Query(default=None, pattern="^(draft|published|hidden|deleted)$"),
+    status: Optional[str] = Query(default=None, pattern="^(draft|published|hidden)$"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -138,7 +145,11 @@ async def unlike_my_work(
     return success(data=work.model_dump(mode="json"), message="取消点赞成功")
 
 
-@router.get("/{work_id}/media/{media_id}/stream")
+@router.get(
+    "/{work_id}/media/{media_id}/stream",
+    response_class=RedirectResponse,
+    status_code=307,
+)
 async def work_media_stream(
     work_id: UUID,
     media_id: UUID,
@@ -150,7 +161,11 @@ async def work_media_stream(
     return await stream_work_media(media)
 
 
-@router.get("/{work_id}/media/{media_id}/thumbnail")
+@router.get(
+    "/{work_id}/media/{media_id}/thumbnail",
+    response_class=RedirectResponse,
+    status_code=307,
+)
 async def work_media_thumbnail(
     work_id: UUID,
     media_id: UUID,

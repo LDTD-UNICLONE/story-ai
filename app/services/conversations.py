@@ -6,7 +6,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.timezone import beijing_datetime
 from app.core.exceptions import AppException
-from app.integrations import comfly
+from app.integrations import apimart, comfly
+from app.integrations.apimart_video_specs import (
+    merge_video_capabilities as merge_apimart_video_capabilities,
+    normalize_video_resolution as normalize_apimart_video_resolution,
+)
 from app.integrations.comfly_video_specs import (
     merge_video_capabilities as merge_comfly_video_capabilities,
 )
@@ -26,7 +30,11 @@ from app.schemas.conversation import (
     ConversationUpdateRequest,
 )
 from app.services.model_runner import ModelRunResult
-from app.services.model_points import calculate_submission_points_cost
+from app.services.model_configuration import model_request_capabilities
+from app.services.model_points import (
+    calculate_submission_points_cost,
+    ensure_model_minimum_balance,
+)
 from app.services.points import change_user_points, consume_user_points
 from app.services.task_records import (
     create_user_task_record,
@@ -70,6 +78,18 @@ TEXT_MULTIMODAL_MEDIA_KEYS = (
     "image",
     "image_url",
     "image_urls",
+    "imageUrl",
+    "imageUrls",
+    "uploaded_images",
+    "uploadedImages",
+    "reference_image",
+    "reference_image_url",
+    "reference_images",
+    "reference_image_urls",
+    "referenceImage",
+    "referenceImageUrl",
+    "referenceImages",
+    "referenceImageUrls",
     "videos",
     "video",
     "video_url",
@@ -307,9 +327,29 @@ async def delete_conversation(
     conversation_id: UUID,
     user_id: UUID,
 ) -> Conversation:
-    conversation = await get_conversation_or_404(db, conversation_id, user_id)
+    conversation = await _lock_conversation(db, conversation_id, user_id)
     conversation.is_enabled = False
     conversation.updated_at = beijing_datetime()
+    await db.flush()
+    active_task_result = await db.execute(
+        select(UserTaskRecord.id).where(
+            UserTaskRecord.user_id == user_id,
+            UserTaskRecord.business_type == "conversation",
+            UserTaskRecord.business_id == conversation_id,
+            UserTaskRecord.status.in_(("pending", "running")),
+        )
+    )
+    for task_record_id in active_task_result.scalars().all():
+        try:
+            await interrupt_task_record(
+                db,
+                task_record_id,
+                user_id,
+                reason="用户删除会话，任务已取消",
+            )
+        except AppException as exc:
+            if exc.code not in {40035, 40406}:
+                raise
     await db.commit()
     await db.refresh(conversation)
     return conversation
@@ -363,19 +403,28 @@ async def _interrupt_message_task_if_active(
     message: ConversationMessage,
     user_id: UUID,
 ) -> None:
-    task_record_id = _parse_uuid((message.extra or {}).get("task_record_id"))
-    if task_record_id is None:
-        return
-    record = await db.get(UserTaskRecord, task_record_id)
-    if (
-        record is None
-        or record.user_id != user_id
-        or record.business_type != "conversation"
-        or record.business_id != message.conversation_id
-        or record.status not in {"pending", "running"}
-    ):
-        return
-    await interrupt_task_record(db, task_record_id, user_id, reason="用户删除对话历史，任务已取消")
+    direct_task_record_id = _parse_uuid((message.extra or {}).get("task_record_id"))
+    result = await db.execute(
+        select(UserTaskRecord).where(
+            UserTaskRecord.user_id == user_id,
+            UserTaskRecord.business_type == "conversation",
+            UserTaskRecord.business_id == message.conversation_id,
+            UserTaskRecord.status.in_(("pending", "running")),
+        )
+    )
+    for record in result.scalars().all():
+        record_extra = record.extra or {}
+        is_linked = record.id == direct_task_record_id or str(message.id) in {
+            str(record_extra.get("user_message_id") or ""),
+            str(record_extra.get("assistant_message_id") or ""),
+        }
+        if is_linked:
+            await interrupt_task_record(
+                db,
+                record.id,
+                user_id,
+                reason="用户删除对话历史，任务已取消",
+            )
 
 
 async def list_conversation_messages(
@@ -452,7 +501,15 @@ async def get_conversation_generation_task_status(
     assistant_message = None
     parsed_assistant_message_id = _parse_uuid(assistant_message_id)
     if parsed_assistant_message_id:
-        assistant_message = await db.get(ConversationMessage, parsed_assistant_message_id)
+        assistant_result = await db.execute(
+            select(ConversationMessage).where(
+                ConversationMessage.id == parsed_assistant_message_id,
+                ConversationMessage.conversation_id == conversation_id,
+                ConversationMessage.user_id == user_id,
+                ConversationMessage.role == "assistant",
+            )
+        )
+        assistant_message = assistant_result.scalar_one_or_none()
 
     if assistant_message is not None and task_record.status in {"success", "failed"}:
         await _sync_assistant_message_from_task_record(db, assistant_message, task_record)
@@ -570,13 +627,16 @@ async def send_conversation_message(
             business_type="conversation",
             generation_type="text",
         )
-        conversation = await _lock_text_conversation(db, conversation_id, user.id)
+        conversation = await _lock_conversation(db, conversation_id, user.id)
         existing_submission = await _find_idempotent_text_submission(
             db, conversation, payload
         )
         if existing_submission is not None:
             return existing_submission
         await _ensure_no_active_text_generation(db, conversation)
+
+    else:
+        conversation = await _lock_conversation(db, conversation_id, user.id)
 
     selected_ai_model_id = payload.ai_model_id or conversation.ai_model_id
     ai_model = await get_enabled_conversation_model_or_404(
@@ -600,9 +660,10 @@ async def send_conversation_message(
         extra=payload.extra or {},
         ai_model=ai_model,
     )
-    _validate_comfly_conversation_request(
+    _validate_conversation_request(
         ai_model, conversation_type, payload.content, message_extra
     )
+    await ensure_model_minimum_balance(db, user.id, ai_model)
     ai_model_points_cost = calculate_submission_points_cost(
         ai_model, conversation_type, message_extra
     )
@@ -717,7 +778,7 @@ async def send_conversation_message(
     return user_message, assistant_message, ai_model_points_cost
 
 
-async def _lock_text_conversation(
+async def _lock_conversation(
     db: AsyncSession,
     conversation_id: UUID,
     user_id: UUID,
@@ -728,13 +789,12 @@ async def _lock_text_conversation(
             Conversation.id == conversation_id,
             Conversation.user_id == user_id,
             Conversation.is_enabled.is_(True),
-            Conversation.conversation_type == "text",
         )
         .with_for_update()
     )
     conversation = result.scalar_one_or_none()
     if conversation is None:
-        raise AppException("文本会话不存在", code=40405, status_code=404)
+        raise AppException("会话不存在", code=40405, status_code=404)
     return conversation
 
 
@@ -776,6 +836,7 @@ async def _find_idempotent_text_submission(
         select(ConversationMessage)
         .where(
             ConversationMessage.conversation_id == conversation.id,
+            ConversationMessage.user_id == conversation.user_id,
             ConversationMessage.turn_id == user_message.turn_id,
             ConversationMessage.role == "assistant",
             ConversationMessage.message_type == "text",
@@ -795,7 +856,17 @@ async def _find_idempotent_text_submission(
         )
 
     task_record_id = _parse_uuid((assistant_message.extra or {}).get("task_record_id"))
-    task_record = await db.get(UserTaskRecord, task_record_id) if task_record_id else None
+    task_record = None
+    if task_record_id is not None:
+        task_result = await db.execute(
+            select(UserTaskRecord).where(
+                UserTaskRecord.id == task_record_id,
+                UserTaskRecord.user_id == conversation.user_id,
+                UserTaskRecord.business_type == "conversation",
+                UserTaskRecord.business_id == conversation.id,
+            )
+        )
+        task_record = task_result.scalar_one_or_none()
     points_cost = (
         int((task_record.extra or {}).get("submission_points_cost", task_record.points_cost))
         if task_record
@@ -859,7 +930,7 @@ async def retry_text_conversation_turn(
         business_type="conversation",
         generation_type="text",
     )
-    conversation = await _lock_text_conversation(db, conversation_id, user.id)
+    conversation = await _lock_conversation(db, conversation_id, user.id)
     await _ensure_no_active_text_generation(db, conversation)
 
     result = await db.execute(
@@ -915,7 +986,8 @@ async def retry_text_conversation_turn(
         extra=raw_extra,
         ai_model=ai_model,
     )
-    _validate_comfly_conversation_request(ai_model, "text", user_message.content, message_extra)
+    _validate_conversation_request(ai_model, "text", user_message.content, message_extra)
+    await ensure_model_minimum_balance(db, user.id, ai_model)
     points_cost = calculate_submission_points_cost(ai_model, "text", message_extra)
     points_transaction = None
     if points_cost > 0:
@@ -1011,12 +1083,23 @@ def _conversation_generation_queue(conversation_type: str) -> str:
     return "story_ai_default"
 
 
-def _validate_comfly_conversation_request(
+def _validate_conversation_request(
     ai_model: AiModel,
     conversation_type: str,
     content: str,
     extra: Dict[str, Any],
 ) -> None:
+    if ai_model.vendor == apimart.APIMART_VENDOR:
+        if conversation_type == "text":
+            apimart.validate_chat_completion_request(ai_model.model_id, content, extra)
+            return
+        if conversation_type == "image":
+            apimart.validate_image_request(ai_model.model_id, content, extra)
+            return
+        if conversation_type == "video":
+            apimart.validate_video_request(ai_model.model_id, content, extra)
+            return
+        return
     if not _is_comfly_model(ai_model):
         return
     if conversation_type == "text":
@@ -1050,7 +1133,8 @@ async def _build_message_extra_with_context(
         )
 
     chat_mode = str(extra.get("chat_mode") or extra.get("capability") or "chat")
-    if chat_mode != "chat":
+    is_apimart_text = ai_model is not None and ai_model.vendor == apimart.APIMART_VENDOR
+    if chat_mode != "chat" and not is_apimart_text:
         return extra
 
     messages = await _build_text_context_messages(db, conversation_id, content, extra)
@@ -1111,11 +1195,12 @@ async def _build_video_message_extra(
         if reference_audios:
             payload["audios"] = reference_audios
             payload["audio_urls"] = reference_audios
-        if reference_audios and not (reference_images or reference_videos):
+        allow_audio_only = _conversation_video_allows_audio_only(ai_model)
+        if reference_audios and not (reference_images or reference_videos) and not allow_audio_only:
             raise AppException(
                 "参考音频不能单独使用，需要同时传入参考图片或参考视频", code=40012, status_code=400
             )
-        if not reference_images and not reference_videos:
+        if not reference_images and not reference_videos and not (reference_audios and allow_audio_only):
             raise AppException(
                 "参考生成需要至少传入参考图片或参考视频；上传后请把 /uploads/file 返回的 data.url 放入 extra.uploaded_images 或 extra.reference_video_url",
                 code=40012,
@@ -1168,7 +1253,7 @@ def _reference_video_provider_mode(
 ) -> str:
     if reference_videos:
         return "video_to_video"
-    if reference_audios and reference_images:
+    if reference_audios:
         return "audio_video"
     return "image_to_video"
 
@@ -1269,11 +1354,20 @@ async def _validate_conversation_video_model_capability(
 
 
 def _conversation_video_capabilities(ai_model: AiModel) -> Dict[str, Any]:
+    saved = model_request_capabilities(ai_model)
     if ai_model.vendor == "volcengine_ark" or is_volcengine_ark_video_model(ai_model.model_id):
-        return merge_ark_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
+        return merge_ark_video_capabilities(ai_model.model_id, saved)
     if ai_model.vendor in COMFLY_VIDEO_VENDORS:
-        return merge_comfly_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
-    return ai_model.capabilities or {}
+        return merge_comfly_video_capabilities(ai_model.model_id, saved)
+    if ai_model.vendor == apimart.APIMART_VENDOR:
+        return merge_apimart_video_capabilities(ai_model.model_id, saved)
+    return saved
+
+
+def _conversation_video_allows_audio_only(ai_model: Optional[AiModel]) -> bool:
+    if ai_model is None:
+        return False
+    return bool(_conversation_video_capabilities(ai_model).get("allow_audio_only"))
 
 
 def _capability_set(capabilities: Dict[str, Any], key: str) -> set[str]:
@@ -1541,12 +1635,17 @@ def _optional_float(value: Any) -> Optional[float]:
 
 
 def _normalize_conversation_video_resolution(ai_model: Optional[AiModel], value: Any) -> str:
+    if ai_model is not None and ai_model.vendor == apimart.APIMART_VENDOR:
+        return normalize_apimart_video_resolution(ai_model.model_id, value)
     if ai_model is not None and (
         ai_model.vendor == "volcengine_ark" or is_volcengine_ark_video_model(ai_model.model_id)
     ):
         if value not in (None, "") and not is_known_video_resolution(value):
             raise AppException("火山方舟视频 resolution 参数不支持", code=40012, status_code=400)
-        capabilities = merge_ark_video_capabilities(ai_model.model_id, ai_model.capabilities or {})
+        capabilities = merge_ark_video_capabilities(
+            ai_model.model_id,
+            model_request_capabilities(ai_model),
+        )
         if value not in (None, "") and not is_video_resolution_supported(value, capabilities):
             raise AppException(
                 "当前火山方舟视频模型不支持该 resolution 参数", code=40012, status_code=400
@@ -1966,7 +2065,12 @@ def _completed_text_context_messages(
     for entry_type, value in ordered_entries:
         if entry_type == "legacy":
             role = "assistant" if value.role == "assistant" else "user"
-            messages.append({"role": role, "content": value.content})
+            content = (
+                _build_text_multimodal_content(value.content, value.extra or {})
+                if role == "user"
+                else value.content
+            )
+            messages.append({"role": role, "content": content})
             continue
 
         turn = turns[value]
@@ -1974,7 +2078,13 @@ def _completed_text_context_messages(
             continue
         messages.extend(
             [
-                {"role": "user", "content": turn["user"].content},
+                {
+                    "role": "user",
+                    "content": _build_text_multimodal_content(
+                        turn["user"].content,
+                        turn["user"].extra or {},
+                    ),
+                },
                 {"role": "assistant", "content": turn["assistant"].content},
             ]
         )

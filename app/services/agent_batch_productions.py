@@ -42,7 +42,10 @@ from app.services.agent_storyboard_bindings import (
 from app.services.agent_default_models import get_agent_video_model
 from app.services.agent_task_context import build_agent_task_context
 from app.services.agent_workflow import agent_pilot_episode_count, uses_agent_workflow_v2
-from app.services.model_points import calculate_submission_points_cost
+from app.services.model_points import (
+    calculate_submission_points_cost,
+    model_minimum_balance_points,
+)
 from app.services.points import ensure_user_points_enough
 from app.services.project_storyboard_images import submit_storyboard_image_generation
 from app.services.project_storyboard_videos import submit_storyboard_video_generation
@@ -242,7 +245,7 @@ async def dispatch_batch_production(
     estimated_cost = sum(
         _scope_submission_cost(context, model, batch_phase, scope_id) for scope_id in selected
     )
-    await _ensure_budget(db, context.production, user.id, estimated_cost)
+    await _ensure_budget(db, context.production, user.id, model, estimated_cost)
 
     _append_idempotency_key(context.step, payload.idempotency_key)
     context.step.extra = {
@@ -365,7 +368,7 @@ async def retry_batch_jobs(
         _scope_submission_cost(context, model, phase, scope_id) for scope_id in scope_ids
     )
     await _account_refunded_tasks(db, context)
-    await _ensure_budget(db, context.production, user.id, estimated_cost)
+    await _ensure_budget(db, context.production, user.id, model, estimated_cost)
     _prepare_manual_job_action(context, phase, payload.idempotency_key, "retry")
     await db.commit()
 
@@ -1282,6 +1285,7 @@ async def _ensure_budget(
     db: AsyncSession,
     production: AgentProduction,
     user_id: UUID,
+    model: AiModel,
     estimated_cost: int,
 ) -> None:
     if (
@@ -1289,7 +1293,11 @@ async def _ensure_budget(
         and production.consumed_points + estimated_cost > production.max_points
     ):
         raise AppException("整剧任务已达到积分预算上限", code=40052, status_code=400)
-    await ensure_user_points_enough(db, user_id, estimated_cost)
+    await ensure_user_points_enough(
+        db,
+        user_id,
+        max(estimated_cost, model_minimum_balance_points(model)),
+    )
 
 
 def _scope_submission_cost(

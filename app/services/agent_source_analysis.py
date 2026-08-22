@@ -35,6 +35,7 @@ from app.services.agent_story_bibles import initialize_script_assets
 from app.services.agent_workflow import uses_agent_workflow_v2
 from app.services.model_points import (
     calculate_text_submission_points_cost,
+    ensure_model_minimum_balance,
     settle_text_task_points,
 )
 from app.services.points import change_user_points, consume_user_points
@@ -770,6 +771,7 @@ async def _create_agent_text_task(
     title: str,
     role_extra: Dict[str, Any],
 ) -> UserTaskRecord:
+    await ensure_model_minimum_balance(db, production.user_id, ai_model)
     points_cost = calculate_text_submission_points_cost(ai_model)
     if production.max_points is not None and production.consumed_points + points_cost > production.max_points:
         raise AppException("整剧任务已达到积分预算上限", code=40052, status_code=400)

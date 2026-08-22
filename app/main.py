@@ -17,9 +17,11 @@ from app.core.rate_limit import RedisRateLimitMiddleware
 from app.core.request_logging import RequestLoggingMiddleware
 from app.core.startup import validate_runtime_config
 from app.db.session import engine
-from app.integrations.comfly import close_comfly_client, init_comfly_client
+from app.integrations.model_providers import (
+    close_model_provider_clients,
+    init_model_provider_clients,
+)
 from app.integrations.redis import close_redis, init_redis
-from app.integrations.volcengine_ark import close_volcengine_ark_client, init_volcengine_ark_client
 from app.services.oss_deletions import process_oss_deletion_outbox
 from app.services.recharges import purge_expired_pending_recharge_orders
 from app.services.works import purge_unused_work_uploads
@@ -33,16 +35,13 @@ MAINTENANCE_ADVISORY_LOCK_ID = 9_178_240_601
 async def lifespan(app: FastAPI):
     validate_runtime_config()
     await init_redis()
-    await init_comfly_client()
-    if settings.volcengine_ark_api_key:
-        await init_volcengine_ark_client()
+    await init_model_provider_clients()
     maintenance_cleanup_task = asyncio.create_task(_maintenance_cleanup_loop())
     yield
     maintenance_cleanup_task.cancel()
     with suppress(asyncio.CancelledError):
         await maintenance_cleanup_task
-    await close_comfly_client()
-    await close_volcengine_ark_client()
+    await close_model_provider_clients()
     await close_redis()
 
 

@@ -5,6 +5,11 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from app.core.exceptions import AppException
 from app.core.logging import log_extra
+from app.integrations import apimart
+from app.integrations.apimart import APIMART_VENDOR
+from app.integrations.apimart_video_specs import (
+    merge_video_capabilities as merge_apimart_video_capabilities,
+)
 from app.integrations import comfly
 from app.integrations.comfly_video_specs import merge_video_capabilities
 from app.integrations import volcengine_ark
@@ -13,6 +18,10 @@ from app.integrations.volcengine_ark_video_specs import (
     merge_video_capabilities as merge_ark_video_capabilities,
 )
 from app.models.ai_model import AiModel
+from app.services.model_configuration import (
+    ensure_model_available,
+    model_request_capabilities,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -36,9 +45,22 @@ async def run_model(
     prompt: str,
     extra: Dict[str, Any],
     idempotency_key: Optional[str] = None,
+    on_text_delta: Optional[apimart.TextDeltaCallback] = None,
+    text_stream: bool = False,
 ) -> ModelRunResult:
+    ensure_model_available(ai_model)
     if _should_use_volcengine_ark(ai_model, generation_type):
         return await _run_volcengine_ark(ai_model, generation_type, prompt, extra)
+    if _should_use_apimart(ai_model):
+        return await _run_apimart(
+            ai_model,
+            generation_type,
+            prompt,
+            extra,
+            idempotency_key,
+            on_text_delta,
+            text_stream,
+        )
     if _should_use_comfly(ai_model):
         return await _run_comfly(ai_model, generation_type, prompt, extra, idempotency_key)
 
@@ -52,6 +74,8 @@ async def query_model_task(
 ) -> ModelRunResult:
     if _should_use_volcengine_ark(ai_model, generation_type):
         return await _query_volcengine_ark_task(generation_type, task_id)
+    if _should_use_apimart(ai_model):
+        return await _query_apimart_task(generation_type, task_id)
     if _should_use_comfly(ai_model):
         return await _query_comfly_task(generation_type, task_id)
 
@@ -123,7 +147,7 @@ async def _run_comfly(
         provider_extra = dict(extra)
         provider_extra["_model_capabilities"] = merge_video_capabilities(
             ai_model.model_id,
-            ai_model.capabilities or {},
+            model_request_capabilities(ai_model),
         )
         payload = await comfly.create_video_generation(
             ai_model.model_id,
@@ -158,7 +182,7 @@ async def _run_volcengine_ark(
     provider_extra = dict(extra)
     provider_extra["_model_capabilities"] = merge_ark_video_capabilities(
         ai_model.model_id,
-        ai_model.capabilities or {},
+        model_request_capabilities(ai_model),
     )
     payload = await volcengine_ark.create_video_generation(
         ai_model.model_id, prompt, provider_extra
@@ -174,6 +198,115 @@ async def _run_volcengine_ark(
             "task_id": task_id,
             "task_status": _extract_status(payload),
             "video_mode": video_mode,
+            "provider_response": payload,
+        },
+    )
+
+
+async def _run_apimart(
+    ai_model: AiModel,
+    generation_type: str,
+    prompt: str,
+    extra: Dict[str, Any],
+    idempotency_key: Optional[str],
+    on_text_delta: Optional[apimart.TextDeltaCallback],
+    text_stream: bool,
+) -> ModelRunResult:
+    if generation_type == "image":
+        payload = await apimart.create_image_generation(
+            ai_model.model_id,
+            prompt,
+            extra,
+            idempotency_key=idempotency_key,
+        )
+        task_id = _extract_task_id(payload)
+        if task_id:
+            return ModelRunResult(
+                content=f"图像生成任务已提交：{task_id}",
+                extra={
+                    "task_id": task_id,
+                    "task_status": _extract_status(payload),
+                    "image_mode": str(
+                        extra.get("image_mode") or extra.get("capability") or "generation"
+                    ),
+                    "provider_response": payload,
+                },
+            )
+        content = _extract_media_content(payload)
+        if not content:
+            raise AppException(
+                "APIMart 图像响应格式错误：未返回 task_id 或图片结果",
+                code=50231,
+                status_code=502,
+            )
+        return ModelRunResult(
+            content=content,
+            extra={
+                "image_mode": str(
+                    extra.get("image_mode") or extra.get("capability") or "generation"
+                ),
+                "provider_response": payload,
+            },
+        )
+
+    if generation_type == "video":
+        provider_extra = dict(extra)
+        provider_extra["_model_capabilities"] = merge_apimart_video_capabilities(
+            ai_model.model_id,
+            model_request_capabilities(ai_model),
+        )
+        payload = await apimart.create_video_generation(
+            ai_model.model_id,
+            prompt,
+            provider_extra,
+            idempotency_key=idempotency_key,
+        )
+        task_id = _extract_task_id(payload)
+        if not task_id:
+            raise AppException(
+                "APIMart 视频响应格式错误：未返回 task_id",
+                code=50232,
+                status_code=502,
+            )
+        return ModelRunResult(
+            content=f"视频生成任务已提交：{task_id}",
+            extra={
+                "task_id": task_id,
+                "task_status": _extract_status(payload),
+                "video_mode": str(
+                    extra.get("video_mode") or extra.get("capability") or "generation"
+                ),
+                "provider_response": payload,
+            },
+        )
+
+    if generation_type != "text":
+        raise AppException("不支持的生成类型", code=40004, status_code=400)
+    kwargs: Dict[str, Any] = {
+        "idempotency_key": idempotency_key,
+        "stream": text_stream,
+    }
+    if on_text_delta is not None:
+        kwargs["on_text_delta"] = on_text_delta
+    payload = await apimart.create_chat_completion(
+        ai_model.model_id, prompt, extra, **kwargs
+    )
+    content = _extract_chat_content(payload) or _extract_media_content(payload)
+    if not content:
+        raise EmptyModelContentError(
+            _empty_content_message(payload), _chat_response_summary(payload)
+        )
+    return ModelRunResult(
+        content=content,
+        extra={
+            "chat_capability": extra.get("capability") or extra.get("chat_mode") or "chat",
+            "provider_api": payload.get("provider_api")
+            or (
+                "chat_completions"
+                if text_stream
+                else "chat_completions_nostream"
+            ),
+            "streamed": bool(payload.get("streamed")),
             "provider_response": payload,
         },
     )
@@ -219,6 +352,20 @@ async def _query_volcengine_ark_task(generation_type: str, task_id: str) -> Mode
     raise AppException("该生成类型没有任务查询接口", code=40006, status_code=400)
 
 
+async def _query_apimart_task(generation_type: str, task_id: str) -> ModelRunResult:
+    if generation_type not in {"image", "video"}:
+        raise AppException("该生成类型没有任务查询接口", code=40006, status_code=400)
+    payload = await apimart.query_generation_task(task_id)
+    return ModelRunResult(
+        content=_extract_media_content(payload),
+        extra={
+            "task_id": _extract_task_id(payload) or task_id,
+            "task_status": _extract_status(payload),
+            "provider_response": payload,
+        },
+    )
+
+
 def _should_use_volcengine_ark(ai_model: AiModel, generation_type: str) -> bool:
     return generation_type == "video" and ai_model.vendor == VOLCENGINE_ARK_VENDOR
 
@@ -227,7 +374,15 @@ def _should_use_comfly(ai_model: AiModel) -> bool:
     return ai_model.vendor in {"comfly", "模型服务"}
 
 
+def _should_use_apimart(ai_model: AiModel) -> bool:
+    return ai_model.vendor == APIMART_VENDOR
+
+
 def _extract_chat_content(payload: Dict[str, Any]) -> str:
+    responses_content = _extract_responses_content(payload)
+    if responses_content:
+        return responses_content
+
     choices = payload.get("choices") or []
     if choices:
         first_choice = choices[0] if isinstance(choices[0], dict) else {}
@@ -262,6 +417,45 @@ def _extract_chat_content(payload: Dict[str, Any]) -> str:
         tool_calls = message.get("tool_calls")
         if tool_calls:
             return json.dumps({"tool_calls": tool_calls}, ensure_ascii=False)
+    return ""
+
+
+def _extract_responses_content(payload: Dict[str, Any]) -> str:
+    output_text = payload.get("output_text")
+    if output_text:
+        return str(output_text)
+
+    output = payload.get("output")
+    if not isinstance(output, list):
+        return ""
+
+    text_parts: List[str] = []
+    refusals: List[str] = []
+    tool_calls: List[Dict[str, Any]] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "")
+        if item_type in {"function_call", "tool_call"}:
+            tool_calls.append(item)
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = str(part.get("type") or "")
+            if part_type in {"output_text", "text"} and part.get("text"):
+                text_parts.append(str(part["text"]))
+            elif part_type == "refusal" and part.get("refusal"):
+                refusals.append(str(part["refusal"]))
+
+    if text_parts:
+        return "".join(text_parts)
+    if refusals:
+        return "".join(refusals)
+    if tool_calls:
+        return json.dumps({"tool_calls": tool_calls}, ensure_ascii=False)
     return ""
 
 

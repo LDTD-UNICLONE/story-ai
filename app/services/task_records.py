@@ -19,8 +19,19 @@ from app.models.project_storyboard import ProjectStoryboard
 from app.models.task_record import UserTaskRecord
 from app.models.user import User
 from app.services.generated_media import persist_generated_media_to_oss
+from app.services.apimart_private_avatars import (
+    complete_private_avatar_review,
+    is_private_avatar_stage,
+    mark_private_avatar_ready_for_resume,
+    update_private_avatar_progress,
+)
 from app.services.core_asset_change_tracking import track_core_asset_reference_change
-from app.services.model_points import settle_video_task_points
+from app.services.model_points import (
+    build_model_billing_snapshot,
+    settle_image_task_points,
+    settle_video_task_points,
+)
+from app.services.model_configuration import ensure_model_available
 from app.services.model_runner import ModelRunResult, query_model_task
 from app.services.points import change_user_points
 from app.services.project_generated_assets import (
@@ -101,6 +112,19 @@ async def create_user_task_record(
     await _lock_user_task_submission(db, user_id)
     queue_snapshot = await _build_user_task_queue_snapshot(db, user_id, generation_type)
     _enforce_user_task_limits(queue_snapshot)
+    model_billing_snapshot = None
+    if ai_model_id is not None:
+        ai_model = await db.get(AiModel, ai_model_id)
+        if ai_model is not None:
+            ensure_model_available(ai_model)
+            model_billing_snapshot = build_model_billing_snapshot(ai_model)
+    record_extra = {
+        **(extra or {}),
+        "queue_snapshot": queue_snapshot,
+    }
+    if model_billing_snapshot is not None:
+        record_extra["model_billing_snapshot"] = model_billing_snapshot
+        record_extra["points_settled"] = False
     record = UserTaskRecord(
         user_id=user_id,
         ai_model_id=ai_model_id,
@@ -113,10 +137,7 @@ async def create_user_task_record(
         prompt=prompt,
         result=result,
         points_cost=points_cost,
-        extra={
-            **(extra or {}),
-            "queue_snapshot": queue_snapshot,
-        },
+        extra=record_extra,
     )
     db.add(record)
     return record
@@ -201,7 +222,16 @@ async def _build_user_task_queue_snapshot(
 
 
 async def _lock_user_task_submission(db: AsyncSession, user_id: UUID) -> None:
-    await db.execute(select(User.id).where(User.id == user_id).with_for_update())
+    result = await db.execute(select(User).where(User.id == user_id).with_for_update())
+    user = result.scalar_one_or_none()
+    if user is None:
+        raise AppException("用户不存在", code=40401, status_code=404)
+    if user.points_balance < 0:
+        raise AppException(
+            "存在未结清的模型实际费用，请充值后重试",
+            code=40003,
+            status_code=400,
+        )
 
 
 def _enforce_user_task_limits(snapshot: Dict[str, Any]) -> None:
@@ -411,6 +441,91 @@ async def interrupt_task_record(
     return record
 
 
+async def cancel_project_task_records(
+    db: AsyncSession,
+    project_id: UUID,
+    user_id: UUID,
+    *,
+    reason: str,
+) -> int:
+    """在删除项目的同一事务中中止其活动任务并退回已扣积分。"""
+    result = await db.execute(
+        select(UserTaskRecord)
+        .where(
+            UserTaskRecord.business_type == "project",
+            UserTaskRecord.business_id == project_id,
+            UserTaskRecord.user_id == user_id,
+            UserTaskRecord.status.in_(("pending", "running")),
+        )
+        .with_for_update()
+    )
+    records = list(result.scalars().all())
+    await _cancel_task_records_without_commit(
+        db,
+        records,
+        reason=reason,
+        markers={"project_deleted": True},
+    )
+    return len(records)
+
+
+async def cancel_project_resource_task_records(
+    db: AsyncSession,
+    project_id: UUID,
+    user_id: UUID,
+    *,
+    match_extra: Dict[str, Any],
+    reason: str,
+) -> int:
+    """中止项目内与指定章节、资产或分镜关联的活动任务。"""
+    result = await db.execute(
+        select(UserTaskRecord)
+        .where(
+            UserTaskRecord.business_type == "project",
+            UserTaskRecord.business_id == project_id,
+            UserTaskRecord.user_id == user_id,
+            UserTaskRecord.status.in_(("pending", "running")),
+        )
+        .with_for_update()
+    )
+    expected = {key: str(value) for key, value in match_extra.items()}
+    records = [
+        record
+        for record in result.scalars().all()
+        if all(str((record.extra or {}).get(key)) == value for key, value in expected.items())
+    ]
+    await _cancel_task_records_without_commit(
+        db,
+        records,
+        reason=reason,
+        markers={"resource_deleted": True},
+    )
+    return len(records)
+
+
+async def _cancel_task_records_without_commit(
+    db: AsyncSession,
+    records: List[UserTaskRecord],
+    *,
+    reason: str,
+    markers: Dict[str, Any],
+) -> None:
+    public_reason = sanitize_public_message(reason)
+    interrupted_at = beijing_datetime().isoformat()
+    for record in records:
+        record.status = "failed"
+        record.result = public_reason
+        record.extra = {
+            **(record.extra or {}),
+            "failed_reason": public_reason,
+            "interrupted": True,
+            **markers,
+            "interrupted_at": interrupted_at,
+        }
+        await _refund_interrupted_task_points(db, record)
+        await _sync_stale_failed_business_state(db, record, public_reason)
+
+
 async def reconcile_provider_task_record(
     db: AsyncSession, task_record_id: UUID
 ) -> Optional[UserTaskRecord]:
@@ -504,9 +619,7 @@ async def _claim_provider_reconcile(
     record.provider_status = record.provider_status or "submitted"
     record.provider_submitted_at = record.provider_submitted_at or record.updated_at or now
     record.last_reconcile_at = now
-    record.next_reconcile_at = now + timedelta(
-        seconds=_provider_reconcile_lease_seconds()
-    )
+    record.next_reconcile_at = now + timedelta(seconds=_provider_reconcile_lease_seconds())
     record.reconcile_attempts = int(record.reconcile_attempts or 0) + 1
     record.extra = {
         **(record.extra or {}),
@@ -555,6 +668,32 @@ async def _finish_provider_reconcile_claim(
         return record
 
     status = str(model_result.extra.get("task_status") or "").lower()
+    if is_private_avatar_stage(record):
+        if not _is_provider_terminal_status(status):
+            update_private_avatar_progress(record, model_result.extra)
+            await _mark_next_reconcile(db, record, None)
+            await db.refresh(record)
+            return record
+
+        private_avatar_result = await complete_private_avatar_review(
+            db,
+            record,
+            model_result.extra,
+        )
+        if private_avatar_result.failed_reason:
+            await _mark_reconciled_failed(
+                db,
+                record,
+                private_avatar_result.failed_reason,
+                model_result.extra,
+            )
+        else:
+            mark_private_avatar_ready_for_resume(record)
+            record.extra = _clear_provider_reconcile_claim(record.extra or {})
+            await db.commit()
+            await db.refresh(record)
+        return record
+
     if _is_provider_failed_status(status):
         await _mark_reconciled_failed(
             db, record, f"模型任务执行失败：{status or 'failed'}", model_result.extra
@@ -693,13 +832,88 @@ def record_provider_task_state(
     if getattr(record, "provider_submitted_at", None) is None:
         record.provider_submitted_at = now
     record.provider_status = provider_status
+    progress_percent = _extract_provider_progress_percent(provider_extra)
+    if _is_provider_success_status(provider_status):
+        progress_percent = 100
+    if progress_percent is not None:
+        record.extra = {
+            **(getattr(record, "extra", None) or {}),
+            "progress_percent": progress_percent,
+        }
     if _is_provider_terminal_status(provider_status):
         record.next_reconcile_at = None
     else:
-        record.next_reconcile_at = now + timedelta(
-            seconds=_provider_reconcile_interval(record)
-        )
+        record.next_reconcile_at = now + timedelta(seconds=_provider_reconcile_interval(record))
     return True
+
+
+def task_record_progress_percent(record: UserTaskRecord) -> Optional[int]:
+    generation_type = str(getattr(record, "generation_type", "") or "")
+    if generation_type not in {
+        "image",
+        "video",
+        "asset_image_generate",
+        "storyboard_image",
+        "storyboard_video",
+    }:
+        return None
+    if str(getattr(record, "status", "") or "").lower() == "success":
+        return 100
+
+    extra = getattr(record, "extra", None) or {}
+    if is_private_avatar_stage(record):
+        private_avatar = extra.get("private_avatar") or {}
+        progress_percent = _normalize_progress_percent(
+            private_avatar.get("progress_percent")
+        )
+        if progress_percent is not None:
+            return progress_percent
+    for candidate in (
+        extra,
+        extra.get("last_provider_task_status"),
+        extra.get("model_result_extra"),
+        extra.get("assistant_message_extra"),
+    ):
+        progress_percent = _extract_provider_progress_percent(candidate)
+        if progress_percent is not None:
+            return progress_percent
+    return None
+
+
+def _extract_provider_progress_percent(value: Any) -> Optional[int]:
+    if not isinstance(value, dict):
+        return None
+
+    candidates = [value]
+    provider_response = value.get("provider_response")
+    if isinstance(provider_response, dict):
+        candidates.append(provider_response)
+        data = provider_response.get("data")
+        if isinstance(data, dict):
+            candidates.append(data)
+        elif isinstance(data, list) and data and isinstance(data[0], dict):
+            candidates.append(data[0])
+
+    for candidate in candidates:
+        raw_progress = candidate.get("progress_percent")
+        if raw_progress is None:
+            raw_progress = candidate.get("progress")
+        progress_percent = _normalize_progress_percent(raw_progress)
+        if progress_percent is not None:
+            return progress_percent
+    return None
+
+
+def _normalize_progress_percent(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        progress_percent = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not 0 <= progress_percent <= 100:
+        return None
+    return progress_percent
 
 
 def _extract_provider_status(extra: Dict[str, Any]) -> str:
@@ -724,10 +938,13 @@ def _is_provider_terminal_status(status: str) -> bool:
     }
 
 
+def _is_provider_success_status(status: str) -> bool:
+    return status in {"success", "succeeded", "completed", "complete", "finished", "done"}
+
+
 def has_provider_task_id(record: UserTaskRecord) -> bool:
     return bool(
-        getattr(record, "provider_task_id", None)
-        or _extract_provider_task_id(record.extra or {})
+        getattr(record, "provider_task_id", None) or _extract_provider_task_id(record.extra or {})
     )
 
 
@@ -759,9 +976,7 @@ async def _mark_next_reconcile(
 ) -> None:
     now = beijing_datetime()
     record.last_reconcile_at = now
-    record.next_reconcile_at = now + timedelta(
-        seconds=_provider_reconcile_interval(record)
-    )
+    record.next_reconcile_at = now + timedelta(seconds=_provider_reconcile_interval(record))
     if provider_extra is not None:
         provider_status = _extract_provider_status(provider_extra)
         if provider_status:
@@ -797,6 +1012,8 @@ def _should_skip_provider_reconcile(record: UserTaskRecord) -> bool:
 
 
 def _provider_reconcile_interval(record: Optional[UserTaskRecord]) -> int:
+    if record is not None and is_private_avatar_stage(record):
+        return max(5, settings.provider_task_poll_interval_seconds)
     generation_type = record.generation_type if record is not None else None
     return provider_poll_interval_seconds(generation_type)
 
@@ -804,7 +1021,9 @@ def _provider_reconcile_interval(record: Optional[UserTaskRecord]) -> int:
 def _provider_reconcile_lease_seconds() -> int:
     return max(
         60,
-        settings.comfly_timeout_seconds + settings.generated_media_read_timeout_seconds + 30,
+        settings.provider_request_timeout_ceiling_seconds
+        + settings.generated_media_read_timeout_seconds
+        + 30,
     )
 
 
@@ -892,43 +1111,13 @@ async def _mark_stale_failed(db: AsyncSession, record: UserTaskRecord) -> None:
         "stale_failed": True,
         "stale_failed_at": beijing_datetime().isoformat(),
     }
-    await _refund_stale_task_points(db, record)
+    await _refund_task_points(db, record, remark_prefix="任务超时失败退回积分")
     await _sync_stale_failed_business_state(db, record, reason)
     await db.commit()
 
 
-async def _refund_stale_task_points(db: AsyncSession, record: UserTaskRecord) -> None:
-    if record.points_cost <= 0 or (record.extra or {}).get("refund_transaction_id"):
-        return
-    refund_transaction = await change_user_points(
-        db,
-        user_id=record.user_id,
-        amount=record.points_cost,
-        transaction_type="refund",
-        remark=f"任务超时失败退回积分：{record.title}",
-        auto_commit=False,
-    )
-    record.extra = {
-        **(record.extra or {}),
-        "refund_transaction_id": str(refund_transaction.id),
-    }
-
-
 async def _refund_interrupted_task_points(db: AsyncSession, record: UserTaskRecord) -> None:
-    if record.points_cost <= 0 or (record.extra or {}).get("refund_transaction_id"):
-        return
-    refund_transaction = await change_user_points(
-        db,
-        user_id=record.user_id,
-        amount=record.points_cost,
-        transaction_type="refund",
-        remark=f"任务中断退回积分：{record.title}",
-        auto_commit=False,
-    )
-    record.extra = {
-        **(record.extra or {}),
-        "refund_transaction_id": str(refund_transaction.id),
-    }
+    await _refund_task_points(db, record, remark_prefix="任务中断退回积分")
 
 
 async def _sync_stale_failed_business_state(
@@ -968,7 +1157,15 @@ async def _sync_conversation_failed(db: AsyncSession, record: UserTaskRecord, re
     parsed_assistant_message_id = _parse_uuid(assistant_message_id)
     if parsed_assistant_message_id is None:
         return
-    assistant_message = await db.get(ConversationMessage, parsed_assistant_message_id)
+    result = await db.execute(
+        select(ConversationMessage).where(
+            ConversationMessage.id == parsed_assistant_message_id,
+            ConversationMessage.user_id == record.user_id,
+            ConversationMessage.conversation_id == record.business_id,
+            ConversationMessage.role == "assistant",
+        )
+    )
+    assistant_message = result.scalar_one_or_none()
     if assistant_message is None:
         return
     assistant_message.content = f"任务执行失败：{reason}"
@@ -1121,6 +1318,7 @@ async def _mark_reconciled_success(
     record.extra = _clear_provider_reconcile_claim(
         {
             **(record.extra or {}),
+            "progress_percent": 100,
             "model_result_extra": model_result.extra,
             "provider_reconciled_at": now.isoformat(),
         }
@@ -1135,16 +1333,25 @@ async def _mark_reconciled_success(
     elif record.generation_type == "storyboard_video":
         await _sync_storyboard_video_success(db, record, model_result)
 
-    if provider_generation_type == "video" and record.ai_model_id:
+    if provider_generation_type in {"image", "video"} and record.ai_model_id:
         ai_model = await db.get(AiModel, record.ai_model_id)
         if ai_model is not None:
-            await settle_video_task_points(
-                db,
-                record,
-                ai_model,
-                _video_request_extra(record),
-                remark_prefix="视频生成",
-            )
+            if provider_generation_type == "image":
+                await settle_image_task_points(
+                    db,
+                    record,
+                    ai_model,
+                    model_result.extra,
+                    remark_prefix="图像生成",
+                )
+            else:
+                await settle_video_task_points(
+                    db,
+                    record,
+                    ai_model,
+                    _video_request_extra(record),
+                    remark_prefix="视频生成",
+                )
 
     await db.commit()
     await db.refresh(record)
@@ -1163,14 +1370,16 @@ async def _mark_reconciled_failed(
     record.provider_status = _extract_provider_status(provider_extra) or "failed"
     record.last_reconcile_at = now
     record.next_reconcile_at = None
-    record.extra = _clear_provider_reconcile_claim(
-        {
-            **(record.extra or {}),
-            "failed_reason": reason,
-            "model_result_extra": provider_extra,
-            "provider_reconciled_at": now.isoformat(),
-        }
-    )
+    reconciled_extra = {
+        **(record.extra or {}),
+        "failed_reason": reason,
+        "model_result_extra": provider_extra,
+        "provider_reconciled_at": now.isoformat(),
+    }
+    progress_percent = _extract_provider_progress_percent(provider_extra)
+    if progress_percent is not None:
+        reconciled_extra["progress_percent"] = progress_percent
+    record.extra = _clear_provider_reconcile_claim(reconciled_extra)
     await _refund_failed_task_points(db, record)
     if record.business_type == "conversation":
         assistant_message_id = (record.extra or {}).get("assistant_message_id")
@@ -1206,6 +1415,15 @@ async def _mark_reconciled_failed(
 
 
 async def _refund_failed_task_points(db: AsyncSession, record: UserTaskRecord) -> None:
+    await _refund_task_points(db, record, remark_prefix="任务失败退回积分")
+
+
+async def _refund_task_points(
+    db: AsyncSession,
+    record: UserTaskRecord,
+    *,
+    remark_prefix: str,
+) -> None:
     if record.points_cost <= 0 or (record.extra or {}).get("refund_transaction_id"):
         return
     refund_transaction = await change_user_points(
@@ -1213,7 +1431,7 @@ async def _refund_failed_task_points(db: AsyncSession, record: UserTaskRecord) -
         user_id=record.user_id,
         amount=record.points_cost,
         transaction_type="refund",
-        remark=f"任务失败退回积分：{record.title}",
+        remark=f"{remark_prefix}：{record.title}",
         auto_commit=False,
     )
     record.extra = {

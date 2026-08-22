@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
-from pydantic import ConfigDict, Field, field_serializer
+from pydantic import ConfigDict, Field, field_serializer, field_validator
 
 from app.core.public_messages import sanitize_public_data
 from app.schemas.base import SchemaBaseModel
@@ -110,6 +110,11 @@ class ProjectCharacterCreateRequest(SchemaBaseModel):
     source_content: Optional[str] = None
     extra: Dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        return _normalize_asset_name(value)
+
 
 class ProjectCharacterUpdateRequest(SchemaBaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=128)
@@ -128,6 +133,16 @@ class ProjectCharacterUpdateRequest(SchemaBaseModel):
     source_content: Optional[str] = None
     extra: Optional[Dict[str, Any]] = None
 
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: Optional[str]) -> str:
+        return _normalize_optional_asset_name(value)
+
+    @field_validator("aliases", "extra")
+    @classmethod
+    def reject_null_json_fields(cls, value):
+        return _reject_null_json_field(value)
+
 
 class ProjectSceneCreateRequest(SchemaBaseModel):
     name: str = Field(..., min_length=1, max_length=128)
@@ -141,6 +156,11 @@ class ProjectSceneCreateRequest(SchemaBaseModel):
     source_chapter_id: Optional[UUID] = None
     source_content: Optional[str] = None
     extra: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        return _normalize_asset_name(value)
 
 
 class ProjectSceneUpdateRequest(SchemaBaseModel):
@@ -156,6 +176,16 @@ class ProjectSceneUpdateRequest(SchemaBaseModel):
     source_content: Optional[str] = None
     extra: Optional[Dict[str, Any]] = None
 
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: Optional[str]) -> str:
+        return _normalize_optional_asset_name(value)
+
+    @field_validator("extra")
+    @classmethod
+    def reject_null_extra(cls, value):
+        return _reject_null_json_field(value)
+
 
 class ProjectPropCreateRequest(SchemaBaseModel):
     name: str = Field(..., min_length=1, max_length=128)
@@ -169,6 +199,11 @@ class ProjectPropCreateRequest(SchemaBaseModel):
     source_content: Optional[str] = None
     extra: Dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        return _normalize_asset_name(value)
+
 
 class ProjectPropUpdateRequest(SchemaBaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=128)
@@ -181,6 +216,35 @@ class ProjectPropUpdateRequest(SchemaBaseModel):
     source_chapter_id: Optional[UUID] = None
     source_content: Optional[str] = None
     extra: Optional[Dict[str, Any]] = None
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: Optional[str]) -> str:
+        return _normalize_optional_asset_name(value)
+
+    @field_validator("extra")
+    @classmethod
+    def reject_null_extra(cls, value):
+        return _reject_null_json_field(value)
+
+
+def _normalize_asset_name(value: str) -> str:
+    value = value.strip()
+    if not value:
+        raise ValueError("资产名称不能为空")
+    return value
+
+
+def _normalize_optional_asset_name(value: Optional[str]) -> str:
+    if value is None:
+        raise ValueError("资产名称不能为 null")
+    return _normalize_asset_name(value)
+
+
+def _reject_null_json_field(value):
+    if value is None:
+        raise ValueError("字段不能为 null")
+    return value
 
 
 class ProjectAssetAnalyzeRequest(SchemaBaseModel):

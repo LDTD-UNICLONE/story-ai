@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from types import SimpleNamespace
 from typing import Optional, Tuple
 from uuid import UUID
 
@@ -12,8 +11,7 @@ from app.core.exceptions import AppException
 from app.core.public_messages import sanitize_public_message
 from app.core.timezone import beijing_datetime
 from app.db.session import create_worker_sessionmaker
-from app.integrations.comfly import close_comfly_client
-from app.integrations.volcengine_ark import close_volcengine_ark_client
+from app.integrations.model_providers import close_model_provider_clients
 from app.models.agent_production import AgentProduction, ProjectSourceDocument
 from app.models.ai_model import AiModel
 from app.models.task_record import UserTaskRecord
@@ -27,6 +25,7 @@ from app.services.agent_source_analysis import (
 )
 from app.services.agent_source_text import parse_agent_json_object, validate_agent_stage_output
 from app.services.model_runner import run_model
+from app.services.model_configuration import build_model_runtime_snapshot
 from app.services.task_execution import TaskExecutionDeferred, prepare_task_execution
 from app.services.task_records import refresh_task_record_interrupted
 from app.worker import celery_app
@@ -152,8 +151,7 @@ async def _run_agent_text_task(task_record_id: UUID) -> Optional[Tuple[UUID, UUI
             timeout=_task_timeout_seconds(),
         )
     finally:
-        await close_comfly_client()
-        await close_volcengine_ark_client()
+        await close_model_provider_clients()
 
 
 async def _execute_agent_text_task(task_record_id: UUID) -> Optional[Tuple[UUID, UUID]]:
@@ -193,14 +191,7 @@ async def _execute_agent_text_task(task_record_id: UUID) -> Optional[Tuple[UUID,
         if ai_model is None:
             await fail_agent_text_task(db, task_record, "文本模型不存在或已禁用", refund=True)
             return None
-        model_snapshot = SimpleNamespace(
-            id=ai_model.id,
-            model_id=ai_model.model_id,
-            vendor=ai_model.vendor,
-            nickname=ai_model.nickname,
-            points_cost=ai_model.points_cost,
-            capabilities=ai_model.capabilities or {},
-        )
+        model_snapshot = build_model_runtime_snapshot(ai_model)
         try:
             prompt = await build_agent_text_prompt(db, task_record)
             source = await db.get(ProjectSourceDocument, production.source_document_id)

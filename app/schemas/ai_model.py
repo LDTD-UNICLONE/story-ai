@@ -1,10 +1,26 @@
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, field_validator
 from app.schemas.base import SchemaBaseModel
+
+
+AiModelType = Literal["text", "image", "video"]
+
+
+def _required_text(value: object) -> object:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("字段不能为空")
+    return value.strip()
+
+
+def _optional_text(value: object) -> object:
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    return value
 
 
 class AiModelOut(SchemaBaseModel):
@@ -16,14 +32,9 @@ class AiModelOut(SchemaBaseModel):
     vendor: str
     model_type: str
     remark: Optional[str] = None
-    points_cost: int
-    model_multiplier: Decimal
-    cache_multiplier: Decimal
-    completion_multiplier: Decimal
-    platform_multiplier: Decimal
     is_enabled: bool
     is_agent_default: bool
-    capabilities: Dict[str, Any]
+    configuration: Dict[str, Any]
     created_at: datetime
     updated_at: datetime
 
@@ -35,6 +46,28 @@ class AiModelListOut(SchemaBaseModel):
     page_size: int
 
 
+class AiModelBillingRecommendationOut(SchemaBaseModel):
+    ai_model_id: UUID
+    model_id: str
+    model_type: str
+    vendor: str
+    platform_rate: Decimal
+    recommendation_basis: str
+    evaluated_success_tasks: int
+    sample_count: int
+    confidence: Literal["none", "low", "medium", "high"]
+    safe_to_apply: bool
+    minimum_points: Optional[int] = None
+    p50_points: Optional[int] = None
+    p90_points: Optional[int] = None
+    p95_points: Optional[int] = None
+    maximum_points: Optional[int] = None
+    recommended_base_points: Optional[int] = None
+    recommended_precharge_points: Optional[int] = None
+    current_base_points: int
+    suggested_patch: Optional[Dict[str, Any]] = None
+
+
 class AiModelOptionOut(SchemaBaseModel):
     id: UUID
     nickname: str
@@ -42,46 +75,76 @@ class AiModelOptionOut(SchemaBaseModel):
     vendor: str
     model_type: str
     remark: Optional[str] = None
-    points_cost: int
-    model_multiplier: Decimal
-    cache_multiplier: Decimal
-    completion_multiplier: Decimal
-    platform_multiplier: Decimal
-    capabilities: Dict[str, Any]
+    configuration: Dict[str, Any]
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class AiModelCreateRequest(SchemaBaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     nickname: str = Field(..., min_length=1, max_length=64)
     model_id: str = Field(..., min_length=1, max_length=128)
     vendor: str = Field(..., min_length=1, max_length=64)
-    model_type: str = Field(..., min_length=1, max_length=64)
+    model_type: AiModelType
     remark: Optional[str] = None
-    points_cost: int = Field(default=0, ge=0)
-    model_multiplier: Decimal = Field(default=Decimal("1.0000"), ge=0)
-    cache_multiplier: Decimal = Field(default=Decimal("1.0000"), ge=0)
-    completion_multiplier: Decimal = Field(default=Decimal("1.0000"), ge=0)
-    platform_multiplier: Decimal = Field(default=Decimal("1.0000"), ge=0)
     is_enabled: bool = True
     is_agent_default: bool = False
-    capabilities: Dict[str, Any] = Field(default_factory=dict)
+    configuration: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("nickname", "model_id", "vendor", "model_type", mode="before")
+    @classmethod
+    def normalize_required_text(cls, value: object) -> object:
+        return _required_text(value)
+
+    @field_validator("remark", mode="before")
+    @classmethod
+    def normalize_optional_text(cls, value: object) -> object:
+        return _optional_text(value)
+
+    @field_validator("configuration", mode="before")
+    @classmethod
+    def reject_null_configuration(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("字段不能为 null")
+        return value
 
 
 class AiModelUpdateRequest(SchemaBaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     nickname: Optional[str] = Field(default=None, min_length=1, max_length=64)
     model_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
     vendor: Optional[str] = Field(default=None, min_length=1, max_length=64)
-    model_type: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    model_type: Optional[AiModelType] = None
     remark: Optional[str] = None
-    points_cost: Optional[int] = Field(default=None, ge=0)
-    model_multiplier: Optional[Decimal] = Field(default=None, ge=0)
-    cache_multiplier: Optional[Decimal] = Field(default=None, ge=0)
-    completion_multiplier: Optional[Decimal] = Field(default=None, ge=0)
-    platform_multiplier: Optional[Decimal] = Field(default=None, ge=0)
     is_enabled: Optional[bool] = None
     is_agent_default: Optional[bool] = None
-    capabilities: Optional[Dict[str, Any]] = None
+    configuration: Optional[Dict[str, Any]] = None
+
+    @field_validator("nickname", "model_id", "vendor", "model_type", mode="before")
+    @classmethod
+    def normalize_present_required_text(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("字段不能为 null")
+        return _required_text(value)
+
+    @field_validator(
+        "is_enabled",
+        "is_agent_default",
+        "configuration",
+        mode="before",
+    )
+    @classmethod
+    def reject_null_non_nullable_fields(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("字段不能为 null")
+        return value
+
+    @field_validator("remark", mode="before")
+    @classmethod
+    def normalize_optional_text(cls, value: object) -> object:
+        return _optional_text(value)
 
 
 class ProviderModelOut(SchemaBaseModel):
@@ -90,14 +153,9 @@ class ProviderModelOut(SchemaBaseModel):
     nickname: str
     vendor: str
     model_type: str
-    points_cost: int = 0
-    model_multiplier: Decimal = Decimal("1.0000")
-    cache_multiplier: Decimal = Decimal("1.0000")
-    completion_multiplier: Decimal = Decimal("1.0000")
-    platform_multiplier: Decimal = Decimal("1.0000")
     is_enabled: bool = True
     is_agent_default: bool = False
-    capabilities: Dict[str, Any] = Field(default_factory=dict)
+    configuration: Dict[str, Any] = Field(default_factory=dict)
     object: Optional[str] = None
     owned_by: Optional[str] = None
     root: Optional[str] = None
@@ -105,22 +163,37 @@ class ProviderModelOut(SchemaBaseModel):
 
 
 class ProviderModelImportItem(SchemaBaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     model_id: str = Field(..., min_length=1, max_length=128)
     nickname: Optional[str] = Field(default=None, max_length=64)
     vendor: Optional[str] = Field(default=None, max_length=64)
-    model_type: str = Field(default="text", min_length=1, max_length=64)
+    model_type: AiModelType = "text"
     remark: Optional[str] = None
-    points_cost: int = Field(default=0, ge=0)
-    model_multiplier: Decimal = Field(default=Decimal("1.0000"), ge=0)
-    cache_multiplier: Decimal = Field(default=Decimal("1.0000"), ge=0)
-    completion_multiplier: Decimal = Field(default=Decimal("1.0000"), ge=0)
-    platform_multiplier: Decimal = Field(default=Decimal("1.0000"), ge=0)
     is_enabled: bool = True
-    capabilities: Dict[str, Any] = Field(default_factory=dict)
+    is_agent_default: bool = False
+    configuration: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("model_id", "model_type", mode="before")
+    @classmethod
+    def normalize_required_text(cls, value: object) -> object:
+        return _required_text(value)
+
+    @field_validator("nickname", "vendor", "remark", mode="before")
+    @classmethod
+    def normalize_optional_text(cls, value: object) -> object:
+        return _optional_text(value)
+
+    @field_validator("configuration", mode="before")
+    @classmethod
+    def reject_null_configuration(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("字段不能为 null")
+        return value
 
 
 class ProviderModelImportRequest(SchemaBaseModel):
-    models: List[ProviderModelImportItem]
+    models: List[ProviderModelImportItem] = Field(..., min_length=1, max_length=100)
 
 
 class ProviderModelImportOut(SchemaBaseModel):

@@ -25,6 +25,14 @@ from app.services.task_records import (
 router = APIRouter(prefix="/admin/task-records")
 
 
+def _dump_admin_task_record(record) -> dict:
+    data = UserTaskRecordOut.model_validate(record).model_dump(mode="json")
+    provider_cost_billing = (record.extra or {}).get("provider_cost_billing")
+    if isinstance(provider_cost_billing, dict):
+        data["provider_cost_billing"] = provider_cost_billing
+    return data
+
+
 @router.get("")
 async def admin_task_records(
     user_id: Optional[UUID] = Query(default=None),
@@ -69,7 +77,7 @@ async def admin_task_record_detail(
     current_admin: User = Depends(get_current_admin_user),
 ):
     record = await get_task_record_or_404(db, task_record_id)
-    return success(data=UserTaskRecordOut.model_validate(record).model_dump(mode="json"))
+    return success(data=_dump_admin_task_record(record))
 
 
 @router.post("/{task_record_id}/interrupt")
@@ -85,4 +93,4 @@ async def admin_interrupt_task_record(
         admin_user_id=current_admin.id,
         reason=payload.reason if payload else None,
     )
-    return success(data=UserTaskRecordOut.model_validate(record).model_dump(mode="json"))
+    return success(data=_dump_admin_task_record(record))

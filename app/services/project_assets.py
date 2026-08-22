@@ -10,6 +10,7 @@ from app.models.project_asset import ProjectCharacter, ProjectProp, ProjectScene
 from app.models.project_chapter import ProjectChapter
 from app.services.projects import get_project_or_404
 from app.services.core_asset_change_tracking import track_core_asset_reference_change
+from app.services.task_records import cancel_project_resource_task_records
 
 
 AssetModel = Union[Type[ProjectCharacter], Type[ProjectScene], Type[ProjectProp]]
@@ -189,6 +190,13 @@ async def delete_project_asset(
     user_id: UUID,
 ) -> Any:
     asset = await get_project_asset_or_404(db, model, project_id, asset_id, user_id)
+    await cancel_project_resource_task_records(
+        db,
+        project_id,
+        user_id,
+        match_extra={"asset_id": asset_id},
+        reason="资产已删除",
+    )
     asset.is_enabled = False
     asset.updated_at = beijing_datetime()
     await db.commit()
