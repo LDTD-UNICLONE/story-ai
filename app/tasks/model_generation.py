@@ -20,7 +20,6 @@ from app.models.ai_model import AiModel
 from app.models.conversation import Conversation, ConversationMessage
 from app.models.task_record import UserTaskRecord
 from app.services.generated_media import persist_generated_media_to_oss
-from app.services.apimart_private_avatars import prepare_private_avatar_references
 from app.services.model_points import (
     settle_image_task_points,
     settle_text_task_points,
@@ -245,27 +244,6 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
                     assistant_message,
                 )
             generation_extra = (task_record.extra or {}).get("user_message_extra") or {}
-            if (
-                ai_model.vendor == APIMART_VENDOR
-                and task_record.generation_type == "video"
-            ):
-                prepared_extra = await prepare_private_avatar_references(
-                    db,
-                    task_record,
-                    ai_model.model_id,
-                    generation_extra,
-                )
-                if prepared_extra is None:
-                    assistant_message.extra = {
-                        **(assistant_message.extra or {}),
-                        "task_status": "running",
-                        "provider_stage": "private_avatar_review",
-                        "private_avatar": (task_record.extra or {}).get("private_avatar") or {},
-                    }
-                    await db.commit()
-                    _enqueue_provider_reconcile_if_needed(task_record)
-                    return
-                generation_extra = prepared_extra
             model_result = await run_model(
                 model_snapshot,
                 task_record.generation_type,

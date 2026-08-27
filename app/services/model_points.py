@@ -983,7 +983,6 @@ def _has_image_reference(extra: Dict[str, Any]) -> bool:
         "reference_image_url",
         "reference_image_urls",
         "reference_images",
-        "private_avatar_image_urls",
         "image_with_roles",
         "img_references",
         "first_frame_url",
@@ -995,7 +994,6 @@ def _has_image_reference(extra: Dict[str, Any]) -> bool:
         "last_frame_image",
         "last_image_url",
         "avatar_id",
-        "private_avatar_id",
     ):
         if _has_value(extra.get(key)):
             return True

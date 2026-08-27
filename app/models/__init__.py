@@ -22,7 +22,6 @@ from app.models.agent_review import (
     AgentReviewIssue,
 )
 from app.models.announcement import Announcement
-from app.models.apimart_private_avatar import ApimartPrivateAvatarAsset
 from app.models.conversation import Conversation, ConversationMessage
 from app.models.material import Material
 from app.models.oss_deletion import OssDeletionOutbox
@@ -54,7 +53,6 @@ __all__ = [
     "AgentReviewIssue",
     "AgentStoryboardMediaRequest",
     "Announcement",
-    "ApimartPrivateAvatarAsset",
     "Conversation",
     "ConversationMessage",
     "Material",

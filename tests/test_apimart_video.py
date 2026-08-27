@@ -192,79 +192,6 @@ async def test_create_apimart_video_generation_uses_unified_endpoint(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_create_private_avatar_assets_uses_seedance_endpoint(monkeypatch) -> None:
-    client = _Client(
-        {
-            "code": 200,
-            "data": {
-                "id": "avatar-task-1",
-                "object": "seedance.avatar.asset.task",
-                "status": "processing",
-                "progress": 10,
-            },
-        }
-    )
-
-    async def get_client():
-        return client
-
-    monkeypatch.setattr(apimart, "_get_client", get_client)
-
-    result = await apimart.create_private_avatar_assets(
-        [
-            {"url": "https://cdn.example/avatar-a.png", "name": "avatar-a"},
-            {"url": "https://cdn.example/avatar-b.png", "name": "avatar-b"},
-        ],
-        group_name="story-ai-user-1",
-        project_name="story-ai",
-    )
-
-    assert result["data"]["id"] == "avatar-task-1"
-    assert client.captured["path"] == "/seedance2/private-avatar"
-    assert client.captured["body"] == {
-        "group": {"name": "story-ai-user-1"},
-        "project_name": "story-ai",
-        "asset_type": "Image",
-        "assets": [
-            {"url": "https://cdn.example/avatar-a.png", "name": "avatar-a"},
-            {"url": "https://cdn.example/avatar-b.png", "name": "avatar-b"},
-        ],
-    }
-
-
-@pytest.mark.asyncio
-async def test_create_private_avatar_assets_uses_seedance_25_asset_endpoint(
-    monkeypatch,
-) -> None:
-    client = _Client(
-        {
-            "code": 200,
-            "data": {
-                "id": "avatar-task-25",
-                "status": "processing",
-                "progress": 5,
-            },
-        }
-    )
-
-    async def get_client():
-        return client
-
-    monkeypatch.setattr(apimart, "_get_client", get_client)
-
-    result = await apimart.create_private_avatar_assets(
-        [{"url": "https://cdn.example/avatar.png", "name": "avatar"}],
-        group_name="story-ai-user-1",
-        project_name="story-ai",
-        model="seedance-2.5",
-    )
-
-    assert result["data"]["id"] == "avatar-task-25"
-    assert client.captured["path"] == "/seedance2/private-avatar/assets"
-    assert client.captured["body"]["model"] == "seedance-2.5"
-
-
-@pytest.mark.asyncio
 async def test_seedance_nsfw_rejection_returns_actionable_error(monkeypatch) -> None:
     request = httpx.Request("POST", "https://api.apib.ai/v1/videos/generations")
     response = httpx.Response(400, request=request)
@@ -292,17 +219,6 @@ async def test_seedance_nsfw_rejection_returns_actionable_error(monkeypatch) -> 
         )
 
     assert exc_info.value.code == 40019
-
-
-def test_private_avatar_assets_reject_more_than_twenty_items() -> None:
-    with pytest.raises(AppException, match="最多提交 20 个"):
-        apimart.build_private_avatar_payload(
-            [
-                {"url": f"https://cdn.example/avatar-{index}.png", "name": str(index)}
-                for index in range(21)
-            ],
-            group_name="story-ai-user-1",
-        )
 
 
 @pytest.mark.asyncio
@@ -415,18 +331,7 @@ def test_apimart_video_capabilities_expose_model_duration_contracts() -> None:
         "controllable": False,
         "provider_managed": True,
     }
-    assert video_model_capabilities("seedance-2.0")["private_avatar"] == {
-        "supported": True,
-        "max_assets_per_request": 20,
-        "asset_type": "Image",
-    }
-    assert video_model_capabilities("seedance-2.5")["private_avatar"] == {
-        "supported": True,
-        "max_assets_per_request": 20,
-        "asset_type": "Image",
-    }
     seedance_25_keys = video_model_capabilities("seedance-2.5")["request_keys"]
-    assert "private_avatar" in seedance_25_keys
     assert "watermark" not in seedance_25_keys
 
 

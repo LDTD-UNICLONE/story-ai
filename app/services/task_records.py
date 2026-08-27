@@ -19,12 +19,6 @@ from app.models.project_storyboard import ProjectStoryboard
 from app.models.task_record import UserTaskRecord
 from app.models.user import User
 from app.services.generated_media import persist_generated_media_to_oss
-from app.services.apimart_private_avatars import (
-    complete_private_avatar_review,
-    is_private_avatar_stage,
-    mark_private_avatar_ready_for_resume,
-    update_private_avatar_progress,
-)
 from app.services.core_asset_change_tracking import track_core_asset_reference_change
 from app.services.model_points import (
     build_model_billing_snapshot,
@@ -668,32 +662,6 @@ async def _finish_provider_reconcile_claim(
         return record
 
     status = str(model_result.extra.get("task_status") or "").lower()
-    if is_private_avatar_stage(record):
-        if not _is_provider_terminal_status(status):
-            update_private_avatar_progress(record, model_result.extra)
-            await _mark_next_reconcile(db, record, None)
-            await db.refresh(record)
-            return record
-
-        private_avatar_result = await complete_private_avatar_review(
-            db,
-            record,
-            model_result.extra,
-        )
-        if private_avatar_result.failed_reason:
-            await _mark_reconciled_failed(
-                db,
-                record,
-                private_avatar_result.failed_reason,
-                model_result.extra,
-            )
-        else:
-            mark_private_avatar_ready_for_resume(record)
-            record.extra = _clear_provider_reconcile_claim(record.extra or {})
-            await db.commit()
-            await db.refresh(record)
-        return record
-
     if _is_provider_failed_status(status):
         await _mark_reconciled_failed(
             db, record, f"模型任务执行失败：{status or 'failed'}", model_result.extra
@@ -861,13 +829,6 @@ def task_record_progress_percent(record: UserTaskRecord) -> Optional[int]:
         return 100
 
     extra = getattr(record, "extra", None) or {}
-    if is_private_avatar_stage(record):
-        private_avatar = extra.get("private_avatar") or {}
-        progress_percent = _normalize_progress_percent(
-            private_avatar.get("progress_percent")
-        )
-        if progress_percent is not None:
-            return progress_percent
     for candidate in (
         extra,
         extra.get("last_provider_task_status"),
@@ -1012,8 +973,6 @@ def _should_skip_provider_reconcile(record: UserTaskRecord) -> bool:
 
 
 def _provider_reconcile_interval(record: Optional[UserTaskRecord]) -> int:
-    if record is not None and is_private_avatar_stage(record):
-        return max(5, settings.provider_task_poll_interval_seconds)
     generation_type = record.generation_type if record is not None else None
     return provider_poll_interval_seconds(generation_type)
 

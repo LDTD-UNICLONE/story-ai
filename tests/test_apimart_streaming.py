@@ -1,6 +1,7 @@
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -49,6 +50,37 @@ def test_conversation_sse_event_uses_named_json_event() -> None:
         "delta": "你好",
         "status": "running",
     }
+
+
+@pytest.mark.asyncio
+async def test_conversation_stream_releases_request_transaction_before_response(
+    monkeypatch,
+) -> None:
+    task_id = uuid4()
+    message_id = uuid4()
+    task_record = SimpleNamespace(id=task_id)
+    assistant_message = SimpleNamespace(id=message_id)
+    db = SimpleNamespace(rollback=AsyncMock())
+
+    async def get_status(*args, **kwargs):
+        return task_record, assistant_message
+
+    monkeypatch.setattr(
+        conversation_endpoint,
+        "get_conversation_generation_task_status",
+        get_status,
+    )
+
+    response = await conversation_endpoint.stream_my_conversation_generation_task(
+        conversation_id=uuid4(),
+        task_record_id=task_id,
+        request=SimpleNamespace(),
+        db=db,
+        current_user=SimpleNamespace(id=uuid4()),
+    )
+
+    db.rollback.assert_awaited_once()
+    await response.body_iterator.aclose()
 
 
 @pytest.mark.asyncio

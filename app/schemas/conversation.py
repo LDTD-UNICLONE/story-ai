@@ -125,7 +125,6 @@ _MESSAGE_EXTRA_COMPAT_FIELDS = {
     "media",
     "media_items",
     "nsfw_check",
-    "private_avatar",
     "ratio",
     "reference_audio",
     "reference_audio_url",

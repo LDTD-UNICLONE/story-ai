@@ -38,7 +38,6 @@ from app.models.task_record import UserTaskRecord
 from app.models.user import User
 from app.schemas.project_storyboard import ProjectStoryboardVideoGenerateRequest
 from app.services.generated_media import persist_generated_media_to_oss
-from app.services.apimart_private_avatars import prepare_private_avatar_references
 from app.services.model_points import (
     calculate_submission_points_cost,
     ensure_model_minimum_balance,
@@ -137,18 +136,6 @@ async def submit_storyboard_video_generation(
         reference_images,
         resolution,
     )
-    if ai_model.vendor == APIMART_VENDOR and not agent_context and payload.character_ids:
-        character_reference_images = await _asset_reference_images(
-            db,
-            ProjectCharacter,
-            project_id,
-            user.id,
-            payload.character_ids,
-        )
-        model_extra["private_avatar_image_urls"] = await resolve_storyboard_reference_image_urls(
-            db,
-            _dedupe(character_reference_images),
-        )
     compiled_agent_prompt = str(
         (agent_context or {}).get("agent_compiled_prompt") or ""
     ).strip()
@@ -255,23 +242,6 @@ async def run_storyboard_video_generation_in_worker(
 
     model_snapshot = build_model_runtime_snapshot(ai_model)
     generation_extra = (task_record.extra or {}).get("model_extra") or {}
-    if ai_model.vendor == APIMART_VENDOR:
-        prepared_extra = await prepare_private_avatar_references(
-            db,
-            task_record,
-            ai_model.model_id,
-            generation_extra,
-        )
-        if prepared_extra is None:
-            storyboard.extra = {
-                **(storyboard.extra or {}),
-                "video_generation_status": "running",
-                "video_generation_stage": "private_avatar_review",
-                "video_generation_task_record_id": str(task_record.id),
-                "private_avatar": (task_record.extra or {}).get("private_avatar") or {},
-            }
-            return
-        generation_extra = prepared_extra
     model_result = await run_model(
         model_snapshot,
         "video",

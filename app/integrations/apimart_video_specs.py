@@ -336,8 +336,6 @@ def video_model_capabilities(model: str) -> Dict[str, Any]:
     if not spec.duration_controllable:
         duration["provider_managed"] = True
     request_keys = list(family_fields[spec.family])
-    if spec.family in {"seedance_2_0", "seedance_2_5"}:
-        request_keys.append("private_avatar")
     capabilities: Dict[str, Any] = {
         "provider": "apimart",
         "model_family": spec.family,
@@ -357,12 +355,6 @@ def video_model_capabilities(model: str) -> Dict[str, Any]:
         "supports_async_task": True,
     }
     capabilities["duration"] = duration
-    if spec.family in {"seedance_2_0", "seedance_2_5"}:
-        capabilities["private_avatar"] = {
-            "supported": True,
-            "max_assets_per_request": 20,
-            "asset_type": "Image",
-        }
     return capabilities
 
 
@@ -388,7 +380,6 @@ def merge_video_capabilities(model: str, saved: Optional[Dict[str, Any]]) -> Dic
         "resolutions",
         "supports_async_task",
         "task_endpoint",
-        "private_avatar",
     ):
         if key in inferred:
             merged[key] = inferred[key]

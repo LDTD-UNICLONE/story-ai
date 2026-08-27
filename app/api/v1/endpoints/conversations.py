@@ -234,6 +234,7 @@ async def stream_my_conversation_generation_task(
         task_record_id=task_record_id,
     )
     assistant_message_id = assistant_message.id if assistant_message is not None else None
+    await db.rollback()
     return StreamingResponse(
         _conversation_generation_event_stream(
             request,
