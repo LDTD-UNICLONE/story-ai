@@ -20,6 +20,8 @@ build/
 /key
 /logs
 *.log
+celerybeat-schedule
+celerybeat-schedule.*
 *.pem
 *.crt
 *.key
