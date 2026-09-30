@@ -18,7 +18,7 @@ from app.schemas.agent_production import (
     AgentEpisodePlanSplitRequest,
     AgentEpisodePlanUpdateRequest,
 )
-from app.services.agent_episode_plans import (
+from app.services.agent.episode_plans import (
     EpisodePlanContext,
     confirm_episode_plan,
     get_episode_plan_document,

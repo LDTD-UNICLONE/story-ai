@@ -73,7 +73,7 @@ async def test_token_version_mismatch_requires_new_login(monkeypatch) -> None:
 async def test_admin_password_reset_increments_token_version(monkeypatch) -> None:
     user = SimpleNamespace(password_hash="old", token_version=3)
 
-    async def fake_get_user_or_404(db, user_id):
+    async def fake_get_user_or_404(db, user_id, *, lock=False):
         return user
 
     class FakeDb:

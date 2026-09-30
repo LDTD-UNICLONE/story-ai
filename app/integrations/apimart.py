@@ -769,13 +769,36 @@ async def query_generation_task(task_id: str) -> Dict[str, Any]:
         response = await (await _get_client()).get(
             f"/tasks/{quote(normalized_task_id, safe='')}",
             cast_to=httpx.Response,
-            options={"query": {"language": "zh"}},
+            options={"query": {"language": "zh"}, "timeout": settings.provider_query_timeout_seconds, "max_retries": 0},
         )
         payload = await _read_json_response(response, "APIMart 任务响应格式错误")
     except Exception as exc:
         _raise_provider_error("APIMart 任务查询失败", exc)
     data = payload.get("data")
     return data if isinstance(data, dict) else payload
+
+
+async def create_private_avatar(source_url: str, name: str) -> Dict[str, Any]:
+    """One file per task keeps result-to-file association unambiguous.
+
+    Do not retry POST automatically: the provider documents no idempotency contract.
+    """
+    response = await (await _get_client()).post(
+        "/seedance2/private-avatar",
+        cast_to=httpx.Response,
+        body={
+            "group": {"name": name},
+            "project_name": "default",
+            "asset_type": "Image",
+            "assets": [{"url": source_url, "name": name}],
+        },
+        options={"timeout": settings.apimart_timeout_seconds, "max_retries": 0},
+    )
+    payload = await _read_json_response(response, "素材提交响应格式错误")
+    data = payload.get("data")
+    if payload.get("code", 200) != 200 or not isinstance(data, dict) or not data.get("id"):
+        raise AppException("素材提交结果不明确，请联系管理员核对", code=50231, status_code=502)
+    return data
 
 
 def _raise_provider_error(prefix: str, exc: Exception) -> None:

@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 from app.main import app
-from app.services.agent_workflow_steps import (
+from app.services.agent.workflow_steps import (
     PRODUCT_STEP_CODES,
     _episode_script_status,
     _episode_storyboard_status,

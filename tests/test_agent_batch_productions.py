@@ -11,9 +11,9 @@ from app.schemas.agent_batch_production import (
     AgentBatchDispatchRequest,
     AgentVideoModelSelectionRequest,
 )
-from app.services import agent_batch_productions as batch_service
-from app.services.agent_productions import _agent_step_task_record_ids
-from app.services.agent_workflow import agent_pilot_episode_count
+from app.services.agent import batch_productions as batch_service
+from app.services.agent.productions import _agent_step_task_record_ids
+from app.services.agent.workflow import agent_pilot_episode_count
 
 
 def test_agent_batch_routes_are_registered() -> None:

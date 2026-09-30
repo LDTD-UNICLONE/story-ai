@@ -18,11 +18,10 @@ from app.api.v1.endpoints import (
     materials,
     models,
     points,
-    project_asset_analysis,
-    project_assets,
-    project_chapter_processing,
-    project_chapters,
-    project_storyboards,
+    project_canvases,
+    canvas_generations,
+    canvas_import_records,
+    project_media,
     projects,
     styles,
     task_records,
@@ -70,11 +69,10 @@ api_router.include_router(conversations.router, tags=["Conversations"])
 api_router.include_router(materials.router, tags=["Materials"])
 api_router.include_router(models.router, tags=["Models"])
 api_router.include_router(points.router, tags=["Points"])
-api_router.include_router(project_asset_analysis.router, tags=["Project Asset Analysis"])
-api_router.include_router(project_assets.router, tags=["Project Assets"])
-api_router.include_router(project_chapter_processing.router, tags=["Project Chapter Processing"])
-api_router.include_router(project_chapters.router, tags=["Project Chapters"])
-api_router.include_router(project_storyboards.router, tags=["Project Storyboards"])
+api_router.include_router(project_canvases.router, tags=["Project Canvases"])
+api_router.include_router(canvas_generations.router, tags=["Project Canvases"])
+api_router.include_router(canvas_import_records.router, tags=["Project Canvases"])
+api_router.include_router(project_media.router, tags=["Project Media"])
 api_router.include_router(projects.router, tags=["Projects"])
 api_router.include_router(styles.router, tags=["Styles"])
 api_router.include_router(task_records.router, tags=["Task Records"])

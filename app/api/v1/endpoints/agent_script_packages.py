@@ -18,12 +18,12 @@ from app.schemas.agent_story_bible import (
     AgentAssetVariantOut,
     AgentAssetVariantUpdateRequest,
 )
-from app.services.agent_script_packages import (
+from app.services.agent.script_packages import (
     confirm_script_package,
     get_script_package,
     update_script_asset_variant,
 )
-from app.services.agent_script_supplements import (
+from app.services.agent.script_supplements import (
     append_agent_script_file,
     append_agent_script_text,
 )

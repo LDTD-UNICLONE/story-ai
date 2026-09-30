@@ -11,7 +11,7 @@ from app.schemas.agent_pilot_production import (
     AgentPilotActionRequest,
     AgentPilotProductionOut,
 )
-from app.services.agent_pilot_productions import (
+from app.services.agent.pilot_productions import (
     confirm_pilot_production,
     get_pilot_production,
     start_pilot_storyboards,

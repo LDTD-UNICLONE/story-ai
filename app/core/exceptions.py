@@ -95,7 +95,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             message="参数校验失败",
             code=42200,
             data=validation_errors,
-            http_status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            http_status=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 
     @app.exception_handler(Exception)

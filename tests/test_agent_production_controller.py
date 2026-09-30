@@ -3,8 +3,8 @@ from uuid import uuid4
 
 import pytest
 
-from app.services import agent_production_controller as controller_service
-from app.services.agent_task_context import build_agent_task_context
+from app.services.agent import production_controller as controller_service
+from app.services.agent.task_context import build_agent_task_context
 from app.tasks import agent_delivery as delivery_tasks
 from app.tasks import agent_production_controller as controller_tasks
 from app.worker import celery_app

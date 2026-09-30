@@ -23,7 +23,7 @@ from app.integrations.model_providers import (
 )
 from app.integrations.redis import close_redis, init_redis
 from app.services.oss_deletions import process_oss_deletion_outbox
-from app.services.recharges import purge_expired_pending_recharge_orders
+from app.services.billing.recharges import purge_expired_pending_recharge_orders
 from app.services.works import purge_unused_work_uploads
 
 configure_logging()

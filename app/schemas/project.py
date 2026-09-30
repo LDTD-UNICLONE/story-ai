@@ -5,8 +5,6 @@ from uuid import UUID
 from pydantic import ConfigDict, Field, field_validator
 from app.schemas.base import SchemaBaseModel
 
-from app.schemas.style import StyleBaseOut
-
 
 ProjectGenerationRatio = Literal["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
 
@@ -16,14 +14,11 @@ class ProjectOut(SchemaBaseModel):
 
     id: UUID
     user_id: UUID
-    style_id: Optional[UUID] = None
     name: str
     cover: str
     description: str
-    generation_ratio: Optional[str] = None
     project_kind: Literal["standard", "agent"]
     is_enabled: bool
-    style: Optional[StyleBaseOut] = None
     created_at: datetime
     updated_at: datetime
 
@@ -36,11 +31,11 @@ class ProjectListOut(SchemaBaseModel):
 
 
 class ProjectCreateRequest(SchemaBaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(..., min_length=1, max_length=128)
     cover: Optional[str] = Field(default="", max_length=512)
     description: Optional[str] = Field(default="")
-    generation_ratio: ProjectGenerationRatio
-    style_id: UUID
 
     @field_validator("name")
     @classmethod
@@ -52,11 +47,11 @@ class ProjectCreateRequest(SchemaBaseModel):
 
 
 class ProjectUpdateRequest(SchemaBaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: Optional[str] = Field(default=None, min_length=1, max_length=128)
     cover: Optional[str] = Field(default=None, max_length=512)
     description: Optional[str] = Field(default=None)
-    generation_ratio: Optional[ProjectGenerationRatio] = None
-    style_id: Optional[UUID] = None
 
     @field_validator("name")
     @classmethod
@@ -68,7 +63,7 @@ class ProjectUpdateRequest(SchemaBaseModel):
             raise ValueError("项目名称不能为空")
         return value
 
-    @field_validator("cover", "description", "generation_ratio", "style_id")
+    @field_validator("cover", "description")
     @classmethod
     def reject_null_required_fields(cls, value):
         if value is None:

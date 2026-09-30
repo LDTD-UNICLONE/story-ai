@@ -375,6 +375,8 @@ async def test_anonymous_list_succeeds_but_anonymous_like_is_rejected(monkeypatc
 
     app.dependency_overrides[get_db] = override_db
     monkeypatch.setattr(works_endpoint, "list_public_works", list_public_works)
+    # Access rules are tested here; Redis limiting is covered in test_request_security.py.
+    monkeypatch.setattr(settings, "rate_limit_enabled", False)
     transport = httpx.ASGITransport(app=app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -401,7 +403,7 @@ async def test_unlike_does_not_disclose_another_users_private_work(monkeypatch) 
     )
     user = SimpleNamespace(id=uuid4(), is_admin=False)
 
-    async def get_work(_db, _work_id):
+    async def get_work(_db, _work_id, *, lock=False):
         return work
 
     class FailOnExecuteDb:
@@ -427,7 +429,7 @@ async def test_unlike_requires_a_published_public_work(monkeypatch) -> None:
         visibility="private",
     )
 
-    async def get_work(_db, _work_id):
+    async def get_work(_db, _work_id, *, lock=False):
         return work
 
     class FailOnExecuteDb:
@@ -453,7 +455,7 @@ async def test_owner_cannot_republish_admin_hidden_work(monkeypatch) -> None:
         is_enabled=True,
     )
 
-    async def get_work(_db, _work_id):
+    async def get_work(_db, _work_id, *, lock=False):
         return work
 
     monkeypatch.setattr(works_service, "_get_work_or_404", get_work)
@@ -477,7 +479,7 @@ async def test_admin_patch_cannot_publish_work_without_media(monkeypatch) -> Non
         is_enabled=True,
     )
 
-    async def get_work(_db, _work_id):
+    async def get_work(_db, _work_id, *, lock=False):
         return work
 
     async def has_media(_db, _work_id):

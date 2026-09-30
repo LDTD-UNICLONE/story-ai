@@ -5,6 +5,7 @@ from typing import Any
 
 
 INTERNAL_EXTRA_KEYS = {
+    "provider_completed_result",
     "provider_cost_billing",
     "raw_failed_reason",
     "provider_response",
@@ -76,7 +77,8 @@ def sanitize_public_data(value: Any) -> Any:
     if isinstance(value, tuple):
         return [sanitize_public_data(item) for item in value]
     if isinstance(value, str):
-        return sanitize_public_message(value)
+        # Empty business data is not an error; keep the original blank value.
+        return sanitize_public_message(value, fallback=value)
     return value
 
 

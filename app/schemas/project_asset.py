@@ -247,20 +247,6 @@ def _reject_null_json_field(value):
     return value
 
 
-class ProjectAssetAnalyzeRequest(SchemaBaseModel):
-    ai_model_id: UUID
-    analysis_prompt: Optional[str] = Field(default=None, min_length=1)
-    extra: Optional[Dict[str, Any]] = None
-
-
-class ProjectAssetAnalyzeOut(SchemaBaseModel):
-    task_record_id: UUID
-    asset_type: str
-    status: str
-    points_cost: int
-    next_poll_seconds: Optional[int] = None
-
-
 class ProjectAssetImageGenerateRequest(SchemaBaseModel):
     ai_model_id: UUID
     generation_mode: str = Field(default="general", min_length=1, max_length=64)

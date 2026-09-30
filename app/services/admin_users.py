@@ -10,7 +10,7 @@ from app.core.config import settings
 from app.core.security import hash_password
 from app.models.user import User
 from app.schemas.user import AdminUserCreateRequest, AdminUserUpdateRequest
-from app.services.points import change_user_points
+from app.services.billing.points import change_user_points
 
 
 async def list_users(
@@ -51,8 +51,11 @@ async def list_users(
     return list(result.scalars().all()), total
 
 
-async def get_user_or_404(db: AsyncSession, user_id: UUID) -> User:
-    result = await db.execute(select(User).where(User.id == user_id))
+async def get_user_or_404(db: AsyncSession, user_id: UUID, *, lock: bool = False) -> User:
+    query = select(User).where(User.id == user_id)
+    if lock:
+        query = query.with_for_update().execution_options(populate_existing=True)
+    result = await db.execute(query)
     user = result.scalar_one_or_none()
     if user is None:
         raise AppException("用户不存在", code=40401, status_code=404)
@@ -66,7 +69,7 @@ async def create_user(db: AsyncSession, payload: AdminUserCreateRequest) -> User
     if payload.email:
         unique_conditions.append(User.email == payload.email)
 
-    exists = await db.execute(select(User).where(or_(*unique_conditions)))
+    exists = await db.execute(select(User).where(or_(*unique_conditions)).limit(1))
     if exists.scalar_one_or_none() is not None:
         raise AppException("账号、手机号或邮箱已存在", code=40901, status_code=409)
 
@@ -108,7 +111,7 @@ async def update_user(
     *,
     current_admin_id: UUID,
 ) -> User:
-    user = await get_user_or_404(db, user_id)
+    user = await get_user_or_404(db, user_id, lock=True)
     update_data = payload.model_dump(exclude_unset=True)
     if user_id == current_admin_id and (
         update_data.get("is_admin") is False or update_data.get("is_enabled") is False
@@ -128,10 +131,17 @@ async def update_user(
         unique_conditions.append(User.email == update_data["email"])
 
     if unique_conditions:
-        exists = await db.execute(select(User).where(or_(*unique_conditions), User.id != user_id))
+        exists = await db.execute(
+            select(User).where(or_(*unique_conditions), User.id != user_id).limit(1)
+        )
         if exists.scalar_one_or_none() is not None:
             raise AppException("账号、手机号或邮箱已存在", code=40901, status_code=409)
 
+    if any(
+        field in update_data and update_data[field] != getattr(user, field)
+        for field in ("is_admin", "is_enabled")
+    ):
+        user.token_version += 1
     for field, value in update_data.items():
         setattr(user, field, value)
 
@@ -146,7 +156,7 @@ async def update_user(
 
 
 async def reset_user_password(db: AsyncSession, user_id: UUID, password: str) -> User:
-    user = await get_user_or_404(db, user_id)
+    user = await get_user_or_404(db, user_id, lock=True)
     user.password_hash = hash_password(password)
     user.token_version += 1
     await db.commit()
@@ -158,6 +168,8 @@ async def delete_user(db: AsyncSession, user_id: UUID, current_admin_id: UUID) -
     if user_id == current_admin_id:
         raise AppException("不能删除当前登录管理员", code=40001, status_code=400)
 
-    user = await get_user_or_404(db, user_id)
-    user.is_enabled = False
+    user = await get_user_or_404(db, user_id, lock=True)
+    if user.is_enabled:
+        user.is_enabled = False
+        user.token_version += 1
     await db.commit()

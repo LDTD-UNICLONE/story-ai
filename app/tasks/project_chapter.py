@@ -16,14 +16,21 @@ from app.integrations.model_providers import close_model_provider_clients
 from app.models.ai_model import AiModel
 from app.models.project_chapter import ProjectChapter
 from app.models.task_record import UserTaskRecord
-from app.services.model_points import settle_text_task_points
-from app.services.model_configuration import build_model_runtime_snapshot
-from app.services.model_runner import run_model
-from app.services.points import change_user_points
+from app.services.billing.model_points import refund_task_points, settle_text_task_points
+from app.services.models.configuration import build_model_runtime_snapshot
+from app.services.generation.runner import run_model
 from app.services.prompts import render_system_prompt
-from app.services.task_records import refresh_task_record_interrupted
-from app.services.task_execution import TaskExecutionDeferred, prepare_task_execution
-from app.worker import celery_app
+from app.services.generation.task_execution import (
+    TaskExecutionDeferred,
+    lock_active_task,
+    prepare_task_execution,
+)
+from app.tasks.retry_policy import (
+    is_retryable_provider_error,
+    retry_countdown,
+    user_failed_reason,
+)
+from app.core.celery_app import celery_app
 
 
 WorkerSessionLocal = create_worker_sessionmaker()
@@ -49,15 +56,15 @@ def run_project_chapter_processing(self, task_record_id: str, chapter_id: str) -
     except TaskExecutionDeferred as exc:
         raise self.retry(countdown=exc.retry_after_seconds) from exc
     except Exception as exc:
-        if self.request.retries < settings.celery_task_max_retries and _is_retryable_provider_error(
+        if self.request.retries < settings.celery_task_max_retries and is_retryable_provider_error(
             exc
         ):
-            raise self.retry(exc=exc, countdown=_retry_countdown(self.request.retries)) from exc
+            raise self.retry(exc=exc, countdown=retry_countdown(self.request.retries)) from exc
         asyncio.run(
             _fail_processing(
                 UUID(task_record_id),
                 UUID(chapter_id),
-                _user_failed_reason(exc),
+                user_failed_reason(exc, retryable_message="模型服务繁忙，请稍后再试"),
                 raw_reason=str(exc) or "任务执行失败",
             )
         )
@@ -112,6 +119,8 @@ async def _execute_processing(task_record_id: UUID, chapter_id: UUID) -> None:
         model_snapshot = build_model_runtime_snapshot(ai_model)
         try:
             model_prompt = _resolve_model_prompt(task_record, chapter)
+            if not await lock_active_task(db, task_record):
+                return
             task_record.extra = {
                 **(task_record.extra or {}),
                 "provider_call_status": "started",
@@ -137,13 +146,10 @@ async def _execute_processing(task_record_id: UUID, chapter_id: UUID) -> None:
                 (task_record.extra or {}).get("model_extra") or {},
                 idempotency_key=str(task_record.id),
             )
-            task_record.extra = {
-                **(task_record.extra or {}),
-                "provider_call_status": "finished",
-                "provider_call_finished_at": beijing_datetime().isoformat(),
-            }
         except Exception as exc:
-            if _is_retryable_provider_error(exc):
+            await db.rollback()
+            await db.refresh(task_record)
+            if is_retryable_provider_error(exc):
                 await _mark_retrying(
                     db,
                     task_record,
@@ -161,8 +167,14 @@ async def _execute_processing(task_record_id: UUID, chapter_id: UUID) -> None:
             )
             return
 
-        if await refresh_task_record_interrupted(db, task_record):
+        if not await lock_active_task(db, task_record):
             return
+        await db.refresh(chapter)
+        task_record.extra = {
+            **(task_record.extra or {}),
+            "provider_call_status": "finished",
+            "provider_call_finished_at": beijing_datetime().isoformat(),
+        }
 
         await settle_text_task_points(
             db,
@@ -216,19 +228,13 @@ async def _mark_failed(
     refund: bool = False,
     raw_reason: Optional[str] = None,
 ) -> None:
+    if not await lock_active_task(db, task_record, allow_provider_task=False):
+        return
+    await db.refresh(chapter)
     reason = sanitize_public_message(reason)
+    if refund:
+        await refund_task_points(db, task_record, remark_prefix="任务失败退回积分")
     refund_transaction_id = (task_record.extra or {}).get("refund_transaction_id")
-    already_refunded = bool(refund_transaction_id)
-    if refund and task_record.points_cost > 0 and not already_refunded:
-        refund_transaction = await change_user_points(
-            db,
-            user_id=task_record.user_id,
-            amount=task_record.points_cost,
-            transaction_type="refund",
-            remark=f"任务失败退回积分：{task_record.title}",
-            auto_commit=False,
-        )
-        refund_transaction_id = str(refund_transaction.id)
 
     task_record.status = "failed"
     task_record.result = reason
@@ -254,6 +260,9 @@ async def _mark_retrying(
     chapter: ProjectChapter,
     reason: str,
 ) -> None:
+    if not await lock_active_task(db, task_record, allow_provider_task=False):
+        return
+    await db.refresh(chapter)
     reason = sanitize_public_message(reason, fallback="模型服务繁忙，正在重试")
     task_record.status = "pending"
     task_record.result = reason
@@ -270,16 +279,6 @@ async def _mark_retrying(
     await db.commit()
 
 
-def _is_retryable_provider_error(exc: Exception) -> bool:
-    if isinstance(exc, AppException):
-        if exc.code == 50231 or exc.status_code in {400, 401, 403}:
-            return False
-        if _is_non_retryable_provider_error_text(str(exc)):
-            return False
-        return exc.status_code >= 500 or exc.code in {50202, 50206}
-    return False
-
-
 def _resolve_model_prompt(task_record: UserTaskRecord, chapter: ProjectChapter) -> str:
     if not (chapter.content or "").strip():
         raise AppException("章节原文内容不能为空", code=40036, status_code=400)
@@ -289,29 +288,3 @@ def _resolve_model_prompt(task_record: UserTaskRecord, chapter: ProjectChapter) 
             raise AppException("章节原文未正确写入模型提示词", code=50042, status_code=500)
         return prompt
     return task_record.prompt
-
-
-def _is_non_retryable_provider_error_text(message: str) -> bool:
-    normalized = message.lower()
-    non_retryable_tokens = (
-        "http 400",
-        "badrequest",
-        "invalidparameter",
-        "sensitivecontentdetected",
-        "privacyinformation",
-        "real person",
-        "not valid",
-        "content policy",
-    )
-    return any(token in normalized for token in non_retryable_tokens)
-
-
-def _retry_countdown(retries: int) -> int:
-    countdown = settings.celery_task_retry_countdown_seconds * (2**retries)
-    return min(countdown, settings.celery_task_retry_backoff_max_seconds)
-
-
-def _user_failed_reason(exc: Exception) -> str:
-    if _is_retryable_provider_error(exc):
-        return "模型服务繁忙，请稍后再试"
-    return sanitize_public_message(str(exc) or "任务执行失败")

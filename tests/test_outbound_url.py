@@ -10,7 +10,7 @@ from app.core.outbound_url import (
     validate_public_http_url,
 )
 from app.integrations.comfly import _download_upload_file
-from app.services import generated_media
+from app.services.generation import media as generated_media
 from app.services.uploads import probe_media_url
 
 

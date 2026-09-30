@@ -75,12 +75,13 @@ class Settings(BaseSettings):
     celery_task_retry_backoff_max_seconds: int = 300
     celery_result_expires_seconds: int = 60 * 60 * 24
     celery_worker_max_tasks_per_child: int = 50
-    provider_task_poll_interval_seconds: int = 30
-    provider_task_image_poll_interval_seconds: int = 60
-    provider_task_video_poll_interval_seconds: int = 120
-    provider_task_poll_max_attempts: int = 60
-    provider_task_worker_poll_interval_seconds: int = 5
-    provider_task_worker_poll_max_attempts: int = 0
+    provider_task_poll_interval_seconds: int = 2
+    provider_query_timeout_seconds: int = Field(default=10, ge=1, le=120)
+    provider_query_max_concurrency: int = Field(default=4, ge=1)
+    provider_query_requests_per_second: int = Field(default=5, ge=1)
+    provider_query_retry_max_seconds: int = Field(default=60, ge=5)
+    task_event_stream_max_connections: int = Field(default=3, ge=1, le=20)
+    task_events_fallback_seconds: int = Field(default=15, ge=1, le=60)
     user_pending_task_limit: int = 20
     user_pending_media_task_limit: int = 5
     user_pending_task_window_hours: int = 24

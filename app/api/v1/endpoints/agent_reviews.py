@@ -22,7 +22,7 @@ from app.schemas.agent_review import (
     AgentReviewIssueOut,
     AgentReviewIssueUpdateRequest,
 )
-from app.services.agent_reviews import (
+from app.services.agent.reviews import (
     approve_agent_episode,
     create_agent_delivery,
     create_agent_jianying_export,
@@ -36,7 +36,7 @@ from app.services.agent_reviews import (
     list_agent_jianying_exports,
     update_agent_review_issue,
 )
-from app.services.agent_workflow_steps import require_agent_step_access
+from app.services.agent.workflow_steps import require_agent_step_access
 
 
 async def require_video_editing_step(

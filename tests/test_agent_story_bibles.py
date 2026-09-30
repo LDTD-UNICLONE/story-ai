@@ -14,7 +14,7 @@ from app.schemas.agent_story_bible import (
     AgentAssetCandidateUpdateRequest,
     SeriesBibleConfirmRequest,
 )
-from app.services.agent_story_bibles import (
+from app.services.agent.story_bibles import (
     build_asset_candidate_payloads,
     confirm_story_bible,
     materialize_asset_candidates,

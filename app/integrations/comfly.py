@@ -1,11 +1,20 @@
 import json
 import logging
 from typing import Any, Dict, List, Optional, Set
+from urllib.parse import urlsplit
 
 import httpx
 
 from app.core.config import settings
 from app.core.exceptions import AppException
+from app.core.media_inputs import (
+    FIRST_FRAME_URL_KEYS,
+    LAST_FRAME_URL_KEYS,
+    FIRST_FRAME_ROLES,
+    LAST_FRAME_ROLES,
+    as_list,
+    extract_media_url,
+)
 from app.core.outbound_url import open_safe_http_response, trusted_oss_hosts
 from app.integrations.comfly_dimensions import (
     adapt_image_dimensions, adapt_video_dimensions,
@@ -177,68 +186,6 @@ VIDEO_URL_REQUEST_KEYS = {"audio_url", "character_url", "notify_hook"}
 VIDEO_ARRAY_REQUEST_KEYS = {"character_timestamps"}
 VIDEO_STRING_REQUEST_KEYS = {"negative_prompt", "resolution", "size"}
 VIDEO_URL_OR_BASE64_PREFIXES = ("http://", "https://", "data:")
-FIRST_FRAME_URL_KEYS = (
-    "first_frame_url",
-    "first_frame",
-    "firstFrameUrl",
-    "firstFrame",
-    "first_image_url",
-    "firstImageUrl",
-    "start_frame_url",
-    "start_frame",
-    "startFrameUrl",
-    "startFrame",
-    "start_image_url",
-    "startImageUrl",
-    "reference_first_frame_url",
-    "reference_start_frame_url",
-)
-LAST_FRAME_URL_KEYS = (
-    "last_frame_url",
-    "last_frame",
-    "lastFrameUrl",
-    "lastFrame",
-    "last_image_url",
-    "lastImageUrl",
-    "end_frame_url",
-    "end_frame",
-    "endFrameUrl",
-    "endFrame",
-    "end_image_url",
-    "endImageUrl",
-    "ending_frame_url",
-    "endingFrameUrl",
-    "tail_frame_url",
-    "tailFrameUrl",
-    "reference_last_frame_url",
-    "reference_end_frame_url",
-)
-FIRST_FRAME_ROLES = {
-    "first_frame",
-    "firstFrame",
-    "start_frame",
-    "startFrame",
-    "reference_first_frame",
-    "referenceFirstFrame",
-    "reference_start_frame",
-    "referenceStartFrame",
-}
-LAST_FRAME_ROLES = {
-    "last_frame",
-    "lastFrame",
-    "end_frame",
-    "endFrame",
-    "ending_frame",
-    "endingFrame",
-    "tail_frame",
-    "tailFrame",
-    "reference_last_frame",
-    "referenceLastFrame",
-    "reference_end_frame",
-    "referenceEndFrame",
-}
-
-
 def _base_url() -> str:
     base_url = settings.comfly_base_url
     if not base_url:
@@ -335,7 +282,7 @@ async def list_provider_models() -> List[Dict[str, Any]]:
 async def _get_json(path: str) -> Dict[str, Any]:
     try:
         client = await _get_client()
-        response = await client.get(_url(path), headers=_headers())
+        response = await client.get(_url(path), headers=_headers(), timeout=settings.provider_query_timeout_seconds)
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         _raise_model_service_http_error(exc, "任务查询失败")
@@ -659,7 +606,7 @@ def _normalize_chat_content(value: Any) -> Any:
                 content.append({"type": "text", "text": text})
                 continue
             media_value = item.get(content_type)
-            url = _extract_media_url(media_value)
+            url = extract_media_url(media_value)
             if not url:
                 raise AppException("Chat 多模态内容缺少媒体 URL", code=40019, status_code=400)
             content.append({"type": content_type, content_type: {"url": url}})
@@ -781,44 +728,23 @@ def _collect_chat_media_items(extra: Dict[str, Any]) -> List[tuple[str, str]]:
     image_values: List[Any] = []
     for key in ("images", "image", "image_url", "image_urls"):
         if key in extra:
-            image_values.extend(_as_list(extra[key]))
+            image_values.extend(as_list(extra[key]))
 
     video_values: List[Any] = []
     for key in ("videos", "video", "video_url", "video_urls"):
         if key in extra:
-            video_values.extend(_as_list(extra[key]))
+            video_values.extend(as_list(extra[key]))
 
     items: List[tuple[str, str]] = []
     for value in image_values:
-        url = _extract_media_url(value)
+        url = extract_media_url(value)
         if url:
             items.append(("image", url))
     for value in video_values:
-        url = _extract_media_url(value)
+        url = extract_media_url(value)
         if url:
             items.append(("video", url))
     return items
-
-
-def _as_list(value: Any) -> List[Any]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return value
-    return [value]
-
-
-def _extract_media_url(value: Any) -> Optional[str]:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, dict):
-        for key in ("url", "image_url", "video_url", "audio_url", "file_url", "oss_url"):
-            nested = value.get(key)
-            if isinstance(nested, str):
-                return nested
-            if isinstance(nested, dict) and isinstance(nested.get("url"), str):
-                return nested["url"]
-    return None
 
 
 async def create_image_generation(
@@ -913,11 +839,11 @@ def _collect_image_media_urls(extra: Dict[str, Any]) -> List[str]:
     values: List[Any] = []
     for key in ("images", "image", "image_url", "image_urls"):
         if key in extra:
-            values.extend(_as_list(extra[key]))
+            values.extend(as_list(extra[key]))
 
     urls: List[str] = []
     for value in values:
-        url = _extract_media_url(value)
+        url = extract_media_url(value)
         if url:
             urls.append(url)
     return urls
@@ -973,6 +899,17 @@ async def create_video_generation(
     *,
     idempotency_key: Optional[str] = None,
 ) -> Dict[str, Any]:
+    payload = build_video_generation_payload(model, prompt, extra)
+    return await _post_json(
+        "/v2/videos/generations",
+        payload,
+        idempotency_key=idempotency_key,
+    )
+
+
+def build_video_generation_payload(
+    model: str, prompt: str, extra: Dict[str, Any]
+) -> Dict[str, Any]:
     model_id = _normalize_model_id(model, "视频 model 不能为空")
     capabilities = merge_video_capabilities(model_id, extra.get("_model_capabilities") or {})
     capabilities["model_id"] = model_id
@@ -980,11 +917,16 @@ async def create_video_generation(
     payload: Dict[str, Any] = {"model": model_id, "prompt": _normalize_video_prompt(prompt)}
     _normalize_video_media(payload, extra, allowed_keys, capabilities)
     _merge_video_extra(payload, model_id, extra, VIDEO_GENERATION_HELPER_KEYS, capabilities)
-    return await _post_json(
-        "/v2/videos/generations",
-        payload,
-        idempotency_key=idempotency_key,
-    )
+    mode = str(extra.get("video_mode") or extra.get("capability") or "")
+    # A project storyboard is an image reference, not a separate provider feature.
+    mode = "image_to_video" if mode in {"storyboard", "reference"} else mode
+    modes = capabilities.get("modes") or []
+    if mode and mode != "generation" and modes and mode not in modes:
+        raise AppException("当前视频模型不支持该生成模式", code=40021, status_code=400)
+    if mode in {"image_to_video", "first_last_frame"} and not payload.get("images"):
+        if not (mode == "image_to_video" and payload.get("videos")):
+            raise AppException("当前模式需要模型支持的参考图片或视频", code=40021, status_code=400)
+    return payload
 
 
 async def query_video_generation(task_id: str) -> Dict[str, Any]:
@@ -1045,7 +987,7 @@ def _normalize_image_request_value(key: str, value: Any) -> Any:
     if isinstance(value, str) and not value.strip():
         return None
     if key == "image":
-        urls = _collect_urls(_as_list(value))
+        urls = _collect_urls(as_list(value))
         if not urls:
             raise AppException("图片生成 image 必须是 URL 或 URL 数组", code=40020, status_code=400)
         return urls
@@ -1146,7 +1088,7 @@ def _collect_image_input_urls(extra: Dict[str, Any]) -> List[str]:
     values: List[Any] = []
     for key in ("image", "images", "image_url", "image_urls"):
         if key in extra:
-            values.extend(_as_list(extra[key]))
+            values.extend(as_list(extra[key]))
     return _collect_urls(values)
 
 
@@ -1154,7 +1096,7 @@ def _collect_mask_input_url(extra: Dict[str, Any]) -> Optional[str]:
     values: List[Any] = []
     for key in ("mask", "mask_url", "mask_urls"):
         if key in extra:
-            values.extend(_as_list(extra[key]))
+            values.extend(as_list(extra[key]))
     urls = _collect_urls(values)
     return urls[0] if urls else None
 
@@ -1197,11 +1139,17 @@ def _normalize_video_media(
     allowed_keys: Set[str],
     capabilities: Dict[str, Any],
 ) -> None:
+    if "images" not in allowed_keys and _collect_video_image_urls(extra):
+        raise AppException("当前视频模型不支持参考图片", code=40021, status_code=400)
+    if "videos" not in allowed_keys and _collect_video_urls(extra):
+        raise AppException("当前视频模型不支持参考视频", code=40021, status_code=400)
+    if "audio_url" not in allowed_keys and _collect_video_audio_url(extra):
+        raise AppException("当前视频模型不支持参考音频", code=40021, status_code=400)
     if "images" in allowed_keys:
         image_urls = _collect_video_image_urls(extra)
         if image_urls:
             _validate_video_media_limit("images", image_urls, capabilities)
-            payload["images"] = image_urls
+            payload["images"] = [_normalize_video_image_url(url) for url in image_urls]
 
     if "videos" in allowed_keys:
         video_urls = _collect_video_urls(extra)
@@ -1228,7 +1176,7 @@ def _collect_video_image_urls(extra: Dict[str, Any]) -> List[str]:
         "reference_image_urls",
     ):
         if key in extra:
-            values.extend(_as_list(extra[key]))
+            values.extend(as_list(extra[key]))
     return _collect_urls(values)
 
 
@@ -1248,13 +1196,13 @@ def _collect_first_last_frame_urls(extra: Dict[str, Any]) -> List[str]:
 def _collect_frame_urls(extra: Dict[str, Any], keys: tuple[str, ...], roles: Set[str]) -> List[str]:
     urls: List[str] = []
     for key in keys:
-        url = _extract_media_url(extra.get(key))
+        url = extract_media_url(extra.get(key))
         if url:
             urls.append(url)
-    for item in _as_list(extra.get("media_items") or extra.get("media")):
+    for item in as_list(extra.get("media_items") or extra.get("media")):
         if not isinstance(item, dict) or _normalize_frame_role(item.get("role")) not in roles:
             continue
-        url = _extract_media_url(item)
+        url = extract_media_url(item)
         if url:
             urls.append(url)
     return urls
@@ -1272,7 +1220,7 @@ def _collect_video_urls(extra: Dict[str, Any]) -> List[str]:
         "reference_videos",
     ):
         if key in extra:
-            values.extend(_as_list(extra[key]))
+            values.extend(as_list(extra[key]))
     return _collect_urls(values)
 
 
@@ -1280,7 +1228,7 @@ def _collect_video_audio_url(extra: Dict[str, Any]) -> Optional[str]:
     values: List[Any] = []
     for key in ("audio_url", "audio", "audio_urls"):
         if key in extra:
-            values.extend(_as_list(extra[key]))
+            values.extend(as_list(extra[key]))
     urls = _collect_urls(values)
     return urls[0] if urls else None
 
@@ -1315,11 +1263,11 @@ def _normalize_video_request_value(key: str, value: Any, capabilities: Dict[str,
     if isinstance(value, str) and not value.strip():
         return None
     if key == "images":
-        urls = [_normalize_video_image_url(item) for item in _collect_urls(_as_list(value))]
+        urls = [_normalize_video_image_url(item) for item in _collect_urls(as_list(value))]
         _validate_video_media_limit("images", urls, capabilities)
         return urls
     if key == "videos":
-        return [_normalize_video_url(item, "videos") for item in _collect_urls(_as_list(value))]
+        return [_normalize_video_url(item, "videos") for item in _collect_urls(as_list(value))]
     if key == "audio_url":
         return _normalize_video_url(value, key)
     if key in VIDEO_URL_REQUEST_KEYS:
@@ -1364,8 +1312,10 @@ def _normalize_video_duration(value: Any, capabilities: Dict[str, Any]) -> Any:
             )
     try:
         number = int(text)
-    except ValueError:
-        return text
+    except ValueError as exc:
+        raise AppException("视频 duration 必须是整数", code=40021, status_code=400) from exc
+    if number <= 0:
+        raise AppException("视频 duration 必须大于 0", code=40021, status_code=400)
     return text if _is_sora2_model(str(capabilities.get("model_id") or "")) else number
 
 
@@ -1425,13 +1375,20 @@ def _normalize_video_image_url(value: Any) -> str:
     text = str(value or "").strip()
     if not text.startswith(VIDEO_URL_OR_BASE64_PREFIXES):
         raise AppException("视频 images 必须是 URL 或 base64 data URL", code=40021, status_code=400)
+    if text.startswith(("http://", "https://")):
+        return _normalize_video_url(text, "images")
     return text
 
 
 def _normalize_video_url(value: Any, key: str) -> str:
-    url = _extract_media_url(value)
+    url = extract_media_url(value)
     text = str(url or value or "").strip()
-    if not text.startswith(("http://", "https://")):
+    try:
+        parsed = urlsplit(text)
+        valid = parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+    except ValueError:
+        valid = False
+    if not valid or any(char.isspace() for char in text):
         raise AppException(f"视频参数 {key} 必须是 HTTP(S) URL", code=40021, status_code=400)
     return text
 
@@ -1460,7 +1417,7 @@ def _is_sora2_model(model: str) -> bool:
 def _collect_urls(values: List[Any]) -> List[str]:
     urls: List[str] = []
     for value in values:
-        url = _extract_media_url(value)
+        url = extract_media_url(value)
         if url:
             urls.append(url)
     return urls

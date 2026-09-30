@@ -3,7 +3,7 @@ from uuid import UUID
 
 from app.core.config import settings
 from app.db.session import create_worker_sessionmaker
-from app.services.agent_production_controller import (
+from app.services.agent.production_controller import (
     advance_agent_batch_production,
     fail_agent_controller_claim,
     finish_agent_controller_claim,
@@ -11,7 +11,7 @@ from app.services.agent_production_controller import (
     queue_agent_controller_claim,
     start_agent_controller_claim,
 )
-from app.worker import celery_app
+from app.core.celery_app import celery_app
 
 
 WorkerSessionLocal = create_worker_sessionmaker()

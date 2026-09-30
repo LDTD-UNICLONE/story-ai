@@ -54,9 +54,9 @@ async def admin_list_materials(
 @router.post("")
 async def admin_create_material(
     file: UploadFile = File(...),
-    name: str = Form(...),
-    category: str = Form(...),
-    description: Optional[str] = Form(default=None),
+    name: str = Form(..., min_length=1, max_length=128),
+    category: str = Form(..., min_length=1, max_length=64),
+    description: Optional[str] = Form(default=None, max_length=2000),
     tags: Optional[str] = Form(default=None),
     sort_order: int = Form(default=0, ge=0),
     is_enabled: bool = Form(default=True),
@@ -93,9 +93,9 @@ async def admin_get_material(
 async def admin_update_material(
     material_id: UUID,
     file: Optional[UploadFile] = File(default=None),
-    name: Optional[str] = Form(default=None),
-    category: Optional[str] = Form(default=None),
-    description: Optional[str] = Form(default=None),
+    name: Optional[str] = Form(default=None, min_length=1, max_length=128),
+    category: Optional[str] = Form(default=None, min_length=1, max_length=64),
+    description: Optional[str] = Form(default=None, max_length=2000),
     tags: Optional[str] = Form(default=None),
     sort_order: Optional[int] = Form(default=None, ge=0),
     is_enabled: Optional[bool] = Form(default=None),

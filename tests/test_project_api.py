@@ -17,28 +17,16 @@ from app.schemas.project_storyboard import (
     ProjectStoryboardCreateRequest,
     ProjectStoryboardUpdateRequest,
 )
-from app.services import projects
-from app.services import task_records
-from app.services.project_storyboard_images import _build_storyboard_image_prompt
+from app.services.projects import lifecycle as projects
+from app.services.generation import task_records
+from app.services.projects.storyboard_images import _build_storyboard_image_prompt
 
 
 def test_nested_standard_project_routes_require_parent_project_guard() -> None:
-    from app.api.v1.endpoints import (
-        project_asset_analysis,
-        project_assets,
-        project_chapter_processing,
-        project_chapters,
-        project_storyboards,
-    )
+    from app.api.v1.endpoints import project_canvases, project_media, canvas_generations, canvas_import_records
     from app.api.v1.endpoints.project_dependencies import require_standard_project
 
-    routers = (
-        project_assets.router,
-        project_asset_analysis.router,
-        project_chapters.router,
-        project_chapter_processing.router,
-        project_storyboards.router,
-    )
+    routers = (project_canvases.router, project_media.router, canvas_generations.router, canvas_import_records.router)
     routes = [route for router in routers for route in router.routes]
 
     assert routes
@@ -51,7 +39,7 @@ def test_nested_standard_project_routes_require_parent_project_guard() -> None:
 
 def test_project_contract_rejects_blank_name_and_null_required_patch_fields() -> None:
     with pytest.raises(ValidationError):
-        ProjectCreateRequest(name="   ", generation_ratio="16:9", style_id=uuid4())
+        ProjectCreateRequest(name="   ")
 
     for field in ("name", "cover", "description", "generation_ratio", "style_id"):
         with pytest.raises(ValidationError):
@@ -139,14 +127,14 @@ async def test_cancel_project_resource_tasks_only_interrupts_matching_records(mo
         async def execute(self, statement):
             return ExecuteResult()
 
-    async def refund(db, record):
+    async def refund(db, record, *, remark_prefix):
         side_effects.append(("refund", record))
 
     async def sync(db, record, reason):
         side_effects.append(("sync", record, reason))
 
-    monkeypatch.setattr(task_records, "_refund_interrupted_task_points", refund)
-    monkeypatch.setattr(task_records, "_sync_stale_failed_business_state", sync)
+    monkeypatch.setattr(task_records, "refund_task_points", refund)
+    monkeypatch.setattr(task_records, "sync_task_business_failure", sync)
 
     count = await task_records.cancel_project_resource_task_records(
         FakeDb(),

@@ -12,12 +12,12 @@ from app.schemas.agent_batch_production import (
     AgentBatchProductionOut,
     AgentVideoModelSelectionRequest,
 )
-from app.services.agent_batch_productions import (
+from app.services.agent.batch_productions import (
     dispatch_batch_production,
     get_batch_production,
     select_batch_video_model,
 )
-from app.services.agent_workflow_steps import require_agent_step_access
+from app.services.agent.workflow_steps import require_agent_step_access
 
 async def require_storyboard_generation_step(
     production_id: UUID,

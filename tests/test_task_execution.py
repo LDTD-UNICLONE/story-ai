@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.core.timezone import beijing_datetime
-from app.services.task_execution import TaskExecutionDeferred, prepare_task_execution
+from app.services.generation.task_execution import TaskExecutionDeferred, prepare_task_execution
 from app.worker import celery_app
 
 
@@ -56,6 +56,23 @@ def test_running_provider_task_column_is_not_submitted_again() -> None:
     record.provider_task_id = "provider-column-123"
 
     assert prepare_task_execution(record) is False
+
+
+@pytest.mark.parametrize("status", ["pending", "running"])
+@pytest.mark.parametrize("source", [
+    "column", "task_id", "provider_task_id", "assistant_message_extra",
+    "model_result_extra", "last_provider_task_status",
+])
+def test_accepted_provider_task_is_never_reclaimed(status, source):
+    record = task(status)
+    if source == "column":
+        record.provider_task_id = "accepted-job"
+    elif source in {"task_id", "provider_task_id"}:
+        record.extra[source] = "accepted-job"
+    else:
+        record.extra[source] = {"task_id": "accepted-job"}
+    assert prepare_task_execution(record) is False
+    assert "execution_attempt" not in record.extra
 
 
 def test_successful_conversation_points_have_periodic_recovery() -> None:

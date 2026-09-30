@@ -6,13 +6,12 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 import app.models  # noqa: F401
 from app.api.deps import get_current_user
-from app.core.config import settings
 from app.core.timezone import beijing_datetime
 from app.db.base import Base
 from app.db.session import get_db
@@ -41,9 +40,11 @@ from app.models.project_generated_asset import ProjectGeneratedAsset
 from app.models.project_storyboard import ProjectStoryboard
 from app.models.style import Style
 from app.models.task_record import UserTaskRecord
+from app.models.task_dispatch import TaskDispatchOutbox
+from app.services.generation import task_dispatch
 from app.models.user import User
 from app.schemas.upload import UploadFileOut
-from app.services.agent_production_controller import (
+from app.services.agent.production_controller import (
     advance_agent_batch_production,
     fail_agent_controller_claim,
     finish_agent_controller_claim,
@@ -51,20 +52,22 @@ from app.services.agent_production_controller import (
     queue_agent_controller_claim,
     start_agent_controller_claim,
 )
-from app.services.agent_reviews import claim_agent_delivery, run_agent_delivery
-from app.services.agent_source_analysis import (
+from app.services.agent.reviews import claim_agent_delivery, run_agent_delivery
+from app.services.agent.source_analysis import (
     _complete_source_analysis,
     _merge_incremental_episode_plan,
     advance_source_analysis,
     build_agent_text_prompt,
 )
-from app.services.agent_story_bibles import initialize_script_assets
-from app.services.agent_storyboard_bindings import bind_storyboards_to_core_lock
-from app.services.model_runner import ModelRunResult
-from app.services.project_asset_generation import get_project_with_style_or_404
-from app.services.project_asset_generation import run_asset_image_generation_in_worker
-from app.services.project_generated_assets import record_storyboard_video_generation_success
-from app.services.project_storyboards import run_storyboard_analysis_in_worker
+from app.services.agent.story_bibles import initialize_script_assets
+from app.services.agent.storyboard_bindings import bind_storyboards_to_core_lock
+from app.services.generation.runner import ModelRunResult
+from app.services.projects.asset_generation import get_project_with_style_or_404
+from app.services.projects.asset_generation import run_asset_image_generation_in_worker
+from app.services.projects.generated_assets import record_storyboard_video_generation_success
+from app.services.projects.storyboard_execution import (
+    run_storyboard_analysis_in_worker,
+)
 
 
 @pytest.mark.asyncio
@@ -260,7 +263,7 @@ async def test_episode_video_contract_uses_global_variant_assets_and_is_idempote
     await agent_api.session.commit()
 
     monkeypatch.setattr(
-        "app.tasks.project_storyboard_video.run_project_storyboard_video_generation.apply_async",
+        "app.services.generation.task_dispatch.publish_task_message",
         lambda **_kwargs: None,
     )
     prefix = (
@@ -474,12 +477,12 @@ pytestmark = [
 
 
 @pytest.fixture
-async def agent_api():
+async def agent_api(test_database_url):
     schema_name = f"agent_f_{uuid4().hex}"
     assert re.fullmatch(r"agent_f_[0-9a-f]{32}", schema_name)
-    admin_engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    admin_engine = create_async_engine(test_database_url, poolclass=NullPool)
     test_engine = create_async_engine(
-        settings.database_url,
+        test_database_url,
         poolclass=NullPool,
         execution_options={"schema_translate_map": {None: schema_name}},
     )
@@ -525,7 +528,7 @@ async def agent_api():
                 cover="https://example.com/cover.png",
                 description="integration",
                 generation_ratio="16:9",
-                project_kind="standard",
+                project_kind="agent",
                 is_enabled=True,
             )
             text_model = AiModel(
@@ -552,7 +555,7 @@ async def agent_api():
                 id=uuid4(),
                 nickname="Epic H 视频模型",
                 model_id=f"integration-video-{uuid4().hex}",
-                vendor="integration",
+                vendor="comfly",
                 model_type="video",
                 is_enabled=True,
                 is_agent_default=True,
@@ -832,13 +835,10 @@ async def test_supervised_script_supplement_creates_incremental_asset_version(
 
     queued = []
 
-    async def capture_enqueue(_db, production_id, step_id):
-        queued.append((production_id, step_id))
+    def capture_enqueue(**message):
+        queued.append(message)
 
-    monkeypatch.setattr(
-        "app.services.agent_script_supplements._enqueue_source_analysis",
-        capture_enqueue,
-    )
+    monkeypatch.setattr(task_dispatch, "publish_task_message", capture_enqueue)
     response = await agent_api.client.post(
         f"/api/v1/agent-productions/{agent_api.production.id}/script-supplements/from-text",
         json={"content": "十年后，沈先生带着怀表重返旧宅。"},
@@ -998,13 +998,10 @@ async def test_confirmed_script_supplement_keeps_completed_steps_accessible(
 
     queued = []
 
-    async def capture_enqueue(_db, production_id, step_id):
-        queued.append((production_id, step_id))
+    def capture_enqueue(**message):
+        queued.append(message)
 
-    monkeypatch.setattr(
-        "app.services.agent_script_supplements._enqueue_source_analysis",
-        capture_enqueue,
-    )
+    monkeypatch.setattr(task_dispatch, "publish_task_message", capture_enqueue)
     prefix = f"/api/v1/agent-productions/{agent_api.production.id}"
     response = await agent_api.client.post(
         f"{prefix}/script-supplements/from-text",
@@ -1282,7 +1279,7 @@ async def test_agent_storyboard_step_generates_ordered_timed_scripts(
     await agent_api.session.commit()
 
     monkeypatch.setattr(
-        "app.tasks.project_storyboard.run_project_storyboard_analysis.apply_async",
+        "app.services.generation.task_dispatch.publish_task_message",
         lambda **_kwargs: None,
     )
     prefix = f"/api/v1/agent-productions/{agent_api.production.id}/storyboards"
@@ -1337,7 +1334,7 @@ async def test_agent_storyboard_step_generates_ordered_timed_scripts(
             extra={},
         )
 
-    monkeypatch.setattr("app.services.project_storyboards.run_model", run_model)
+    monkeypatch.setattr("app.services.projects.storyboard_execution.run_model", run_model)
     await run_storyboard_analysis_in_worker(agent_api.session, task, agent_api.chapter)
     await agent_api.session.commit()
 
@@ -1552,7 +1549,9 @@ async def test_agent_storyboard_step_generates_ordered_timed_scripts(
     )
     assert created.status_code == 200
     await agent_api.session.refresh(agent_api.owner)
-    assert agent_api.owner.points_balance == 986
+    # Text submission is not precharged; this model stub supplies no billable usage.
+    assert task.points_cost == 0
+    assert agent_api.owner.points_balance == 1000
     created_data = created.json()["data"]
     assert created_data["origin"] == "user"
     assert created_data["status"] == "draft"
@@ -1686,9 +1685,9 @@ async def test_story_bible_http_flow_enforces_review_idempotency_and_ownership(a
     assert repeated.json()["data"]["created_count"] == 0
     assert repeated.json()["data"]["reused_count"] == 1
 
-    characters = await agent_api.client.get(f"/api/v1/projects/{agent_api.project.id}/characters")
-    assert characters.status_code == 200
-    assert characters.json()["data"]["total"] == 1
+    assert await agent_api.session.scalar(select(func.count()).select_from(ProjectCharacter).where(
+        ProjectCharacter.project_id == agent_api.project.id
+    )) == 1
 
     confirmed = await agent_api.client.post(
         f"{prefix}/story-bible/confirm",
@@ -2112,57 +2111,11 @@ async def test_script_package_flow_materializes_text_assets_without_reference_im
 
 
 @pytest.mark.asyncio
-async def test_source_file_preview_can_create_agent_production(agent_api, monkeypatch) -> None:
-    async def fake_upload(_file, category=""):
-        assert category == f"agent-source/{agent_api.project.id}"
-        return UploadFileOut(
-            url="https://example.com/agent-source/script.txt",
-            object_key="story/agent-source/script.txt",
-            filename="整剧.txt",
-            content_type="text/plain",
-            size=40,
-            file_type="file",
-        )
-
-    monkeypatch.setattr("app.services.agent_source_files.upload_story_file", fake_upload)
-    preview = await agent_api.client.post(
-        f"/api/v1/projects/{agent_api.project.id}/agent-productions/source-preview",
-        files={"file": ("整剧.txt", "第一集：雨夜相遇\n第二集：旧宅重逢".encode(), "text/plain")},
+async def test_standard_project_agent_entry_is_removed(agent_api):
+    response = await agent_api.client.post(
+        f"/api/v1/projects/{agent_api.project.id}/agent-productions", json={}
     )
-
-    assert preview.status_code == 200
-    preview_data = preview.json()["data"]
-    assert preview_data["source_type"] == "txt"
-    assert preview_data["parse_status"] == "previewed"
-    assert preview_data["content_preview"] == "第一集：雨夜相遇\n第二集：旧宅重逢"
-    assert preview_data["content_preview_truncated"] is False
-
-    created = await agent_api.client.post(
-        f"/api/v1/projects/{agent_api.project.id}/agent-productions",
-        json={
-            "source_document_id": preview_data["id"],
-            "production_spec": {
-                "text_model_id": str(agent_api.text_model.id),
-                "image_model_id": str(agent_api.image_model.id),
-                "video_model_id": str(agent_api.video_model.id),
-            },
-        },
-    )
-    assert created.status_code == 200
-    created_data = created.json()["data"]
-    assert created_data["source_document_id"] == preview_data["id"]
-    assert created_data["source_document"]["file_name"] == "整剧.txt"
-
-    workbench = await agent_api.client.get(
-        f"/api/v1/agent-productions/{created_data['id']}/workbench"
-    )
-    assert workbench.status_code == 200
-    workbench_data = workbench.json()["data"]
-    assert workbench_data["production"]["id"] == created_data["id"]
-    assert workbench_data["matrix"]["total_episode_count"] == 0
-    assert workbench_data["costs"]["net_points"] == 0
-    assert workbench_data["controller"] is None
-    assert workbench_data["next_action"] == "start"
+    assert response.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -2170,7 +2123,7 @@ async def test_script_first_entries_create_isolated_agent_projects_and_snapshot_
     agent_api,
     monkeypatch,
 ) -> None:
-    async def skip_enqueue(_db, _production_id, _step_id):
+    def skip_enqueue(**message):
         return None
 
     async def fake_upload(_file, category=""):
@@ -2185,10 +2138,10 @@ async def test_script_first_entries_create_isolated_agent_projects_and_snapshot_
         )
 
     monkeypatch.setattr(
-        "app.services.agent_productions._enqueue_source_analysis",
+        "app.services.generation.task_dispatch.publish_task_message",
         skip_enqueue,
     )
-    monkeypatch.setattr("app.services.agent_entries.upload_story_file", fake_upload)
+    monkeypatch.setattr("app.services.agent.entries.upload_story_file", fake_upload)
 
     automatic_payload = {
         "name": "新契约整剧",
@@ -2303,10 +2256,16 @@ async def test_script_first_entries_create_isolated_agent_projects_and_snapshot_
         "vendor": agent_api.video_model.vendor,
     }
 
+    canvas_project = Project(
+        user_id=agent_api.owner.id, name="Canvas only", cover="", description="",
+        project_kind="standard",
+    )
+    agent_api.session.add(canvas_project)
+    await agent_api.session.commit()
     project_center = await agent_api.client.get("/api/v1/projects")
     assert project_center.status_code == 200
     assert {item["id"] for item in project_center.json()["data"]["items"]} == {
-        str(agent_api.project.id)
+        str(canvas_project.id)
     }
     hidden_project = await agent_api.client.get(f"/api/v1/projects/{internal_project.id}")
     assert hidden_project.status_code == 404
@@ -2394,11 +2353,11 @@ async def test_agent_project_delete_soft_deletes_internal_project_and_cancels_wo
     agent_api,
     monkeypatch,
 ) -> None:
-    async def skip_enqueue(_db, _production_id, _step_id):
+    def skip_enqueue(**message):
         return None
 
     monkeypatch.setattr(
-        "app.services.agent_productions._enqueue_source_analysis",
+        "app.services.generation.task_dispatch.publish_task_message",
         skip_enqueue,
     )
     created = await agent_api.client.post(
@@ -2521,8 +2480,11 @@ async def test_source_analysis_recovery_redispatches_pending_task_without_rechar
     )
 
     assert recovered.task_record_ids == first.task_record_ids
-    assert production.consumed_points == charged_points == 7
-    assert agent_api.owner.points_balance == charged_balance == 93
+    assert production.consumed_points == charged_points == 0
+    assert agent_api.owner.points_balance == charged_balance == 100
+    recovered_task = await agent_api.session.get(UserTaskRecord, first.task_record_ids[0])
+    assert recovered_task.points_cost == 0
+    assert recovered_task.points_transaction_id is None
 
 
 @pytest.mark.asyncio
@@ -3061,7 +3023,7 @@ async def test_core_asset_lock_flow_generates_previews_and_invalidates_by_stable
     await agent_api.session.commit()
 
     monkeypatch.setattr(
-        "app.tasks.project_asset_generation.run_project_asset_image_generation.apply_async",
+        "app.services.generation.task_dispatch.publish_task_message",
         lambda **_kwargs: None,
     )
     prefix = f"/api/v1/agent-productions/{agent_api.production.id}/core-assets"
@@ -3120,11 +3082,11 @@ async def test_core_asset_lock_flow_generates_previews_and_invalidates_by_stable
         return result
 
     monkeypatch.setattr(
-        "app.services.project_asset_generation.run_model",
+        "app.services.projects.asset_generation.run_model",
         fake_variant_model,
     )
     monkeypatch.setattr(
-        "app.services.project_asset_generation.persist_generated_media_to_oss",
+        "app.services.projects.asset_generation.persist_generated_media_to_oss",
         keep_generated_variant,
     )
     await run_asset_image_generation_in_worker(
@@ -3222,7 +3184,7 @@ async def test_core_asset_lock_flow_generates_previews_and_invalidates_by_stable
         )
 
     monkeypatch.setattr(
-        "app.services.project_asset_generation.run_model",
+        "app.services.projects.asset_generation.run_model",
         fake_post_confirm_variant_model,
     )
     post_confirm_generation = await agent_api.client.post(
@@ -3334,12 +3296,10 @@ async def test_core_asset_lock_flow_generates_previews_and_invalidates_by_stable
     resumed = await agent_api.client.get(f"/api/v1/agent-productions/{agent_api.production.id}")
     assert resumed.json()["data"]["current_stage"] == "pilot_production"
 
-    storyboard_detail = await agent_api.client.get(
-        f"/api/v1/projects/{agent_api.project.id}/chapters/{agent_api.chapter.id}"
-        f"/storyboards/{storyboard.id}"
-    )
-    assert storyboard_detail.json()["data"]["extra"]["image_generation_status"] == "invalidated"
-    assert storyboard_detail.json()["data"]["extra"]["video_generation_status"] == "invalidated"
+    await agent_api.session.refresh(storyboard)
+    assert storyboard.extra["image_generation_status"] == "invalidated"
+    assert storyboard.extra["video_generation_status"] == "invalidated"
+
 
 
 @pytest.mark.asyncio
@@ -3460,15 +3420,7 @@ async def test_pilot_production_runs_storyboard_image_video_and_confirmation_flo
     await agent_api.session.commit()
 
     monkeypatch.setattr(
-        "app.tasks.project_storyboard.run_project_storyboard_analysis.apply_async",
-        lambda **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        "app.tasks.project_storyboard_image.run_project_storyboard_image_generation.apply_async",
-        lambda **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        "app.tasks.project_storyboard_video.run_project_storyboard_video_generation.apply_async",
+        "app.services.generation.task_dispatch.publish_task_message",
         lambda **_kwargs: None,
     )
     prefix = f"/api/v1/agent-productions/{agent_api.production.id}/pilot"
@@ -3479,11 +3431,13 @@ async def test_pilot_production_runs_storyboard_image_video_and_confirmation_flo
     started = await agent_api.client.post(f"{prefix}/storyboards", json=action)
     assert started.status_code == 200
     assert started.json()["data"]["phase"] == "storyboards"
-    assert started.json()["data"]["submitted_points"] == 7
+    assert started.json()["data"]["submitted_points"] == 0
 
     await agent_api.session.refresh(agent_api.chapter)
     analysis_task_id = UUID(agent_api.chapter.extra["storyboard_analysis_task_record_id"])
     analysis_task = await agent_api.session.get(UserTaskRecord, analysis_task_id)
+    assert analysis_task.points_cost == 0
+    assert analysis_task.points_transaction_id is None
     analysis_task.status = "success"
     agent_api.chapter.extra = {
         **(agent_api.chapter.extra or {}),
@@ -3515,15 +3469,9 @@ async def test_pilot_production_runs_storyboard_image_video_and_confirmation_flo
     assert storyboard.extra["agent_asset_ids"]["character"] == [str(character.id)]
     assert storyboard.extra["agent_asset_ids"]["scene"] == [str(scene.id)]
 
-    storyboard_prefix = (
-        f"/api/v1/projects/{agent_api.project.id}/chapters/{agent_api.chapter.id}"
-        f"/storyboards/{storyboard.id}"
-    )
-    unbound = await agent_api.client.patch(
-        storyboard_prefix,
-        json={"characters": ["陌生人"]},
-    )
-    assert unbound.status_code == 200
+    # Simulate inconsistent stored names to verify Agent's review gate.
+    storyboard.characters = ["陌生人"]
+    await agent_api.session.commit()
     blocked_review = await agent_api.client.get(prefix)
     assert blocked_review.json()["data"]["error_count"] == 1
     assert blocked_review.json()["data"]["can_submit_images"] is False
@@ -3533,11 +3481,8 @@ async def test_pilot_production_runs_storyboard_image_video_and_confirmation_flo
     )
     assert blocked_images.status_code == 409
     assert blocked_images.json()["code"] == 40942
-    rebound = await agent_api.client.patch(
-        storyboard_prefix,
-        json={"characters": ["阿砚"]},
-    )
-    assert rebound.status_code == 200
+    storyboard.characters = ["阿砚"]
+    await agent_api.session.commit()
     rebound_review = await agent_api.client.get(prefix)
     assert rebound_review.json()["data"]["error_count"] == 0
 
@@ -3566,8 +3511,10 @@ async def test_pilot_production_runs_storyboard_image_video_and_confirmation_flo
     assert images_ready.json()["data"]["can_submit_videos"] is True
 
     edited_after_image = await agent_api.client.patch(
-        storyboard_prefix,
-        json={"action": "沈砚推开旧宅木门并警惕观察。"},
+        f"/api/v1/agent-productions/{agent_api.production.id}/storyboards/{storyboard.id}",
+        json={"expected_core_asset_lock_version": 1,
+              "expected_revision": (storyboard.extra or {}).get("agent_storyboard_revision", 1),
+              "prompt_notes": "沈砚推开旧宅木门并警惕观察。"},
     )
     assert edited_after_image.status_code == 200
     regressed = await agent_api.client.get(prefix)
@@ -3830,15 +3777,12 @@ async def test_pilot_production_runs_storyboard_image_video_and_confirmation_flo
     assert resolved_video["manually_resolved"] is True
     assert resolved_video["replacement_url"] == skip_payload["replacement_url"]
 
-    manual_history = await agent_api.client.get(
-        f"/api/v1/projects/{agent_api.project.id}/chapters/{batch_chapter.id}"
-        f"/storyboards/{batch_storyboard.id}/generation-history?media_type=video"
-    )
-    assert manual_history.status_code == 200
-    assert (
-        manual_history.json()["data"]["items"][0]["result_url"] == skip_payload["replacement_url"]
-    )
-    assert manual_history.json()["data"]["items"][0]["extra"]["manual_replacement"] is True
+    manual_history = await agent_api.session.scalar(select(ProjectGeneratedAsset).where(
+        ProjectGeneratedAsset.target_id == batch_storyboard.id,
+        ProjectGeneratedAsset.media_type == "video", ProjectGeneratedAsset.is_selected.is_(True),
+    ))
+    assert manual_history.result_url == skip_payload["replacement_url"]
+    assert manual_history.extra["manual_replacement"] is True
 
     costs = await agent_api.client.get(f"{production_prefix}/costs")
     assert costs.status_code == 200
@@ -4129,10 +4073,12 @@ async def test_agent_review_timeline_approval_and_jianying_delivery_flow(
         "video_url"
     ] == "https://example.com/shot-1-v1.mp4"
 
-    monkeypatch.setattr(
-        "app.tasks.agent_delivery.build_agent_delivery.apply_async",
-        lambda **_kwargs: None,
-    )
+    assert await agent_api.session.get(TaskDispatchOutbox, UUID(delivery.json()["data"]["id"])) is None
+
+    def unavailable(**message):
+        raise ConnectionError("delivery broker unavailable")
+
+    monkeypatch.setattr(task_dispatch, "publish_task_message", unavailable)
     windows_export = await agent_api.client.post(
         f"{prefix}/jianying-exports",
         json={
@@ -4156,7 +4102,18 @@ async def test_agent_review_timeline_approval_and_jianying_delivery_flow(
     assert macos_export.status_code == 200
     assert macos_export.json()["data"]["platform"] == "macos"
 
+    assert windows_export.json()["data"]["status"] == "pending"
     export_id = UUID(windows_export.json()["data"]["id"])
+    outbox = await agent_api.session.get(TaskDispatchOutbox, export_id)
+    assert outbox.task_name == "tasks.agent_delivery.build_agent_delivery"
+    assert outbox.args == [str(export_id)]
+    assert outbox.queue == "story_ai_delivery"
+    outbox.next_attempt_at = beijing_datetime() - timedelta(seconds=1)
+    await agent_api.session.commit()
+    published = []
+    monkeypatch.setattr(task_dispatch, "publish_task_message", lambda **message: published.append(message))
+    assert await task_dispatch.dispatch_pending_tasks(agent_api.session, message_ids=[export_id]) == 1
+    assert published[0]["message_id"] == str(export_id)
     lease_token, retry_after = await claim_agent_delivery(agent_api.session, export_id)
     assert lease_token is not None
     assert retry_after == 0

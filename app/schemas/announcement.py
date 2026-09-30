@@ -9,6 +9,7 @@ from app.core.announcement_security import (
     sanitize_announcement_content,
 )
 from app.schemas.base import SchemaBaseModel
+from app.core.timezone import to_beijing_datetime
 
 
 class AnnouncementBaseOut(SchemaBaseModel):
@@ -66,6 +67,11 @@ class AnnouncementCreateRequest(SchemaBaseModel):
     end_at: Optional[datetime] = None
     is_enabled: bool = True
 
+    @field_validator("start_at", "end_at")
+    @classmethod
+    def normalize_publish_time(cls, value: Optional[datetime]) -> Optional[datetime]:
+        return to_beijing_datetime(value) if value is not None else None
+
     @field_validator("title", "announcement_type", "display_position", mode="before")
     @classmethod
     def normalize_required_text(cls, value: object) -> object:
@@ -94,6 +100,11 @@ class AnnouncementUpdateRequest(SchemaBaseModel):
     start_at: Optional[datetime] = None
     end_at: Optional[datetime] = None
     is_enabled: Optional[bool] = None
+
+    @field_validator("start_at", "end_at")
+    @classmethod
+    def normalize_publish_time(cls, value: Optional[datetime]) -> Optional[datetime]:
+        return to_beijing_datetime(value) if value is not None else None
 
     @field_validator("title", "announcement_type", "display_position", mode="before")
     @classmethod

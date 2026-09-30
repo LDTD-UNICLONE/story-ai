@@ -4,7 +4,7 @@ import pytest
 
 from app.core.exceptions import AppException
 from app.integrations.wechat_pay import _validate_notify_timestamp
-from app.services import recharges
+from app.services.billing import recharges
 
 
 def test_wechat_notify_rejects_stale_timestamp(monkeypatch) -> None:

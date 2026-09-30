@@ -15,28 +15,28 @@ from app.integrations.model_providers import close_model_provider_clients
 from app.models.agent_production import AgentProduction, ProjectSourceDocument
 from app.models.ai_model import AiModel
 from app.models.task_record import UserTaskRecord
-from app.services.agent_source_analysis import (
+from app.services.agent.source_analysis import (
     advance_source_analysis,
     build_agent_text_prompt,
     fail_agent_text_task,
-    mark_agent_tasks_dispatched,
     mark_source_analysis_blocked,
     settle_agent_text_task_cost,
 )
-from app.services.agent_source_text import parse_agent_json_object, validate_agent_stage_output
-from app.services.model_runner import run_model
-from app.services.model_configuration import build_model_runtime_snapshot
-from app.services.task_execution import TaskExecutionDeferred, prepare_task_execution
-from app.services.task_records import refresh_task_record_interrupted
-from app.worker import celery_app
+from app.services.agent.source_text import parse_agent_json_object, validate_agent_stage_output
+from app.services.generation.runner import run_model
+from app.services.generation.task_dispatch import dispatch_tasks_best_effort
+from app.services.agent.productions import enqueue_source_analysis
+from app.services.models.configuration import build_model_runtime_snapshot
+from app.services.generation.task_execution import (
+    TaskExecutionDeferred,
+    lock_active_task,
+    prepare_task_execution,
+)
+from app.core.celery_app import celery_app
 
 
 WorkerSessionLocal = create_worker_sessionmaker()
 logger = logging.getLogger(__name__)
-
-
-class CoordinatorDispatchError(RuntimeError):
-    pass
 
 
 @celery_app.task(
@@ -48,10 +48,7 @@ class CoordinatorDispatchError(RuntimeError):
 )
 def run_source_analysis(self, production_id: str, step_id: str) -> None:
     try:
-        task_record_ids = asyncio.run(_advance(UUID(production_id), UUID(step_id)))
-        if task_record_ids:
-            _dispatch_agent_text_tasks(task_record_ids)
-            asyncio.run(_mark_dispatched(task_record_ids))
+        asyncio.run(_advance(UUID(production_id), UUID(step_id)))
     except (SoftTimeLimitExceeded, asyncio.TimeoutError) as exc:
         if self.request.retries < settings.celery_task_max_retries:
             raise self.retry(exc=exc, countdown=_retry_countdown(self.request.retries)) from exc
@@ -82,16 +79,7 @@ def run_source_analysis(self, production_id: str, step_id: str) -> None:
 )
 def run_agent_text_task(self, task_record_id: str) -> None:
     try:
-        coordinator = asyncio.run(_run_agent_text_task(UUID(task_record_id)))
-        if coordinator:
-            try:
-                run_source_analysis.apply_async(
-                    args=(str(coordinator[0]), str(coordinator[1])),
-                    queue="story_ai_text",
-                    routing_key="story_ai_text",
-                )
-            except Exception as exc:
-                raise CoordinatorDispatchError("整剧分析后续编排入队失败") from exc
+        asyncio.run(_run_agent_text_task(UUID(task_record_id)))
     except (SoftTimeLimitExceeded, asyncio.TimeoutError) as exc:
         if self.request.retries < settings.celery_task_max_retries:
             asyncio.run(_mark_text_task_pending(UUID(task_record_id), "任务执行超时，正在重试"))
@@ -102,14 +90,6 @@ def run_agent_text_task(self, task_record_id: str) -> None:
     except Exception as exc:
         if self.request.retries < settings.celery_task_max_retries and _is_retryable_error(exc):
             raise self.retry(exc=exc, countdown=_retry_countdown(self.request.retries)) from exc
-        if isinstance(exc, CoordinatorDispatchError):
-            asyncio.run(
-                _block_source_analysis_for_task(
-                    UUID(task_record_id),
-                    "整剧分析后续编排入队失败，请稍后恢复任务",
-                )
-            )
-            return
         asyncio.run(
             _fail_text_task(
                 UUID(task_record_id),
@@ -122,25 +102,12 @@ def run_agent_text_task(self, task_record_id: str) -> None:
 async def _advance(production_id: UUID, step_id: UUID) -> list[UUID]:
     async with WorkerSessionLocal() as db:
         result = await advance_source_analysis(db, production_id, step_id)
+        await dispatch_tasks_best_effort(db, result.task_record_ids)
         return result.task_record_ids
-
-
-async def _mark_dispatched(task_record_ids: list[UUID]) -> None:
-    async with WorkerSessionLocal() as db:
-        await mark_agent_tasks_dispatched(db, task_record_ids)
 
 
 async def _block_source_analysis(production_id: UUID, step_id: UUID, reason: str) -> None:
     async with WorkerSessionLocal() as db:
-        await mark_source_analysis_blocked(db, production_id, step_id, reason)
-
-
-async def _block_source_analysis_for_task(task_record_id: UUID, reason: str) -> None:
-    async with WorkerSessionLocal() as db:
-        task_record = await db.get(UserTaskRecord, task_record_id)
-        if task_record is None:
-            return
-        production_id, step_id = _coordinator_ids(task_record)
         await mark_source_analysis_blocked(db, production_id, step_id, reason)
 
 
@@ -223,6 +190,8 @@ async def _execute_agent_text_task(task_record_id: UUID) -> Optional[Tuple[UUID,
                 source_start=validation_source_start,
             )
         except Exception as exc:
+            await db.rollback()
+            await db.refresh(task_record)
             if _is_retryable_error(exc):
                 await _mark_retrying(db, task_record, exc)
                 raise
@@ -235,7 +204,7 @@ async def _execute_agent_text_task(task_record_id: UUID) -> Optional[Tuple[UUID,
             )
             return None
 
-        if await refresh_task_record_interrupted(db, task_record):
+        if not await lock_active_task(db, task_record):
             return None
         await settle_agent_text_task_cost(db, task_record, ai_model, model_result.extra)
         task_record.status = "success"
@@ -248,7 +217,9 @@ async def _execute_agent_text_task(task_record_id: UUID) -> Optional[Tuple[UUID,
             "model_result_extra": model_result.extra,
             "parsed_result": parsed_result,
         }
+        dispatch_id = await enqueue_source_analysis(db, *coordinator)
         await db.commit()
+        await dispatch_tasks_best_effort(db, [dispatch_id])
         return coordinator
 
 
@@ -264,6 +235,8 @@ async def _get_text_model(db, task_record: UserTaskRecord) -> Optional[AiModel]:
 
 
 async def _mark_retrying(db, task_record: UserTaskRecord, exc: Exception) -> None:
+    if not await lock_active_task(db, task_record, allow_provider_task=False):
+        return
     reason = sanitize_public_message(str(exc) or "模型服务繁忙，正在重试")
     task_record.status = "pending"
     task_record.result = reason
@@ -301,15 +274,6 @@ async def _mark_text_task_pending(task_record_id: UUID, reason: str) -> None:
         await db.commit()
 
 
-def _dispatch_agent_text_tasks(task_record_ids: list[UUID]) -> None:
-    for task_record_id in task_record_ids:
-        run_agent_text_task.apply_async(
-            args=(str(task_record_id),),
-            queue="story_ai_text",
-            routing_key="story_ai_text",
-        )
-
-
 def _coordinator_ids(task_record: UserTaskRecord) -> Tuple[UUID, UUID]:
     extra = task_record.extra or {}
     return UUID(str(extra["agent_production_id"])), UUID(str(extra["agent_step_id"]))
@@ -324,8 +288,6 @@ def _task_timeout_seconds() -> int:
 
 
 def _is_retryable_error(exc: Exception) -> bool:
-    if isinstance(exc, CoordinatorDispatchError):
-        return True
     if not isinstance(exc, AppException):
         return False
     if exc.code in {50241, 50242, 50243, 50244, 50245}:

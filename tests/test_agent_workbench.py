@@ -1,4 +1,4 @@
-from app.services.agent_workbench import resolve_workbench_actions
+from app.services.agent.workbench import resolve_workbench_actions
 
 
 def test_draft_workbench_can_start() -> None:

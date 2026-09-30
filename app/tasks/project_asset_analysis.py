@@ -6,16 +6,24 @@ from celery.exceptions import SoftTimeLimitExceeded
 from sqlalchemy import select
 
 from app.core.config import settings
-from app.core.exceptions import AppException
 from app.core.public_messages import sanitize_public_message
 from app.db.session import create_worker_sessionmaker
 from app.integrations.model_providers import close_model_provider_clients
 from app.models.project_chapter import ProjectChapter
 from app.models.task_record import UserTaskRecord
-from app.services.points import change_user_points
-from app.services.project_asset_analysis import _asset_config, run_asset_analysis_in_worker
-from app.services.task_execution import TaskExecutionDeferred, prepare_task_execution
-from app.worker import celery_app
+from app.services.billing.model_points import refund_task_points
+from app.services.projects.asset_analysis import asset_analysis_config, run_asset_analysis_in_worker
+from app.services.generation.task_execution import (
+    TaskExecutionDeferred,
+    lock_active_task,
+    prepare_task_execution,
+)
+from app.tasks.retry_policy import (
+    is_retryable_provider_error,
+    retry_countdown,
+    user_failed_reason,
+)
+from app.core.celery_app import celery_app
 
 
 WorkerSessionLocal = create_worker_sessionmaker()
@@ -38,16 +46,16 @@ def run_project_asset_analysis(self, task_record_id: str, chapter_id: str, asset
     except TaskExecutionDeferred as exc:
         raise self.retry(countdown=exc.retry_after_seconds) from exc
     except Exception as exc:
-        if self.request.retries < settings.celery_task_max_retries and _is_retryable_provider_error(
+        if self.request.retries < settings.celery_task_max_retries and is_retryable_provider_error(
             exc
         ):
-            raise self.retry(exc=exc, countdown=_retry_countdown(self.request.retries)) from exc
+            raise self.retry(exc=exc, countdown=retry_countdown(self.request.retries)) from exc
         asyncio.run(
             _fail_analysis(
                 UUID(task_record_id),
                 UUID(chapter_id),
                 asset_type,
-                _user_failed_reason(exc),
+                user_failed_reason(exc),
                 raw_reason=str(exc) or "任务执行失败",
             )
         )
@@ -63,7 +71,7 @@ async def _run_project_asset_analysis(
 
 
 async def _execute_analysis(task_record_id: UUID, chapter_id: UUID, asset_type: str) -> None:
-    config = _asset_config(asset_type)
+    config = asset_analysis_config(asset_type)
     async with WorkerSessionLocal() as db:
         result = await db.execute(
             select(UserTaskRecord).where(UserTaskRecord.id == task_record_id).with_for_update()
@@ -86,7 +94,9 @@ async def _execute_analysis(task_record_id: UUID, chapter_id: UUID, asset_type: 
         try:
             await run_asset_analysis_in_worker(db, task_record, chapter, asset_type)
         except Exception as exc:
-            if _is_retryable_provider_error(exc):
+            await db.rollback()
+            await db.refresh(task_record)
+            if is_retryable_provider_error(exc):
                 await _mark_retrying(
                     db,
                     task_record,
@@ -115,7 +125,7 @@ async def _fail_analysis(
     reason: str,
     raw_reason: Optional[str] = None,
 ) -> None:
-    config = _asset_config(asset_type)
+    config = asset_analysis_config(asset_type)
     async with WorkerSessionLocal() as db:
         task_record = await db.get(UserTaskRecord, task_record_id)
         chapter = await db.get(ProjectChapter, chapter_id)
@@ -137,19 +147,13 @@ async def _mark_failed(
     refund: bool = False,
     raw_reason: Optional[str] = None,
 ) -> None:
+    if not await lock_active_task(db, task_record, allow_provider_task=False):
+        return
+    await db.refresh(chapter)
     reason = sanitize_public_message(reason)
+    if refund:
+        await refund_task_points(db, task_record, remark_prefix="任务失败退回积分")
     refund_transaction_id = (task_record.extra or {}).get("refund_transaction_id")
-    already_refunded = bool(refund_transaction_id)
-    if refund and task_record.points_cost > 0 and not already_refunded:
-        refund_transaction = await change_user_points(
-            db,
-            user_id=task_record.user_id,
-            amount=task_record.points_cost,
-            transaction_type="refund",
-            remark=f"任务失败退回积分：{task_record.title}",
-            auto_commit=False,
-        )
-        refund_transaction_id = str(refund_transaction.id)
 
     task_record.status = "failed"
     task_record.result = reason
@@ -172,6 +176,9 @@ async def _mark_failed(
 async def _mark_retrying(
     db, task_record: UserTaskRecord, chapter: ProjectChapter, config: dict, reason: str
 ) -> None:
+    if not await lock_active_task(db, task_record, allow_provider_task=False):
+        return
+    await db.refresh(chapter)
     reason = sanitize_public_message(reason, fallback="模型服务繁忙，正在重试")
     task_record.status = "pending"
     task_record.result = reason
@@ -183,39 +190,3 @@ async def _mark_retrying(
         config["task_key"]: str(task_record.id),
     }
     await db.commit()
-
-
-def _is_retryable_provider_error(exc: Exception) -> bool:
-    if isinstance(exc, AppException):
-        if exc.code == 50231 or exc.status_code in {400, 401, 403}:
-            return False
-        if _is_non_retryable_provider_error_text(str(exc)):
-            return False
-        return exc.status_code >= 500 or exc.code in {50202, 50206}
-    return False
-
-
-def _is_non_retryable_provider_error_text(message: str) -> bool:
-    normalized = message.lower()
-    non_retryable_tokens = (
-        "http 400",
-        "badrequest",
-        "invalidparameter",
-        "sensitivecontentdetected",
-        "privacyinformation",
-        "real person",
-        "not valid",
-        "content policy",
-    )
-    return any(token in normalized for token in non_retryable_tokens)
-
-
-def _retry_countdown(retries: int) -> int:
-    countdown = settings.celery_task_retry_countdown_seconds * (2**retries)
-    return min(countdown, settings.celery_task_retry_backoff_max_seconds)
-
-
-def _user_failed_reason(exc: Exception) -> str:
-    if _is_retryable_provider_error(exc):
-        return "模型服务繁忙，已自动重试多次仍未成功，请稍后再试"
-    return sanitize_public_message(str(exc) or "任务执行失败")

@@ -16,8 +16,8 @@ from app.schemas.points import (
     RechargeOrderListOut,
     RechargeOrderOut,
 )
-from app.services.points import get_user_points_balance, list_user_points_transactions
-from app.services.recharges import (
+from app.services.billing.points import get_user_points_balance, list_user_points_transactions
+from app.services.billing.recharges import (
     create_recharge_order,
     get_user_recharge_order_or_404,
     handle_wechat_pay_notify,

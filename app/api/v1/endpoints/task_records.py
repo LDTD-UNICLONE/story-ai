@@ -1,7 +1,11 @@
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, Query, Response, Request
+from fastapi.responses import StreamingResponse
+from app.db.session import AsyncSessionLocal
+from app.services.generation.task_events import task_phase, task_change_subscription, wait_for_task_change, sse_event
+from app.services.generation.provider_state import task_record_progress_percent
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
@@ -15,13 +19,13 @@ from app.schemas.task_record import (
     UserTaskRecordListOut,
     UserTaskRecordOut,
 )
-from app.services.task_records import (
+from app.services.generation.task_records import (
     get_task_record_options,
     get_task_record_or_404,
     list_user_task_records_by_ids,
     list_user_task_records,
 )
-from app.services.provider_polling import provider_next_poll_seconds
+from app.services.generation.provider_polling import provider_next_poll_seconds
 
 router = APIRouter(prefix="/task-records")
 
@@ -92,6 +96,53 @@ async def my_task_record_batch(
     )
 
 
+@router.get("/stream")
+async def stream_my_task_records(
+    request: Request,
+    ids: list[UUID] = Query(..., min_length=1, max_length=50),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    user_id = current_user.id
+    ids = list(dict.fromkeys(ids))
+    # Release the authentication session before holding a long-lived connection.
+    await db.rollback()
+    return StreamingResponse(
+        _task_record_events(request, user_id, ids), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-store", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _task_record_events(request, user_id, ids):
+    subscribed_ids = {str(value) for value in ids}
+    async with task_change_subscription(user_id) as subscription:
+        previous = None
+        while not await request.is_disconnected():
+            async with AsyncSessionLocal() as db:
+                records = await list_user_task_records_by_ids(db, user_id, ids)
+                data = {"items": [dict(
+                    task_record_id=str(row.id), status=row.status,
+                    phase=task_phase(row.status, row.extra),
+                    progress_percent=task_record_progress_percent(row),
+                ) for row in records]}
+            found = {item["task_record_id"] for item in data["items"]}
+            data["missing_ids"] = sorted(subscribed_ids - found)
+            data["stop_streaming"] = all(item["status"] in {"success", "failed"} for item in data["items"])
+            if data != previous:
+                yield sse_event("snapshot", data)
+                previous = data
+            else:
+                yield ": keep-alive\n\n"
+            if data["stop_streaming"]:
+                return
+            if subscription is None:
+                yield sse_event("fallback", {"next_poll_seconds": 2})
+                return
+            if not await wait_for_task_change(subscription, subscribed_ids):
+                yield sse_event("fallback", {"next_poll_seconds": 2})
+                return
+
+
 @router.get("/{task_record_id}")
 async def my_task_record_detail(
     task_record_id: str,
@@ -111,6 +162,7 @@ async def my_task_record_detail(
 def _dump_task_record(record) -> dict:
     data = UserTaskRecordOut.model_validate(record).model_dump(mode="json")
     data = _clean_terminal_retry_extra(data)
+    data["phase"] = task_phase(record.status, record.extra)
     data["stop_polling"] = record.status in {"success", "failed"}
     data["next_poll_seconds"] = _task_record_next_poll_seconds(
         record.generation_type,

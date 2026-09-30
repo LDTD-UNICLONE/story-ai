@@ -30,14 +30,14 @@ from app.schemas.agent_storyboard_media import (
     AgentStoryboardVideoConfigRequest,
     AgentStoryboardVideoVersionsOut,
 )
-from app.services.agent_storyboard_media import (
+from app.services.agent.storyboard_media import (
     get_agent_episode_videos,
     get_agent_storyboard_video_versions,
     select_agent_storyboard_primary_video,
     submit_agent_episode_videos,
     submit_agent_storyboard_video,
 )
-from app.services.agent_storyboards import (
+from app.services.agent.storyboards import (
     copy_agent_storyboard,
     create_agent_storyboard,
     delete_agent_storyboard,
@@ -48,7 +48,7 @@ from app.services.agent_storyboards import (
     update_agent_storyboard_video_config,
     update_agent_storyboard,
 )
-from app.services.agent_workflow_steps import require_agent_step_access
+from app.services.agent.workflow_steps import require_agent_step_access
 
 
 async def require_storyboard_step(

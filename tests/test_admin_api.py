@@ -20,8 +20,9 @@ from app.schemas.points import AdminPointsAdjustRequest
 from app.schemas.style import StyleCreateRequest, StyleUpdateRequest
 from app.schemas.user import AdminUserCreateRequest, AdminUserUpdateRequest
 from app.schemas.work import AdminWorkUpdateRequest
-from app.services import admin_users, ai_models, recharges
-from app.services.ai_models import _routing_identity_changed
+from app.services import admin_users
+from app.services.models import catalog as ai_models
+from app.services.billing import recharges
 
 
 def test_every_admin_route_requires_admin_dependency() -> None:
@@ -101,15 +102,6 @@ def test_admin_model_contract_rejects_removed_configuration_fields(
 ) -> None:
     with pytest.raises(ValidationError):
         schema(**payload)
-
-
-def test_model_routing_identity_changes_are_detected_separately_from_pricing() -> None:
-    model = SimpleNamespace(vendor="apimart", model_id="gpt-5.6-sol", model_type="text")
-
-    assert _routing_identity_changed(model, {"configuration": {}}) is False
-    assert _routing_identity_changed(model, {"vendor": "comfly"}) is True
-    assert _routing_identity_changed(model, {"model_id": "gpt-5.5"}) is True
-    assert _routing_identity_changed(model, {"model_type": "image"}) is True
 
 
 @pytest.mark.asyncio
@@ -316,7 +308,7 @@ async def test_admin_cannot_disable_or_demote_self(monkeypatch) -> None:
     admin_id = uuid4()
     user = SimpleNamespace(id=admin_id, is_admin=True, is_enabled=True)
 
-    async def get_user_or_404(db, user_id):
+    async def get_user_or_404(db, user_id, *, lock=False):
         return user
 
     monkeypatch.setattr(admin_users, "get_user_or_404", get_user_or_404)

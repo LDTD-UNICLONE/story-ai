@@ -29,7 +29,7 @@ from app.schemas.agent_core_asset import (
     CoreAssetVariantImageGenerationRequest,
     CoreAssetVariantOut,
 )
-from app.services.agent_core_assets import (
+from app.services.agent.core_assets import (
     confirm_core_assets,
     create_core_asset,
     create_core_asset_variant,
@@ -40,13 +40,14 @@ from app.services.agent_core_assets import (
     list_core_assets,
     lock_core_assets,
     preview_core_asset_impact,
+    review_core_asset_reference_image,
     submit_core_asset_image_generations,
     submit_core_asset_variant_image_generation,
     update_core_asset,
     update_core_asset_reference_image,
     update_core_asset_variant_reference_image,
 )
-from app.services.agent_workflow_steps import require_agent_step_access
+from app.services.agent.workflow_steps import require_agent_step_access
 
 
 async def require_core_asset_step(
@@ -58,6 +59,40 @@ async def require_core_asset_step(
 
 
 router = APIRouter(dependencies=[Depends(require_core_asset_step)])
+
+
+@router.post(
+    "/agent-productions/{production_id}/core-assets/{asset_type}/{asset_id}/reference-image/review"
+)
+async def review_my_core_asset_reference_image(
+    production_id: UUID,
+    asset_type: Literal["character", "scene", "prop"],
+    asset_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await review_core_asset_reference_image(
+        db, production_id, current_user.id, asset_type, asset_id,
+    )
+    return success(data=result.model_dump(mode="json"), message="图片审核状态已获取")
+
+
+@router.post(
+    "/agent-productions/{production_id}/core-assets/{asset_type}/{asset_id}/variants/"
+    "{variant_id}/reference-image/review"
+)
+async def review_my_core_asset_variant_reference_image(
+    production_id: UUID,
+    asset_type: Literal["character", "scene", "prop"],
+    asset_id: UUID,
+    variant_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await review_core_asset_reference_image(
+        db, production_id, current_user.id, asset_type, asset_id, variant_id=variant_id,
+    )
+    return success(data=result.model_dump(mode="json"), message="图片审核状态已获取")
 
 
 @router.get("/agent-productions/{production_id}/core-assets")

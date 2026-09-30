@@ -1,7 +1,7 @@
+from app.services.generation.task_events import publish_task_change
 import asyncio
 import logging
 import time
-from types import SimpleNamespace
 from typing import Optional
 from uuid import UUID
 
@@ -9,7 +9,6 @@ from celery.exceptions import SoftTimeLimitExceeded
 from sqlalchemy import select
 
 from app.core.config import settings
-from app.core.exceptions import AppException
 from app.core.logging import log_extra
 from app.core.public_messages import sanitize_public_message
 from app.core.timezone import beijing_datetime
@@ -19,23 +18,32 @@ from app.integrations.apimart import APIMART_VENDOR, TextDeltaCallback
 from app.models.ai_model import AiModel
 from app.models.conversation import Conversation, ConversationMessage
 from app.models.task_record import UserTaskRecord
-from app.services.generated_media import persist_generated_media_to_oss
-from app.services.model_points import (
+from app.services.generation.media import persist_generated_media_to_oss
+from app.services.billing.model_points import (
+    refund_task_points,
     settle_image_task_points,
     settle_text_task_points,
     settle_video_task_points,
 )
-from app.services.model_configuration import build_model_runtime_snapshot
-from app.services.model_runner import ModelRunResult, query_model_task, run_model
-from app.services.points import change_user_points
-from app.services.provider_polling import provider_poll_interval_seconds
-from app.services.task_records import (
+from app.services.models.configuration import build_model_runtime_snapshot
+from app.services.generation.runner import run_model
+from app.services.generation.provider_polling import defer_provider_task_result
+from app.services.generation.provider_state import (
     has_provider_task_id,
+    extract_provider_task_id,
     record_provider_task_state,
-    refresh_task_record_interrupted,
 )
-from app.services.task_execution import TaskExecutionDeferred, prepare_task_execution
-from app.worker import celery_app
+from app.services.generation.task_execution import (
+    TaskExecutionDeferred,
+    lock_active_task,
+    prepare_task_execution,
+)
+from app.tasks.retry_policy import (
+    is_retryable_provider_error,
+    retry_countdown,
+    user_failed_reason,
+)
+from app.core.celery_app import celery_app
 
 
 WorkerSessionLocal = create_worker_sessionmaker()
@@ -61,15 +69,15 @@ def run_conversation_generation(self, task_record_id: str, assistant_message_id:
     except TaskExecutionDeferred as exc:
         raise self.retry(countdown=exc.retry_after_seconds) from exc
     except Exception as exc:
-        if self.request.retries < settings.celery_task_max_retries and _is_retryable_provider_error(
+        if self.request.retries < settings.celery_task_max_retries and is_retryable_provider_error(
             exc
         ):
-            raise self.retry(exc=exc, countdown=_retry_countdown(self.request.retries)) from exc
+            raise self.retry(exc=exc, countdown=retry_countdown(self.request.retries)) from exc
         asyncio.run(
             _fail_generation(
                 UUID(task_record_id),
                 UUID(assistant_message_id),
-                _user_failed_reason(exc),
+                user_failed_reason(exc),
                 raw_reason=str(exc) or "任务执行失败",
             )
         )
@@ -129,6 +137,7 @@ async def _settle_pending_conversation_points(limit: int) -> int:
                     continue
                 await _settle_completed_conversation_task(db, task_record, ai_model)
                 await db.commit()
+                await publish_task_change(task_record)
                 settled_count += 1
             except Exception:
                 await db.rollback()
@@ -187,8 +196,10 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
                         ai_model,
                     )
                     await db.commit()
+                    await publish_task_change(task_record)
             return
         if not prepare_task_execution(task_record):
+            _enqueue_provider_reconcile_if_needed(task_record)
             logger.info(
                 "Conversation generation skipped: task_record is not pending",
                 extra=log_extra(
@@ -206,6 +217,7 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
         if assistant_message.message_type == "text":
             assistant_message.status = "running"
         await db.commit()
+        await publish_task_change(task_record)
         logger.info(
             "Conversation generation business task running",
             extra=log_extra(
@@ -242,6 +254,7 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
                 run_kwargs["on_text_delta"] = _build_apimart_text_delta_callback(
                     db,
                     assistant_message,
+                    task_record,
                 )
             generation_extra = (task_record.extra or {}).get("user_message_extra") or {}
             model_result = await run_model(
@@ -251,7 +264,11 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
                 generation_extra,
                 **run_kwargs,
             )
-            if record_provider_task_state(task_record, model_result.extra, ai_model.vendor):
+            provider_task_id = extract_provider_task_id(model_result.extra)
+            if provider_task_id:
+                if not await lock_active_task(db, task_record):
+                    return
+                record_provider_task_state(task_record, model_result.extra, ai_model.vendor)
                 task_record.extra = {
                     **(task_record.extra or {}),
                     **(
@@ -262,23 +279,38 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
                     "assistant_message_extra": model_result.extra,
                     "assistant_message_id": str(assistant_message.id),
                 }
+                if task_record.generation_type in {"image", "video"}:
+                    # Commit provider ownership before handing off; no worker-side polling.
+                    model_result = defer_provider_task_result(model_result, provider_task_id)
+                    deferred_extra = model_result.extra
+                    task_record.result = model_result.content
+                    task_record.extra = {
+                        **task_record.extra,
+                        "assistant_message_extra": deferred_extra,
+                    }
+                    assistant_message.content = task_record.result
+                    assistant_message.extra = {
+                        **(assistant_message.extra or {}),
+                        **deferred_extra,
+                        "task_status": "running",
+                        "task_record_id": str(task_record.id),
+                    }
+                    await db.commit()
+                    await publish_task_change(task_record)
+                    _enqueue_provider_reconcile_if_needed(task_record)
+                    return
                 await db.commit()
-            model_result = await _resolve_provider_task_result(
-                model_snapshot,
-                task_record.generation_type,
-                model_result,
-            )
+                await publish_task_change(task_record)
             model_result = await persist_generated_media_to_oss(
                 task_record.generation_type, model_result
             )
         except Exception as exc:
+            await db.rollback()
+            await db.refresh(task_record)
             if has_provider_task_id(task_record):
-                await db.rollback()
-                await db.refresh(task_record)
-                if has_provider_task_id(task_record):
-                    _enqueue_provider_reconcile_if_needed(task_record)
-                    return
-            if _is_retryable_provider_error(exc):
+                _enqueue_provider_reconcile_if_needed(task_record)
+                return
+            if is_retryable_provider_error(exc):
                 await _mark_retrying(
                     db,
                     task_record,
@@ -297,8 +329,9 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
             )
             return
 
-        if await refresh_task_record_interrupted(db, task_record):
+        if not await lock_active_task(db, task_record):
             return
+        await db.refresh(assistant_message)
 
         resolved_status = model_result.extra.get("platform_task_status") or "success"
         assistant_message.content = model_result.content
@@ -325,6 +358,7 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
                 .values(updated_at=beijing_datetime())
             )
         await db.commit()
+        await publish_task_change(task_record)
         logger.info(
             "Conversation generation business task committed",
             extra=log_extra(
@@ -344,13 +378,17 @@ async def _execute_generation(task_record_id: UUID, assistant_message_id: UUID) 
 def _build_apimart_text_delta_callback(
     db,
     assistant_message: ConversationMessage,
+    task_record: UserTaskRecord,
 ) -> TextDeltaCallback:
     content_parts: list[str] = []
     pending_characters = 0
     last_flush_at = time.monotonic()
+    stopped = False
 
     async def persist_delta(delta: str) -> None:
-        nonlocal pending_characters, last_flush_at
+        nonlocal pending_characters, last_flush_at, stopped
+        if stopped:
+            return
         content_parts.append(delta)
         pending_characters += len(delta)
         now = time.monotonic()
@@ -360,6 +398,12 @@ def _build_apimart_text_delta_callback(
         ):
             return
 
+        if not await lock_active_task(db, task_record):
+            stopped = True
+            await db.commit()
+            await publish_task_change(task_record)
+            return
+        await db.refresh(assistant_message)
         content = "".join(content_parts)
         assistant_message.content = content
         assistant_message.extra = {
@@ -369,6 +413,7 @@ def _build_apimart_text_delta_callback(
             "streamed_character_count": len(content),
         }
         await db.commit()
+        await publish_task_change(task_record)
         pending_characters = 0
         last_flush_at = now
 
@@ -384,19 +429,13 @@ async def _mark_failed(
     raw_reason: Optional[str] = None,
     failure_extra: Optional[dict] = None,
 ) -> None:
+    if not await lock_active_task(db, task_record, allow_provider_task=False):
+        return
+    await db.refresh(assistant_message)
     reason = sanitize_public_message(reason)
+    if refund:
+        await refund_task_points(db, task_record, remark_prefix="任务失败退回积分")
     refund_transaction_id = (task_record.extra or {}).get("refund_transaction_id")
-    already_refunded = bool(refund_transaction_id)
-    if refund and task_record.points_cost > 0 and not already_refunded:
-        refund_transaction = await change_user_points(
-            db,
-            user_id=task_record.user_id,
-            amount=task_record.points_cost,
-            transaction_type="refund",
-            remark=f"任务失败退回积分：{task_record.title}",
-            auto_commit=False,
-        )
-        refund_transaction_id = str(refund_transaction.id)
 
     task_record.status = "failed"
     task_record.result = reason
@@ -419,6 +458,7 @@ async def _mark_failed(
     if assistant_message.message_type == "text":
         assistant_message.status = "failed"
     await db.commit()
+    await publish_task_change(task_record)
     logger.warning(
         "Conversation generation business task failed",
         extra=log_extra(
@@ -455,6 +495,7 @@ async def _settle_points_after_success(
     try:
         await _settle_completed_conversation_task(db, task_record, ai_model)
         await db.commit()
+        await publish_task_change(task_record)
     except Exception:
         await db.rollback()
         result = await db.execute(
@@ -471,6 +512,7 @@ async def _settle_points_after_success(
             "points_settled": False,
         }
         await db.commit()
+        await publish_task_change(task_record)
 
 
 async def _settle_completed_conversation_task(
@@ -522,6 +564,9 @@ async def _mark_retrying(
     assistant_message: ConversationMessage,
     reason: str,
 ) -> None:
+    if not await lock_active_task(db, task_record, allow_provider_task=False):
+        return
+    await db.refresh(assistant_message)
     reason = sanitize_public_message(reason, fallback="模型服务繁忙，正在重试")
     task_record.status = "pending"
     task_record.result = reason
@@ -539,109 +584,7 @@ async def _mark_retrying(
     if assistant_message.message_type == "text":
         assistant_message.status = "pending"
     await db.commit()
-
-
-async def _resolve_provider_task_result(
-    model_snapshot: SimpleNamespace,
-    generation_type: str,
-    model_result: ModelRunResult,
-) -> ModelRunResult:
-    task_id = model_result.extra.get("task_id")
-    if generation_type not in {"image", "video"} or not task_id:
-        return model_result
-
-    if settings.provider_task_worker_poll_max_attempts <= 0:
-        model_result.extra = {
-            **model_result.extra,
-            "platform_task_status": "running",
-            "provider_polling_deferred": True,
-            "next_poll_seconds": provider_poll_interval_seconds(generation_type),
-        }
-        model_result.content = f"模型任务仍在生成中：{task_id}"
-        return model_result
-
-    latest_result = model_result
-    for _ in range(settings.provider_task_worker_poll_max_attempts):
-        await asyncio.sleep(settings.provider_task_worker_poll_interval_seconds)
-        try:
-            latest_result = await query_model_task(model_snapshot, generation_type, str(task_id))
-        except Exception as exc:
-            if _is_retryable_provider_error(exc):
-                continue
-            raise
-        status = str(latest_result.extra.get("task_status") or "").lower()
-        if _is_provider_failed_status(status):
-            raise RuntimeError(f"模型任务执行失败：{status}")
-        if _is_provider_success_result(latest_result, status):
-            latest_result.extra = {**latest_result.extra, "platform_task_status": "success"}
-            return latest_result
-
-    latest_result.extra = {
-        **latest_result.extra,
-        "platform_task_status": "running",
-        "provider_polling_timeout": True,
-        "next_poll_seconds": provider_poll_interval_seconds(generation_type),
-    }
-    latest_result.content = f"模型任务仍在生成中：{task_id}"
-    return latest_result
-
-
-def _is_provider_success_result(model_result: ModelRunResult, status: str) -> bool:
-    terminal_success_statuses = {
-        "success",
-        "succeeded", "completed", "complete", "finished",
-        "done",
-    }
-    pending_statuses = {
-        "not_start",
-        "submitted", "in_progress", "running", "pending", "processing",
-        "queued",
-    }
-    if status in terminal_success_statuses:
-        return True
-    if status in pending_statuses:
-        return False
-    return bool(model_result.content and model_result.content != "生成任务处理中")
-
-
-def _is_provider_failed_status(status: str) -> bool:
-    return status in {"failed", "failure", "fail", "error", "canceled", "cancelled"}
-
-
-def _is_retryable_provider_error(exc: Exception) -> bool:
-    if isinstance(exc, AppException):
-        if exc.code == 50231 or exc.status_code in {400, 401, 403}:
-            return False
-        if _is_non_retryable_provider_error_text(str(exc)):
-            return False
-        return exc.status_code >= 500 or exc.code in {50202, 50206}
-    return False
-
-
-def _is_non_retryable_provider_error_text(message: str) -> bool:
-    normalized = message.lower()
-    non_retryable_tokens = (
-        "http 400",
-        "badrequest",
-        "invalidparameter",
-        "sensitivecontentdetected",
-        "privacyinformation",
-        "real person",
-        "not valid",
-        "content policy",
-    )
-    return any(token in normalized for token in non_retryable_tokens)
-
-
-def _retry_countdown(retries: int) -> int:
-    countdown = settings.celery_task_retry_countdown_seconds * (2**retries)
-    return min(countdown, settings.celery_task_retry_backoff_max_seconds)
-
-
-def _user_failed_reason(exc: Exception) -> str:
-    if _is_retryable_provider_error(exc):
-        return "模型服务繁忙，已自动重试多次仍未成功，请稍后再试"
-    return sanitize_public_message(str(exc) or "任务执行失败")
+    await publish_task_change(task_record)
 
 
 def _enqueue_provider_reconcile_if_needed(task_record: UserTaskRecord) -> None:

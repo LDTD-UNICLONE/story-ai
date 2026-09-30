@@ -1,4 +1,4 @@
-import asyncio
+from app.services.generation.task_events import task_phase, task_change_subscription, wait_for_task_change
 import json
 import time
 from typing import Any, AsyncIterator, Optional
@@ -9,6 +9,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
+from app.api.v1.endpoints.task_polling import task_next_poll_seconds
 from app.core.config import settings
 from app.core.public_messages import sanitize_public_message
 from app.core.responses import success
@@ -28,7 +29,7 @@ from app.schemas.conversation import (
     ConversationTaskStatusOut,
     ConversationUpdateRequest,
 )
-from app.services.conversations import (
+from app.services.conversation.service import (
     conversation_task_content,
     create_conversation,
     delete_conversation,
@@ -42,10 +43,9 @@ from app.services.conversations import (
     send_conversation_message,
     update_conversation,
 )
-from app.services.task_records import task_record_progress_percent
+from app.services.generation.provider_state import task_record_progress_percent
 
 router = APIRouter(prefix="/conversations")
-SSE_POLL_INTERVAL_SECONDS = 0.5
 SSE_HEARTBEAT_SECONDS = 15
 SSE_MAX_CONNECTION_SECONDS = max(
     60,
@@ -189,9 +189,7 @@ async def my_conversation_generation_task(
         task_record_id=task_record_id,
     )
     assistant_message_id = (task_record.extra or {}).get("assistant_message_id")
-    next_poll_seconds = (task_record.extra or {}).get("next_poll_seconds")
-    if task_record.status in {"pending", "running"} and next_poll_seconds is None:
-        next_poll_seconds = max(1, wait_seconds or 3)
+    next_poll_seconds = task_next_poll_seconds(task_record)
     content = conversation_task_content(task_record, assistant_message)
     failed_reason = task_record.result if task_record.status == "failed" else None
     data = ConversationGenerationTaskOut(
@@ -199,6 +197,7 @@ async def my_conversation_generation_task(
         conversation_id=conversation_id,
         assistant_message_id=_parse_uuid(assistant_message_id),
         status=task_record.status,
+        phase=task_phase(task_record.status, task_record.extra),
         task_status=task_record.status,
         content=content,
         result=task_record.result,
@@ -234,11 +233,14 @@ async def stream_my_conversation_generation_task(
         task_record_id=task_record_id,
     )
     assistant_message_id = assistant_message.id if assistant_message is not None else None
+    stream_task_record_id = task_record.id
+    stream_user_id = current_user.id
     await db.rollback()
     return StreamingResponse(
         _conversation_generation_event_stream(
             request,
-            task_record_id=task_record.id,
+            task_record_id=stream_task_record_id,
+            user_id=stream_user_id,
             assistant_message_id=assistant_message_id,
         ),
         media_type="text/event-stream",
@@ -250,13 +252,25 @@ async def stream_my_conversation_generation_task(
 
 
 async def _conversation_generation_event_stream(
-    request: Request,
-    *,
-    task_record_id: UUID,
-    assistant_message_id: Optional[UUID],
+    request: Request, *, task_record_id: UUID,
+    assistant_message_id: Optional[UUID], user_id: Optional[UUID] = None,
 ) -> AsyncIterator[str]:
+    if user_id is None:
+        async for event in _conversation_generation_events(request, task_record_id, assistant_message_id, None):
+            yield event
+        return
+    async with task_change_subscription(user_id) as subscription:
+        if subscription is None:
+            yield _sse_event("fallback", {"next_poll_seconds": 2})
+            return
+        async for event in _conversation_generation_events(request, task_record_id, assistant_message_id, subscription):
+            yield event
+
+
+async def _conversation_generation_events(request, task_record_id, assistant_message_id, subscription):
     sent_content = ""
     last_status: Optional[str] = None
+    last_phase: Optional[str] = None
     last_progress_percent: Optional[int] = None
     progress_sent = False
     last_emit_at = time.monotonic()
@@ -292,7 +306,8 @@ async def _conversation_generation_event_stream(
         content = sanitize_public_message(raw_content, fallback=raw_content)
         progress_percent = task_record_progress_percent(task_record)
 
-        if status != last_status:
+        phase = task_phase(status, task_record.extra)
+        if status != last_status or phase != last_phase:
             yield _sse_event(
                 "status",
                 {
@@ -301,9 +316,11 @@ async def _conversation_generation_event_stream(
                         str(assistant_message_id) if assistant_message_id else None
                     ),
                     "status": status,
+                    "phase": phase,
                 },
             )
             last_status = status
+            last_phase = phase
             last_emit_at = time.monotonic()
 
         if progress_percent is not None and (
@@ -355,7 +372,9 @@ async def _conversation_generation_event_stream(
         if time.monotonic() - last_emit_at >= SSE_HEARTBEAT_SECONDS:
             yield ": keep-alive\n\n"
             last_emit_at = time.monotonic()
-        await asyncio.sleep(SSE_POLL_INTERVAL_SECONDS)
+        if not await wait_for_task_change(subscription, {str(task_record_id)}):
+            yield _sse_event("fallback", {"next_poll_seconds": 2})
+            return
 
 
 def _sse_event(event: str, data: dict[str, Any]) -> str:

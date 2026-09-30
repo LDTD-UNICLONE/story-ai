@@ -1,6 +1,6 @@
 import pytest
 
-from app.services.agent_production_state import (
+from app.services.agent.production_state import (
     InvalidAgentStateTransition,
     transition_checkpoint_status,
     transition_production_status,

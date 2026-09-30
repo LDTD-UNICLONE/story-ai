@@ -13,29 +13,31 @@ from app.schemas.agent_storyboard import (
     AgentStoryboardReorderRequest,
     AgentStoryboardUpdateRequest,
 )
-from app.services.agent_batch_productions import (
+from app.services.agent.batch_productions import (
     _eligible_scope_ids,
     _scoped_eligible_scope_ids,
 )
-from app.services.agent_storyboard_bindings import _preserve_manual_bindings
-from app.services.agent_storyboard_episode_state import (
+from app.services.agent.storyboard_bindings import _preserve_manual_bindings
+from app.services.agent.storyboard_episode_state import (
     build_storyboard_episode_progress,
 )
-from app.services.agent_storyboards import storyboard_estimated_duration_seconds
-from app.services.agent_storyboard_prompts import (
+from app.services.agent.storyboards import storyboard_estimated_duration_seconds
+from app.services.agent.storyboard_prompts import (
     asset_token_keys,
     render_asset_tokens,
     tokenize_asset_text,
     tokenize_storyboard_shots,
 )
-from app.services.project_storyboard_images import _build_storyboard_image_prompt
-from app.services.project_storyboard_videos import _build_storyboard_reference_video_prompt
+from app.services.projects.storyboard_images import _build_storyboard_image_prompt
+from app.services.projects.storyboard_videos import _build_storyboard_reference_video_prompt
 from app.services.prompts import render_system_prompt
-from app.services.project_storyboards import (
-    _validate_agent_storyboard_sequence,
+from app.services.projects.storyboard_parsing import (
+    validate_agent_storyboard_sequence,
     build_agent_storyboard_prompt,
     estimate_agent_shot_group_duration,
     parse_storyboard_items,
+)
+from app.services.projects.storyboard_execution import (
     storyboard_analysis_task_is_current,
 )
 from app.core.exceptions import AppException
@@ -267,19 +269,19 @@ def test_agent_storyboard_sequence_requires_ordered_source_coverage() -> None:
         {"shot_number": 1, "source_content": "沈砚进入旧宅。"},
         {"shot_number": 2, "source_content": "他发现桌上的玉佩。"},
     ]
-    _validate_agent_storyboard_sequence(
+    validate_agent_storyboard_sequence(
         items,
         "沈砚进入旧宅。\n他发现桌上的玉佩。",
     )
 
     with pytest.raises(AppException, match="序号不连续"):
-        _validate_agent_storyboard_sequence(
+        validate_agent_storyboard_sequence(
             [{**items[0], "shot_number": 2}, items[1]],
             "沈砚进入旧宅。他发现桌上的玉佩。",
         )
 
     with pytest.raises(AppException, match="未覆盖"):
-        _validate_agent_storyboard_sequence(
+        validate_agent_storyboard_sequence(
             [items[0]],
             "沈砚进入旧宅。他发现桌上的玉佩。随后黑衣人现身。",
         )

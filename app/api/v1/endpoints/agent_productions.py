@@ -9,21 +9,17 @@ from app.core.responses import success
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.agent_production import (
-    AgentProductionCreateRequest,
     AgentProductionCreatedOut,
     AgentProductionConfigurationOut,
     AgentProductionConfigurationRequest,
     AgentProductionDeletedOut,
     AgentProductionDetailOut,
     AgentProductionFromTextRequest,
-    AgentProductionListOut,
-    AgentProductionOut,
     AgentProductionMode,
     AgentProductionProjectListOut,
     AgentProductionSummaryOut,
     AgentProductionStatus,
     AgentVideoResolution,
-    AgentSourcePreviewOut,
     AgentEpisodePlanConfirmOut,
     AgentEpisodePlanConfirmRequest,
     AgentEpisodePlanImpactOut,
@@ -34,7 +30,7 @@ from app.schemas.agent_production import (
 )
 from app.schemas.project import ProjectGenerationRatio
 from app.schemas.agent_production_control import AgentProductionWorkbenchOut
-from app.services.agent_episode_plans import (
+from app.services.agent.episode_plans import (
     confirm_episode_plan,
     get_episode_plan_document,
     merge_episode_plans,
@@ -42,22 +38,19 @@ from app.services.agent_episode_plans import (
     split_episode_plan,
     update_episode_plan,
 )
-from app.services.agent_entries import (
+from app.services.agent.entries import (
     configure_agent_production,
     create_agent_production_from_file,
     create_agent_production_from_text,
     get_agent_production_configuration,
     list_agent_projects,
 )
-from app.services.agent_productions import (
+from app.services.agent.productions import (
     apply_agent_production_action,
-    create_agent_production,
     delete_agent_production,
     get_agent_production_or_404,
-    list_agent_productions,
 )
-from app.services.agent_source_files import preview_agent_source_file
-from app.services.agent_workbench import get_agent_production_workbench
+from app.services.agent.workbench import get_agent_production_workbench
 
 router = APIRouter()
 
@@ -152,18 +145,6 @@ async def my_agent_projects(
     return success(data=data.model_dump(mode="json"))
 
 
-@router.post("/projects/{project_id}/agent-productions/source-preview")
-async def preview_my_agent_source_file(
-    project_id: UUID,
-    file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    result = await preview_agent_source_file(db, project_id, current_user, file)
-    data = AgentSourcePreviewOut.model_validate(result)
-    return success(data=data.model_dump(mode="json"), message="剧本文件解析成功")
-
-
 @router.get("/agent-productions/{production_id}/episode-plans")
 async def my_agent_episode_plans(
     production_id: UUID,
@@ -234,44 +215,6 @@ async def confirm_my_agent_episode_plan(
     result = await confirm_episode_plan(db, production_id, current_user, payload)
     data = AgentEpisodePlanConfirmOut.model_validate(result)
     return success(data=data.model_dump(mode="json"), message="分集规划已确认")
-
-
-@router.post("/projects/{project_id}/agent-productions")
-async def create_my_agent_production(
-    project_id: UUID,
-    payload: AgentProductionCreateRequest,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    production = await create_agent_production(db, project_id, current_user, payload)
-    data = AgentProductionDetailOut.model_validate(production)
-    return success(data=data.model_dump(mode="json"), message="创建成功")
-
-
-@router.get("/projects/{project_id}/agent-productions")
-async def my_agent_productions(
-    project_id: UUID,
-    status: Optional[AgentProductionStatus] = Query(default=None),
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    productions, total = await list_agent_productions(
-        db,
-        project_id=project_id,
-        user_id=current_user.id,
-        status=status,
-        page=page,
-        page_size=page_size,
-    )
-    data = AgentProductionListOut(
-        items=[AgentProductionOut.model_validate(item) for item in productions],
-        total=total,
-        page=page,
-        page_size=page_size,
-    )
-    return success(data=data.model_dump(mode="json"))
 
 
 @router.get("/agent-productions/{production_id}")

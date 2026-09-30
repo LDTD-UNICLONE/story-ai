@@ -21,12 +21,18 @@ class _CommitDb:
     async def commit(self):
         self.commit_count += 1
 
+    async def refresh(self, _record):
+        pass
+
 
 @pytest.mark.asyncio
-async def test_apimart_stream_deltas_are_buffered_before_database_flush() -> None:
+async def test_apimart_stream_deltas_are_buffered_before_database_flush(monkeypatch) -> None:
     db = _CommitDb()
     assistant_message = SimpleNamespace(content="任务已提交", extra={})
-    callback = _build_apimart_text_delta_callback(db, assistant_message)
+    monkeypatch.setattr(
+        "app.tasks.model_generation.lock_active_task", AsyncMock(return_value=True)
+    )
+    callback = _build_apimart_text_delta_callback(db, assistant_message, SimpleNamespace(id=uuid4(), user_id=uuid4()))
 
     await callback("甲" * 64)
 
@@ -127,7 +133,7 @@ async def test_conversation_stream_starts_with_snapshot_then_sends_delta(monkeyp
     first_content = "甲" * 128
     states = [
         (
-            SimpleNamespace(id=task_id, status="running", result=None),
+            SimpleNamespace(id=task_id, status="running", result=None, extra={}),
             SimpleNamespace(
                 id=message_id,
                 content=first_content,
@@ -135,7 +141,7 @@ async def test_conversation_stream_starts_with_snapshot_then_sends_delta(monkeyp
             ),
         ),
         (
-            SimpleNamespace(id=task_id, status="success", result=first_content + "乙"),
+            SimpleNamespace(id=task_id, status="success", result=first_content + "乙", extra={}),
             SimpleNamespace(
                 id=message_id,
                 content=first_content + "乙",
@@ -173,7 +179,7 @@ async def test_conversation_stream_starts_with_snapshot_then_sends_delta(monkeyp
         return None
 
     monkeypatch.setattr(conversation_endpoint, "AsyncSessionLocal", SessionFactory())
-    monkeypatch.setattr(conversation_endpoint.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr("app.services.generation.task_events.asyncio.sleep", no_sleep)
 
     events = [
         item
@@ -262,7 +268,7 @@ async def test_conversation_video_stream_sends_progress_only_when_changed(monkey
         return None
 
     monkeypatch.setattr(conversation_endpoint, "AsyncSessionLocal", SessionFactory())
-    monkeypatch.setattr(conversation_endpoint.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr("app.services.generation.task_events.asyncio.sleep", no_sleep)
 
     events = [
         item

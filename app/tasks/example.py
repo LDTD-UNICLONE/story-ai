@@ -1,7 +1,7 @@
 from typing import Dict
 
 from app.core.timezone import now_beijing
-from app.worker import celery_app
+from app.core.celery_app import celery_app
 
 
 @celery_app.task(name="tasks.example.ping")

@@ -12,11 +12,11 @@ from app.integrations.apimart_video_specs import (
     build_video_payload,
     video_model_capabilities,
 )
-from app.services.ai_models import resolve_ai_model_capabilities
-from app.services.conversations import _build_video_message_extra
-from app.services.model_runner import run_model
-from app.services.model_points import calculate_video_model_points_cost
-from app.services.project_storyboard_videos import (
+from app.services.models.catalog import resolve_ai_model_capabilities
+from app.services.conversation.video_inputs import build_video_message_extra
+from app.services.generation.runner import run_model
+from app.services.billing.model_points import calculate_video_model_points_cost
+from app.services.projects.storyboard_videos import (
     _build_storyboard_video_extra,
     _normalize_storyboard_video_resolution,
     storyboard_video_image_limit,
@@ -266,7 +266,7 @@ async def test_conversation_allows_seedance_25_audio_only_reference() -> None:
         capabilities={},
     )
 
-    extra = await _build_video_message_extra(
+    extra = await build_video_message_extra(
         {
             "audio_urls": ["https://cdn.example/dialogue.mp3"],
             "generation_mode": "reference",

@@ -1,9 +1,13 @@
+import subprocess
+import sys
+from pathlib import Path
+from textwrap import dedent
 from types import SimpleNamespace
 
 import pytest
 
 from app.core.exceptions import AppException
-from app.services.model_configuration import (
+from app.services.models.configuration import (
     build_model_configuration,
     build_model_runtime_snapshot,
     ensure_model_available,
@@ -112,6 +116,38 @@ def test_unified_configuration_validates_vendor_specific_billing_policy() -> Non
         )
 
     assert exc_info.value.code == 40062
+
+
+def test_configuration_validation_does_not_load_points_services() -> None:
+    # A fresh interpreter prevents other tests' imports from hiding this dependency.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            dedent(
+                """
+                import sys
+                from app.services.models.configuration import normalize_model_configuration
+
+                configuration = normalize_model_configuration(
+                    vendor="comfly",
+                    model_type="image",
+                    configuration={"billing": {"policy": {"type": " IMAGE "}}},
+                )
+
+                assert configuration["billing"]["policy"] == {"type": "image"}
+                assert "app.services.billing.model_points" not in sys.modules
+                assert "app.services.billing.points" not in sys.modules
+                """
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_maintenance_configuration_blocks_new_generation_with_public_message() -> None:

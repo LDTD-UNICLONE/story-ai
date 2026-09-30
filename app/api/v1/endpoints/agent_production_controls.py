@@ -18,8 +18,8 @@ from app.schemas.agent_production_control import (
     AgentProductionExceptionOut,
     AgentProductionMatrixOut,
 )
-from app.services.agent_batch_productions import retry_batch_jobs, skip_batch_jobs
-from app.services.agent_production_monitoring import (
+from app.services.agent.batch_productions import retry_batch_jobs, skip_batch_jobs
+from app.services.agent.production_monitoring import (
     get_agent_production_costs,
     get_agent_production_matrix,
     list_agent_production_events,

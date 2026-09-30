@@ -15,7 +15,7 @@ from app.schemas.task_record import (
     AdminTaskRecordListItemOut,
     UserTaskRecordOut,
 )
-from app.services.task_records import (
+from app.services.generation.task_records import (
     get_task_record_options,
     get_task_record_or_404,
     interrupt_task_record,

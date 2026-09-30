@@ -7,9 +7,10 @@ import pytest
 
 from app.core.exceptions import AppException
 from app.core.public_messages import sanitize_public_data
-from app.services.ai_models import get_ai_model_billing_recommendation
-from app.services.model_configuration import default_model_platform_multiplier
-from app.services.model_points import (
+from app.services.models.catalog import get_ai_model_billing_recommendation
+from app.services.billing.policy import validate_model_billing_policy
+from app.services.models.configuration import default_model_platform_multiplier
+from app.services.billing.model_points import (
     _task_billing_model,
     build_model_billing_snapshot,
     calculate_image_model_points_cost,
@@ -21,9 +22,8 @@ from app.services.model_points import (
     settle_image_task_points,
     settle_text_task_points,
     summarize_base_points_recommendation,
-    validate_model_billing_policy,
 )
-from app.services.points import change_user_points
+from app.services.billing.points import change_user_points
 
 
 def _model(model_type: str, policy: dict, **overrides):
@@ -415,6 +415,28 @@ def test_video_policy_charges_duration_resolution_and_reference_type() -> None:
     assert points == 280
 
 
+@pytest.mark.parametrize(
+    "resolution, message",
+    [
+        ("1080p", "请求分辨率没有对应的视频计费费率"),
+        ("720p", "参考类型 none 没有对应的视频计费费率"),
+    ],
+    ids=["missing-resolution-rate", "missing-reference-rate"],
+)
+def test_video_policy_rejects_requests_without_matching_rates(
+    resolution: str,
+    message: str,
+) -> None:
+    model = _model("video", {"type": "video", "rates": {"720p": {"video": "13"}}})
+
+    with pytest.raises(AppException) as exc_info:
+        calculate_video_model_points_cost(model, {"duration": 5, "resolution": resolution})
+
+    assert exc_info.value.code == 40062
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.message == message
+
+
 def test_video_policy_does_not_treat_disabled_audio_as_audio_reference() -> None:
     model = _model(
         "video",
@@ -603,7 +625,7 @@ async def test_apimart_image_success_keeps_admin_fixed_charge(monkeypatch) -> No
         transactions.append(kwargs)
         return SimpleNamespace(id="refund-transaction")
 
-    monkeypatch.setattr("app.services.model_points.change_user_points", change_points)
+    monkeypatch.setattr("app.services.billing.model_points.change_user_points", change_points)
     task_record = SimpleNamespace(
         user_id="user-id",
         title="生成图片",
@@ -634,7 +656,7 @@ async def test_apimart_image_success_keeps_admin_policy_charge(monkeypatch) -> N
         transactions.append(kwargs)
         return SimpleNamespace(id="points-transaction")
 
-    monkeypatch.setattr("app.services.model_points.change_user_points", change_points)
+    monkeypatch.setattr("app.services.billing.model_points.change_user_points", change_points)
     policy = {
         "type": "image",
         "default_resolution": "1.5k",
@@ -678,7 +700,7 @@ async def test_actual_cost_supplement_is_recorded_even_when_it_overdraws_balance
         transactions.append(kwargs)
         return SimpleNamespace(id="supplement-transaction")
 
-    monkeypatch.setattr("app.services.model_points.change_user_points", change_points)
+    monkeypatch.setattr("app.services.billing.model_points.change_user_points", change_points)
     task_record = SimpleNamespace(
         user_id="user-id",
         title="文本生成",
@@ -709,7 +731,7 @@ async def test_apimart_usage_credits_settlement_refunds_precharge(monkeypatch) -
         transactions.append(kwargs)
         return SimpleNamespace(id="refund-transaction")
 
-    monkeypatch.setattr("app.services.model_points.change_user_points", change_points)
+    monkeypatch.setattr("app.services.billing.model_points.change_user_points", change_points)
     task_record = SimpleNamespace(
         user_id="user-id",
         title="APIMart 文本生成",

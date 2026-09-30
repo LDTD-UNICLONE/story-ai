@@ -28,7 +28,7 @@ from app.services.admin_users import (
     reset_user_password,
     update_user,
 )
-from app.services.points import change_user_points, list_user_points_transactions
+from app.services.billing.points import change_user_points, list_user_points_transactions
 
 router = APIRouter(prefix="/admin/users")
 

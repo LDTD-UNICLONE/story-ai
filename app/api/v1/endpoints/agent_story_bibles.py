@@ -20,7 +20,7 @@ from app.schemas.agent_story_bible import (
     SeriesBibleVersionListOut,
     SeriesBibleVersionOut,
 )
-from app.services.agent_story_bibles import (
+from app.services.agent.story_bibles import (
     confirm_story_bible,
     get_current_story_bible,
     initialize_story_bible,

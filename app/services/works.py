@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 
 from fastapi import UploadFile
 from sqlalchemy import and_, delete, exists, func, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
@@ -264,7 +264,7 @@ async def get_work_detail(
     *,
     increment_view: bool = True,
 ) -> WorkOut:
-    work = await _get_work_or_404(db, work_id)
+    work = await _get_work_or_404(db, work_id, lock=increment_view)
     _ensure_can_view_work(work, user)
     if (
         increment_view
@@ -285,7 +285,7 @@ async def get_work_detail(
 async def update_work(
     db: AsyncSession, work_id: UUID, user: User, payload: WorkUpdateRequest
 ) -> WorkOut:
-    work = await _get_work_or_404(db, work_id)
+    work = await _get_work_or_404(db, work_id, lock=True)
     if work.user_id != user.id:
         raise AppException("无权修改该作品", code=40320, status_code=403)
     if work.status == "deleted":
@@ -320,15 +320,16 @@ async def update_work(
     except Exception:
         await db.rollback()
         raise
-    await _process_queued_oss_deletions_best_effort(db, removed_object_keys)
     await db.refresh(work)
-    return await _build_work_out(db, work, user)
+    response = await _build_work_out(db, work, user)
+    await _process_queued_oss_deletions_best_effort(db, removed_object_keys)
+    return response
 
 
 async def admin_update_work(
     db: AsyncSession, work_id: UUID, user: User, payload: AdminWorkUpdateRequest
 ) -> WorkOut:
-    work = await _get_work_or_404(db, work_id)
+    work = await _get_work_or_404(db, work_id, lock=True)
     if work.status == "deleted":
         raise AppException("已删除作品不能恢复或修改", code=40051, status_code=400)
     data = payload.model_dump(exclude_unset=True)
@@ -347,13 +348,14 @@ async def admin_update_work(
     work.updated_at = beijing_datetime()
     await enqueue_oss_deletions(db, object_keys)
     await db.commit()
-    await _process_queued_oss_deletions_best_effort(db, object_keys)
     await db.refresh(work)
-    return await _build_work_out(db, work, user)
+    response = await _build_work_out(db, work, user)
+    await _process_queued_oss_deletions_best_effort(db, object_keys)
+    return response
 
 
 async def admin_approve_work(db: AsyncSession, work_id: UUID, user: User) -> WorkOut:
-    work = await _get_work_or_404(db, work_id)
+    work = await _get_work_or_404(db, work_id, lock=True)
     if work.status == "deleted" or not work.is_enabled:
         raise AppException("已删除作品不能审核通过", code=40047, status_code=400)
     if not await _work_has_media(db, work.id):
@@ -367,7 +369,7 @@ async def admin_approve_work(db: AsyncSession, work_id: UUID, user: User) -> Wor
 
 
 async def admin_hide_work(db: AsyncSession, work_id: UUID, user: User) -> WorkOut:
-    work = await _get_work_or_404(db, work_id)
+    work = await _get_work_or_404(db, work_id, lock=True)
     if work.status == "deleted" or not work.is_enabled:
         raise AppException("已删除作品不能下架", code=40048, status_code=400)
     work.status = "hidden"
@@ -379,20 +381,21 @@ async def admin_hide_work(db: AsyncSession, work_id: UUID, user: User) -> WorkOu
 
 
 async def admin_delete_work(db: AsyncSession, work_id: UUID, user: User) -> WorkOut:
-    work = await _get_work_or_404(db, work_id)
+    work = await _get_work_or_404(db, work_id, lock=True)
     object_keys = await _work_oss_object_keys(db, work.id)
     work.status = "deleted"
     work.is_enabled = False
     work.updated_at = beijing_datetime()
     await enqueue_oss_deletions(db, object_keys)
     await db.commit()
-    await _process_queued_oss_deletions_best_effort(db, object_keys)
     await db.refresh(work)
-    return await _build_work_out(db, work, user)
+    response = await _build_work_out(db, work, user)
+    await _process_queued_oss_deletions_best_effort(db, object_keys)
+    return response
 
 
 async def delete_work(db: AsyncSession, work_id: UUID, user: User) -> WorkOut:
-    work = await _get_work_or_404(db, work_id)
+    work = await _get_work_or_404(db, work_id, lock=True)
     if work.user_id != user.id:
         raise AppException("无权删除该作品", code=40320, status_code=403)
     object_keys = await _work_oss_object_keys(db, work.id)
@@ -401,34 +404,34 @@ async def delete_work(db: AsyncSession, work_id: UUID, user: User) -> WorkOut:
     work.updated_at = beijing_datetime()
     await enqueue_oss_deletions(db, object_keys)
     await db.commit()
-    await _process_queued_oss_deletions_best_effort(db, object_keys)
     await db.refresh(work)
-    return await _build_work_out(db, work, user)
+    response = await _build_work_out(db, work, user)
+    await _process_queued_oss_deletions_best_effort(db, object_keys)
+    return response
 
 
 async def like_work(db: AsyncSession, work_id: UUID, user: User) -> WorkOut:
-    work = await _get_work_or_404(db, work_id)
+    work = await _get_work_or_404(db, work_id, lock=True)
     _ensure_can_like_work(work, user)
-    like = UserWorkLike(work_id=work.id, user_id=user.id)
-    db.add(like)
-    try:
-        await db.flush()
-    except IntegrityError:
-        await db.rollback()
-        work = await _get_work_or_404(db, work_id)
-        return await _build_work_out(db, work, user)
-    await db.execute(
-        update(UserWork)
-        .where(UserWork.id == work.id)
-        .values(like_count=UserWork.like_count + 1, updated_at=beijing_datetime())
+    result = await db.execute(
+        insert(UserWorkLike)
+        .values(work_id=work.id, user_id=user.id)
+        .on_conflict_do_nothing(index_elements=[UserWorkLike.work_id, UserWorkLike.user_id])
+        .returning(UserWorkLike.id)
     )
+    if result.scalar_one_or_none() is not None:
+        await db.execute(
+            update(UserWork)
+            .where(UserWork.id == work.id)
+            .values(like_count=UserWork.like_count + 1, updated_at=beijing_datetime())
+        )
     await db.commit()
     await db.refresh(work)
     return await _build_work_out(db, work, user)
 
 
 async def unlike_work(db: AsyncSession, work_id: UUID, user: User) -> WorkOut:
-    work = await _get_work_or_404(db, work_id)
+    work = await _get_work_or_404(db, work_id, lock=True)
     _ensure_can_like_work(work, user)
     result = await db.execute(
         delete(UserWorkLike).where(UserWorkLike.work_id == work.id, UserWorkLike.user_id == user.id)
@@ -474,7 +477,9 @@ async def get_work_media_for_stream(
 async def get_upload_for_preview(db: AsyncSession, upload_id: UUID, user: User) -> UserWorkUpload:
     result = await db.execute(
         select(UserWorkUpload).where(
-            UserWorkUpload.id == upload_id, UserWorkUpload.user_id == user.id
+            UserWorkUpload.id == upload_id,
+            UserWorkUpload.user_id == user.id,
+            UserWorkUpload.is_used.is_(False),
         )
     )
     upload = result.scalar_one_or_none()
@@ -573,8 +578,13 @@ async def _replace_work_media(
     return removed_object_keys
 
 
-async def _get_work_or_404(db: AsyncSession, work_id: UUID) -> UserWork:
-    result = await db.execute(select(UserWork).where(UserWork.id == work_id))
+async def _get_work_or_404(
+    db: AsyncSession, work_id: UUID, *, lock: bool = False
+) -> UserWork:
+    query = select(UserWork).where(UserWork.id == work_id)
+    if lock:
+        query = query.with_for_update().execution_options(populate_existing=True)
+    result = await db.execute(query)
     work = result.scalar_one_or_none()
     if work is None:
         raise AppException("作品不存在", code=40420, status_code=404)
@@ -692,6 +702,7 @@ async def _build_work_out_list(
                 UserWorkMedia.work_id.asc(),
                 UserWorkMedia.sort_order.asc(),
                 UserWorkMedia.created_at.asc(),
+                UserWorkMedia.id.asc(),
             )
         )
         for media in media_result.scalars().all():
@@ -755,7 +766,11 @@ async def _work_media_items(db: AsyncSession, work_id: UUID) -> List[UserWorkMed
     result = await db.execute(
         select(UserWorkMedia)
         .where(UserWorkMedia.work_id == work_id)
-        .order_by(UserWorkMedia.sort_order.asc(), UserWorkMedia.created_at.asc())
+        .order_by(
+            UserWorkMedia.sort_order.asc(),
+            UserWorkMedia.created_at.asc(),
+            UserWorkMedia.id.asc(),
+        )
     )
     return list(result.scalars().all())
 

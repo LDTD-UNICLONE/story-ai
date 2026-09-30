@@ -21,7 +21,7 @@ from app.schemas.user import (
     TokenOut,
     UserOut,
 )
-from app.services.points import change_user_points
+from app.services.billing.points import change_user_points
 from app.services.phone_verification import (
     assert_register_sms_code,
     consume_register_sms_code,

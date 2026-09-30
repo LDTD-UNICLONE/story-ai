@@ -14,11 +14,13 @@ from app.schemas.project import (
     ProjectOut,
     ProjectUpdateRequest,
 )
-from app.services.projects import (
-    create_project,
-    delete_project,
+from app.services.projects.queries import (
     get_project_or_404,
     list_projects,
+)
+from app.services.projects.lifecycle import (
+    create_project,
+    delete_project,
     update_project,
 )
 

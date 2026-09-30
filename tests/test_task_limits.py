@@ -5,7 +5,7 @@ from uuid import uuid4
 import pytest
 
 from app.core.exceptions import AppException
-from app.services.task_records import _enforce_user_task_limits, _lock_user_task_submission
+from app.services.generation.task_records import _enforce_user_task_limits, _lock_user_task_submission
 
 
 def test_media_task_limit_blocks_submission() -> None:

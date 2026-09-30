@@ -12,9 +12,9 @@ from app.schemas.agent_production import (
     AgentProductionCreateRequest,
     AgentProductionFromTextRequest,
 )
-from app.services import agent_productions as production_service
-from app.services import agent_entries as entry_service
-from app.services.agent_entries import agent_list_polling_state
+from app.services.agent import productions as production_service
+from app.services.agent import entries as entry_service
+from app.services.agent.entries import agent_list_polling_state
 
 
 class FakeScalars:
@@ -51,6 +51,11 @@ class FakeSession:
 
     def add(self, item):
         self.added.append(item)
+
+    async def flush(self):
+        for item in self.added:
+            if item.id is None:
+                item.id = uuid4()
 
     async def commit(self):
         self.commits += 1
@@ -124,7 +129,7 @@ def test_agent_production_routes_are_registered() -> None:
         for method in methods
     }
 
-    assert ("/api/v1/projects/{project_id}/agent-productions", "POST") in routes
+    assert ("/api/v1/projects/{project_id}/agent-productions", "POST") not in routes
     assert ("/api/v1/agent-productions/from-file", "POST") in routes
     assert ("/api/v1/agent-productions/from-text", "POST") in routes
     assert ("/api/v1/agent-productions/{production_id}/configuration", "GET") in routes
@@ -133,8 +138,8 @@ def test_agent_production_routes_are_registered() -> None:
     assert (
         "/api/v1/projects/{project_id}/agent-productions/source-preview",
         "POST",
-    ) in routes
-    assert ("/api/v1/projects/{project_id}/agent-productions", "GET") in routes
+    ) not in routes
+    assert ("/api/v1/projects/{project_id}/agent-productions", "GET") not in routes
     assert ("/api/v1/agent-productions/{production_id}", "GET") in routes
     assert ("/api/v1/agent-productions/{production_id}", "DELETE") in routes
     assert ("/api/v1/agent-productions/{production_id}/workbench", "GET") in routes
@@ -415,6 +420,17 @@ async def test_start_action_queues_one_source_analysis_step(monkeypatch) -> None
 
     monkeypatch.setattr(production_service, "_get_locked_production", get_locked)
     monkeypatch.setattr(production_service, "get_agent_production_or_404", get_detail)
+    queued = []
+
+    async def enqueue(_db, production_id, step_id):
+        queued.append((production_id, step_id))
+        return uuid4()
+
+    async def dispatch(_db, ids):
+        assert len(ids) == 1
+
+    monkeypatch.setattr(production_service, "enqueue_source_analysis", enqueue)
+    monkeypatch.setattr(production_service, "dispatch_tasks_best_effort", dispatch)
 
     result = await production_service.apply_agent_production_action(db, item.id, user, "start")
 
@@ -425,6 +441,7 @@ async def test_start_action_queues_one_source_analysis_step(monkeypatch) -> None
     events = [added for added in db.added if isinstance(added, AgentEvent)]
     assert len(steps) == 1
     assert steps[0].status == "queued"
+    assert queued == [(item.id, steps[0].id)]
     assert events[0].event_type == "production.started"
 
 
@@ -514,7 +531,11 @@ async def test_resume_requeues_failed_source_analysis_without_recreating_success
 
     monkeypatch.setattr(production_service, "_get_locked_production", get_locked)
     monkeypatch.setattr(production_service, "get_agent_production_or_404", get_detail)
-    monkeypatch.setattr(production_service, "_enqueue_source_analysis", enqueue)
+    monkeypatch.setattr(production_service, "enqueue_source_analysis", enqueue)
+    async def dispatch(_db, _message_ids):
+        pass
+
+    monkeypatch.setattr(production_service, "dispatch_tasks_best_effort", dispatch)
 
     await production_service.apply_agent_production_action(db, item.id, user, "resume")
 

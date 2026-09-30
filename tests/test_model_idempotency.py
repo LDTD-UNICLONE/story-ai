@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.integrations import comfly
-from app.services.model_runner import run_model
+from app.services.generation.runner import run_model
 
 
 @pytest.mark.asyncio

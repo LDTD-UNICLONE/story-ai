@@ -17,7 +17,7 @@ from app.schemas.points import (
     RechargeOrderOut,
     RechargeRefundRequest,
 )
-from app.services.recharges import (
+from app.services.billing.recharges import (
     get_recharge_order_or_404,
     list_all_recharge_orders,
     refund_recharge_order,

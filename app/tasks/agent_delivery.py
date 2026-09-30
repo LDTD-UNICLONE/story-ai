@@ -2,12 +2,12 @@ import asyncio
 from uuid import UUID
 
 from app.db.session import create_worker_sessionmaker
-from app.services.agent_reviews import (
+from app.services.agent.reviews import (
     claim_agent_delivery,
     fail_agent_delivery,
     run_agent_delivery,
 )
-from app.worker import celery_app
+from app.core.celery_app import celery_app
 
 
 WorkerSessionLocal = create_worker_sessionmaker()
@@ -28,6 +28,7 @@ async def _build_agent_delivery(delivery_id: UUID) -> int:
         try:
             await run_agent_delivery(db, delivery_id, lease_token)
         except Exception as exc:
+            await db.rollback()
             await fail_agent_delivery(
                 db,
                 delivery_id,

@@ -13,18 +13,18 @@ from app.schemas.agent_storyboard_media import (
     AgentStoryboardVideoConfigRequest,
     AgentStoryboardVideoGenerationRequest,
 )
-from app.services.agent_storyboard_media import (
+from app.services.agent.storyboard_media import (
     EPISODE_BATCH_REUSED_STATUSES,
     _request_signature,
     _storyboard_request_signature,
     _storyboard_video_parameters,
     _video_item,
 )
-from app.services.agent_video_settings import (
+from app.services.agent.video_settings import (
     provider_video_duration,
     require_agent_video_defaults,
 )
-from app.services.agent_storyboard_video_inputs import (
+from app.services.agent.storyboard_video_inputs import (
     _compile_prompt,
     build_agent_storyboard_video_input,
 )
@@ -362,10 +362,10 @@ async def test_multimodal_input_rejects_selected_variant_without_image(monkeypat
         }
 
     monkeypatch.setattr(
-        "app.services.agent_storyboard_video_inputs._load_assets", load_assets
+        "app.services.agent.storyboard_video_inputs._load_assets", load_assets
     )
     monkeypatch.setattr(
-        "app.services.agent_storyboard_video_inputs._load_variants", load_variants
+        "app.services.agent.storyboard_video_inputs._load_variants", load_variants
     )
     with pytest.raises(AppException, match="缺少参考图") as exc_info:
         await build_agent_storyboard_video_input(
@@ -436,13 +436,13 @@ async def test_multimodal_input_uses_only_mentioned_assets_in_mention_order(
         return [f"resolved-{url}" for url in urls]
 
     monkeypatch.setattr(
-        "app.services.agent_storyboard_video_inputs._load_assets", load_assets
+        "app.services.agent.storyboard_video_inputs._load_assets", load_assets
     )
     monkeypatch.setattr(
-        "app.services.agent_storyboard_video_inputs._load_variants", load_variants
+        "app.services.agent.storyboard_video_inputs._load_variants", load_variants
     )
     monkeypatch.setattr(
-        "app.services.agent_storyboard_video_inputs.resolve_storyboard_reference_image_urls",
+        "app.services.agent.storyboard_video_inputs.resolve_storyboard_reference_image_urls",
         resolve_urls,
     )
 

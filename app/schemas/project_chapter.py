@@ -92,16 +92,3 @@ class ProjectChapterUpdateRequest(SchemaBaseModel):
         if value is None:
             raise ValueError("章节排序不能为 null")
         return value
-
-
-class ProjectChapterProcessRequest(SchemaBaseModel):
-    ai_model_id: UUID
-    processing_prompt: Optional[str] = Field(default=None, min_length=1)
-    extra: Optional[Dict[str, Any]] = None
-
-
-class ProjectChapterProcessOut(SchemaBaseModel):
-    chapter: ProjectChapterOut
-    task_record_id: UUID
-    points_cost: int
-    next_poll_seconds: Optional[int] = None

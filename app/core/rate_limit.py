@@ -56,7 +56,9 @@ class RedisRateLimitMiddleware(BaseHTTPMiddleware):
 def _match_rule(request: Request) -> str:
     path = request.url.path
     method = request.method.upper()
-    if method == "GET" and _is_polling_path(path):
+    if method == "POST" and path.endswith("/task-records/batch"):
+        return "polling"
+    if method == "GET" and (_is_polling_path(path) or ("/canvases/" in path and path.endswith("/tasks"))):
         return "polling"
     if ( path.endswith("/auth/login") or path.endswith("/auth/register") or path.endswith("/auth/register/sms-code")
     ):

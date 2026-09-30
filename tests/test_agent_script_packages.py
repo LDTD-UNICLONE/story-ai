@@ -16,15 +16,15 @@ from app.schemas.agent_story_bible import (
     AgentAssetCandidateOut,
     AgentAssetVariantUpdateRequest,
 )
-from app.services.agent_source_text import validate_agent_stage_output
-from app.services.agent_story_bibles import (
+from app.services.agent.source_text import validate_agent_stage_output
+from app.services.agent.story_bibles import (
     _merge_incremental_bible_content,
     build_asset_candidate_payloads,
     build_asset_variant_payloads,
     sync_asset_candidate_episode_links,
     sync_asset_variant_episode_links,
 )
-from app.services.agent_workbench import resolve_workbench_actions
+from app.services.agent.workbench import resolve_workbench_actions
 
 
 def _candidate(asset_type: str, name: str, aliases=None) -> AgentAssetCandidate:

@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
-from pydantic import ConfigDict, Field, field_serializer, field_validator, model_validator
+from pydantic import ConfigDict, Field, HttpUrl, field_serializer, field_validator, model_validator
 
 from app.core.config import settings
 from app.core.public_messages import sanitize_public_data, sanitize_public_message
@@ -181,6 +181,20 @@ _MESSAGE_EXTRA_COMPAT_FIELDS = {
 }
 
 
+class ConversationImageReference(SchemaBaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[\w-]+$")
+    url: Optional[HttpUrl] = Field(default=None, max_length=2048)
+    image_id: Optional[UUID] = None
+
+    @model_validator(mode="after")
+    def validate_image_source(self):
+        if (self.url is None) == (self.image_id is None):
+            raise ValueError("url 和 image_id 必须且只能提供一个")
+        return self
+
+
 class ConversationSendMessageRequest(SchemaBaseModel):
     content: str = Field(
         ...,
@@ -190,6 +204,15 @@ class ConversationSendMessageRequest(SchemaBaseModel):
     ai_model_id: Optional[UUID] = None
     client_message_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
     extra: Optional[Dict[str, Any]] = None
+    image_references: List[ConversationImageReference] = Field(default_factory=list, max_length=32)
+
+    @field_validator("image_references")
+    @classmethod
+    def validate_reference_names(cls, value: List[ConversationImageReference]):
+        names = [item.name for item in value]
+        if len(names) != len(set(names)):
+            raise ValueError("图片引用名称不能重复")
+        return value
 
     @field_validator("content")
     @classmethod
@@ -241,6 +264,7 @@ class ConversationSendMessageOut(SchemaBaseModel):
 
 
 class ConversationGenerationTaskOut(SchemaBaseModel):
+    phase: str = "queued"
     task_record_id: UUID
     conversation_id: UUID
     assistant_message_id: Optional[UUID] = None

@@ -796,12 +796,19 @@ def _validate_url(value: str, *, allow_asset: bool = False, allow_video_data: bo
     lowered = normalized.lower()
     if allow_video_data and lowered.startswith("data:video/"):
         return
-    scheme = urlsplit(normalized).scheme.lower()
     allowed = {"http", "https"}
     if allow_asset:
         allowed.add("asset")
+    try:
+        parsed = urlsplit(normalized)
+        scheme = parsed.scheme.lower()
+        valid = bool(parsed.hostname) and not any(char.isspace() for char in normalized)
+    except ValueError as exc:
+        raise AppException("媒体地址格式不正确", code=40012, status_code=400) from exc
     if scheme not in allowed:
         raise AppException("媒体地址协议不受当前模型支持", code=40012, status_code=400)
+    if not valid:
+        raise AppException("媒体地址格式不正确", code=40012, status_code=400)
 
 
 def _normalize_image_role(value: Any) -> str:

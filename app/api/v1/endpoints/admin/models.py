@@ -33,7 +33,7 @@ from app.schemas.ai_model import (
     ProviderModelImportRequest,
     ProviderModelOut,
 )
-from app.services.ai_models import (
+from app.services.models.catalog import (
     create_ai_model,
     delete_ai_model,
     get_ai_model_or_404,
@@ -43,7 +43,7 @@ from app.services.ai_models import (
     resolve_ai_model_configuration,
     update_ai_model,
 )
-from app.services.model_configuration import normalize_model_configuration
+from app.services.models.configuration import normalize_model_configuration
 
 router = APIRouter(prefix="/admin/models")
 

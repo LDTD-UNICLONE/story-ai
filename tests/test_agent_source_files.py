@@ -8,8 +8,8 @@ from pypdf import PdfWriter
 
 from app.core.exceptions import AppException
 from app.core.config import settings
-from app.services import agent_source_files
-from app.services.agent_source_files import extract_agent_source_text, parse_agent_source_file
+from app.services.agent import source_files as agent_source_files
+from app.services.agent.source_files import extract_agent_source_text, parse_agent_source_file
 
 
 def _slow_source_extract(_filename: str, _content: bytes):

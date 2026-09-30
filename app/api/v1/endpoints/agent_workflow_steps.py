@@ -8,7 +8,7 @@ from app.core.responses import success
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.agent_workflow import AgentWorkflowOut
-from app.services.agent_workflow_steps import get_agent_workflow
+from app.services.agent.workflow_steps import get_agent_workflow
 
 
 router = APIRouter()

@@ -13,9 +13,9 @@ from app.schemas.conversation import (
     ConversationSendMessageRequest,
     ConversationUpdateRequest,
 )
-from app.services.conversations import (
+from app.services.conversation.text_context import _completed_text_context_messages
+from app.services.conversation.service import (
     _build_message_extra_with_context,
-    _completed_text_context_messages,
 )
 
 

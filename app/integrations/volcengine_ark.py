@@ -2,12 +2,23 @@ import inspect
 import logging
 import re
 from typing import Any, Dict, List, Optional, Set
+from urllib.parse import urlsplit
 
 from starlette.concurrency import run_in_threadpool
 
 from app.core.config import settings
 from app.core.exceptions import AppException
-from app.integrations.comfly import _as_list, _extract_media_url
+from app.core.media_inputs import (
+    FIRST_FRAME_URL_KEYS,
+    LAST_FRAME_URL_KEYS,
+    GENERIC_UPLOAD_MEDIA_KEYS,
+    REFERENCE_IMAGE_URL_KEYS,
+    REFERENCE_VIDEO_URL_KEYS,
+    REFERENCE_AUDIO_URL_KEYS,
+    as_list,
+    extract_media_url,
+    extract_upload_media_type,
+)
 from app.integrations.comfly_dimensions import normalize_ratio
 from app.integrations.volcengine_ark_video_specs import (
     allowed_video_request_keys,
@@ -135,71 +146,6 @@ DEFAULT_WATERMARK = False
 MAX_REFERENCE_IMAGES = 9
 MAX_REFERENCE_VIDEOS = 3
 MAX_REFERENCE_AUDIOS = 3
-GENERIC_UPLOAD_MEDIA_KEYS = (
-    "file",
-    "files",
-    "file_list",
-    "file_url",
-    "file_urls",
-    "fileList",
-    "fileUrl",
-    "fileUrls",
-    "upload",
-    "upload_file",
-    "upload_files",
-    "upload_list",
-    "uploadFile",
-    "uploadFiles",
-    "uploadList",
-    "uploads",
-    "uploaded_file",
-    "uploaded_files",
-    "uploadedFile",
-    "uploadedFiles",
-    "attachment",
-    "attachments",
-    "attachment_url",
-    "attachment_urls",
-    "attachmentUrl",
-    "attachmentUrls",
-)
-FIRST_FRAME_URL_KEYS = (
-    "first_frame_url",
-    "first_frame",
-    "firstFrameUrl",
-    "firstFrame",
-    "first_image_url",
-    "firstImageUrl",
-    "start_frame_url",
-    "start_frame",
-    "startFrameUrl",
-    "startFrame",
-    "start_image_url",
-    "startImageUrl",
-    "reference_first_frame_url",
-    "reference_start_frame_url",
-)
-LAST_FRAME_URL_KEYS = (
-    "last_frame_url",
-    "last_frame",
-    "lastFrameUrl",
-    "lastFrame",
-    "last_image_url",
-    "lastImageUrl",
-    "end_frame_url",
-    "end_frame",
-    "endFrameUrl",
-    "endFrame",
-    "end_image_url",
-    "endImageUrl",
-    "ending_frame_url",
-    "endingFrameUrl",
-    "tail_frame_url",
-    "tailFrameUrl",
-    "reference_last_frame_url",
-    "reference_end_frame_url",
-)
-
 MEDIA_KEY_BY_TYPE = {
     "image_url": "image_url",
     "video_url": "video_url",
@@ -280,13 +226,8 @@ async def close_volcengine_ark_client() -> None:
 
 
 async def create_video_generation(model: str, prompt: str, extra: Dict[str, Any]) -> Dict[str, Any]:
+    payload = build_video_generation_payload(model, prompt, extra)
     client = await init_volcengine_ark_client()
-    model_id = _normalize_model_id(model)
-    payload: Dict[str, Any] = {
-        "model": model_id,
-        "content": _build_content(prompt, extra),
-    }
-    _merge_video_extra(payload, extra)
 
     try:
         result = await run_in_threadpool(_create_video_task, client, payload)
@@ -295,16 +236,33 @@ async def create_video_generation(model: str, prompt: str, extra: Dict[str, Any]
     return _normalize_task_payload(_to_dict(result))
 
 
+def build_video_generation_payload(
+    model: str, prompt: str, extra: Dict[str, Any]
+) -> Dict[str, Any]:
+    model_id = _normalize_model_id(model)
+    payload: Dict[str, Any] = {
+        "model": model_id,
+        "content": _build_content(prompt, extra),
+    }
+    _merge_video_extra(payload, extra)
+    return _normalize_video_task_payload(payload)
+
+
 async def query_video_generation(task_id: str) -> Dict[str, Any]:
-    client = await init_volcengine_ark_client()
+    def query_once():
+        client = _create_client(query=True)
+        try:
+            return _get_video_task(client, task_id)
+        finally:
+            client.close()
     try:
-        result = await run_in_threadpool(_get_video_task, client, task_id)
+        result = await run_in_threadpool(query_once)
     except Exception as exc:
         _raise_provider_error("火山方舟视频任务查询失败", exc)
     return _normalize_task_payload(_to_dict(result))
 
 
-def _create_client() -> Any:
+def _create_client(*, query: bool = False) -> Any:
     if not settings.volcengine_ark_api_key:
         raise AppException("VOLCENGINE_ARK_API_KEY 未配置", code=50031, status_code=500)
 
@@ -319,8 +277,10 @@ def _create_client() -> Any:
 
     kwargs: Dict[str, Any] = {
         "api_key": settings.volcengine_ark_api_key,
-        "timeout": settings.volcengine_ark_timeout_seconds,
+        "timeout": settings.provider_query_timeout_seconds if query else settings.volcengine_ark_timeout_seconds,
     }
+    if query:
+        kwargs["max_retries"] = 0
     base_url = _sdk_base_url()
     if base_url:
         kwargs["base_url"] = base_url
@@ -457,7 +417,7 @@ def _build_media_content(extra: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _normalize_content_items(raw_content: Any) -> List[Dict[str, Any]]:
     content: List[Dict[str, Any]] = []
-    for value in _as_list(raw_content):
+    for value in as_list(raw_content):
         if not isinstance(value, dict):
             raise AppException("火山方舟 content 数组项必须是对象", code=40010, status_code=400)
         item_type = str(value.get("type") or "").strip()
@@ -474,76 +434,25 @@ def _normalize_content_items(raw_content: Any) -> List[Dict[str, Any]]:
 
 def _collect_image_urls(extra: Dict[str, Any]) -> List[str]:
     values: List[Any] = []
-    for key in (
-        "images",
-        "image",
-        "image_url",
-        "image_urls",
-        "imageUrl",
-        "imageUrls",
-        "uploaded_images",
-        "uploadedImages",
-        "reference_image",
-        "reference_image_url",
-        "reference_images",
-        "reference_image_urls",
-        "referenceImage",
-        "referenceImageUrl",
-        "referenceImages",
-        "referenceImageUrls",
-    ):
+    for key in REFERENCE_IMAGE_URL_KEYS:
         if key in extra:
-            values.extend(_as_list(extra[key]))
+            values.extend(as_list(extra[key]))
     return _dedupe_urls([*_collect_urls(values), *_collect_uploaded_media_urls(extra, "image")])
 
 
 def _collect_video_urls(extra: Dict[str, Any]) -> List[str]:
     values: List[Any] = []
-    for key in (
-        "videos",
-        "video",
-        "video_url",
-        "video_urls",
-        "videoUrl",
-        "videoUrls",
-        "uploaded_videos",
-        "uploadedVideos",
-        "reference_video",
-        "reference_video_url",
-        "reference_videos",
-        "reference_video_urls",
-        "referenceVideo",
-        "referenceVideoUrl",
-        "referenceVideos",
-        "referenceVideoUrls",
-    ):
+    for key in REFERENCE_VIDEO_URL_KEYS:
         if key in extra:
-            values.extend(_as_list(extra[key]))
+            values.extend(as_list(extra[key]))
     return _dedupe_urls([*_collect_urls(values), *_collect_uploaded_media_urls(extra, "video")])
 
 
 def _collect_audio_urls(extra: Dict[str, Any]) -> List[str]:
     values: List[Any] = []
-    for key in (
-        "audios",
-        "audio",
-        "audio_url",
-        "audio_urls",
-        "audioUrl",
-        "audioUrls",
-        "uploaded_audios",
-        "uploadedAudios",
-        "reference_audio",
-        "reference_audio_url",
-        "reference_audios",
-        "reference_audio_urls",
-        "referenceAudio",
-        "referenceAudioUrl",
-        "referenceAudios",
-        "referenceAudioUrls",
-    ):
+    for key in REFERENCE_AUDIO_URL_KEYS:
         if key in extra:
-            values.extend(_as_list(extra[key]))
+            values.extend(as_list(extra[key]))
     return _dedupe_urls([*_collect_urls(values), *_collect_uploaded_media_urls(extra, "audio")])
 
 
@@ -572,7 +481,7 @@ def _collect_uploaded_media_urls(extra: Dict[str, Any], media_type: str) -> List
     urls: List[str] = []
     seen = set()
     for key in GENERIC_UPLOAD_MEDIA_KEYS:
-        for value in _as_list(extra.get(key)):
+        for value in as_list(extra.get(key)):
             if _uploaded_media_type(value) != media_type:
                 continue
             url = _extract_ark_media_url(value)
@@ -585,7 +494,7 @@ def _collect_uploaded_media_urls(extra: Dict[str, Any], media_type: str) -> List
 def _uploaded_media_type(value: Any) -> str:
     raw_type = ""
     if isinstance(value, dict):
-        raw_type = _extract_upload_media_type(value)
+        raw_type = extract_upload_media_type(value)
     if raw_type.startswith("image/") or raw_type in {"image", "img", "image_url"}:
         return "image"
     if raw_type.startswith("video/") or raw_type in {"video", "video_url"}:
@@ -603,23 +512,9 @@ def _uploaded_media_type(value: Any) -> str:
     return ""
 
 
-def _extract_upload_media_type(value: Dict[str, Any]) -> str:
-    for key in ("file_type", "media_type", "content_type", "mime_type", "type"):
-        item = value.get(key)
-        if item not in (None, ""):
-            return str(item).strip().lower()
-    for key in ("data", "response", "file", "upload"):
-        nested = value.get(key)
-        if isinstance(nested, dict):
-            media_type = _extract_upload_media_type(nested)
-            if media_type:
-                return media_type
-    return ""
-
-
 def _collect_media_items(extra: Dict[str, Any]) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
-    for value in _as_list(extra.get("media") or extra.get("media_items")):
+    for value in as_list(extra.get("media") or extra.get("media_items")):
         item = _normalize_media_item(value)
         if item:
             items.append(item)
@@ -641,6 +536,15 @@ def _normalize_media_item(value: Any) -> Optional[Dict[str, Any]]:
         raise AppException("火山方舟 content.type 不支持", code=40010, status_code=400)
     if not url:
         raise AppException("火山方舟媒体 content 缺少 url", code=40010, status_code=400)
+    try:
+        parsed = urlsplit(url)
+        valid = (
+            parsed.scheme in {"http", "https", "asset"} and bool(parsed.hostname)
+        ) or (url.startswith("data:") and "," in url)
+    except ValueError:
+        valid = False
+    if not valid or any(char.isspace() for char in url):
+        raise AppException("火山方舟媒体 URL 格式不正确", code=40010, status_code=400)
 
     media_key = MEDIA_KEY_BY_TYPE[item_type]
     normalized_role = _normalize_media_role(role)
@@ -740,7 +644,7 @@ def _has_reference_media_input(extra: Dict[str, Any]) -> bool:
     if _collect_image_urls(extra) or _collect_video_urls(extra) or _collect_audio_urls(extra):
         return True
     for key in ("media_items", "media", "content"):
-        for item in _as_list(extra.get(key)):
+        for item in as_list(extra.get(key)):
             if not isinstance(item, dict):
                 continue
             item_type = str(item.get("type") or "").strip() or _infer_media_item_type(item)
@@ -768,7 +672,7 @@ def _extract_frame_url(
 
     roleless_images: List[str] = []
     for key in ("media_items", "media", "content"):
-        for item in _as_list(extra.get(key)):
+        for item in as_list(extra.get(key)):
             if not isinstance(item, dict):
                 continue
             item_type = str(item.get("type") or "").strip() or _infer_media_item_type(item)
@@ -806,7 +710,7 @@ def _infer_media_item_type(value: Dict[str, Any]) -> str:
 
 
 def _extract_ark_media_url(value: Any) -> Optional[str]:
-    url = _extract_media_url(value)
+    url = extract_media_url(value)
     if url:
         return url
     if isinstance(value, dict):
@@ -1023,7 +927,7 @@ def _normalize_duration(value: Any) -> int:
     if isinstance(value, bool):
         raise AppException("火山方舟视频 duration 必须是整数", code=40010, status_code=400)
     try:
-        duration = int(value)
+        duration = int(str(value).strip())
     except (TypeError, ValueError) as exc:
         raise AppException("火山方舟视频 duration 必须是整数", code=40010, status_code=400) from exc
     if duration == -1:

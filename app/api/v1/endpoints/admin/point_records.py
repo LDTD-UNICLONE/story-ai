@@ -10,7 +10,7 @@ from app.db.session import get_db
 from app.models.points import UserPointsTransaction
 from app.models.user import User
 from app.schemas.points import AdminPointsRecordListOut, AdminPointsRecordOut, PointsRecordUserOut
-from app.services.points import list_all_points_transactions
+from app.services.billing.points import list_all_points_transactions
 
 router = APIRouter(prefix="/admin/point-records")
 

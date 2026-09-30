@@ -7,8 +7,8 @@ from openai import BadRequestError, InternalServerError
 from app.core.exceptions import AppException
 from app.integrations import apimart
 from app.integrations.apimart_image_specs import image_model_capabilities
-from app.services.ai_models import resolve_ai_model_capabilities
-from app.services.model_runner import query_model_task, run_model
+from app.services.models.catalog import resolve_ai_model_capabilities
+from app.services.generation.runner import query_model_task, run_model
 
 
 class _RawResponse:

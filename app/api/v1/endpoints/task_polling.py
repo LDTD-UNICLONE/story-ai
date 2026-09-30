@@ -3,7 +3,7 @@ from typing import Optional
 from fastapi import Response
 
 from app.models.task_record import UserTaskRecord
-from app.services.provider_polling import provider_next_poll_seconds
+from app.services.generation.provider_polling import provider_next_poll_seconds
 
 
 def task_next_poll_seconds(task_record: UserTaskRecord) -> Optional[int]:

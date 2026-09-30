@@ -4,14 +4,14 @@ from types import SimpleNamespace
 import pytest
 
 from app.core.exceptions import AppException
-from app.services.agent_source_analysis import _source_block_inputs
-from app.services.agent_source_text import (
+from app.services.agent.source_analysis import _source_block_inputs
+from app.services.agent.source_text import (
     parse_agent_json_object,
     split_source_text,
     validate_agent_stage_output,
 )
 from app.services.prompts import render_system_prompt
-from app.services.task_records import get_task_record_options
+from app.services.generation.task_records import get_task_record_options
 from app.worker import celery_app
 
 

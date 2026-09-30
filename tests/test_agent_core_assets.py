@@ -16,8 +16,8 @@ from app.schemas.agent_core_asset import (
     CoreAssetUpdateRequest,
     CoreAssetVariantCreateRequest,
 )
-from app.services import agent_core_assets as core_asset_service
-from app.services.project_asset_generation import build_asset_image_prompt
+from app.services.agent import core_assets as core_asset_service
+from app.services.projects.asset_generation import build_asset_image_prompt
 
 
 def test_core_asset_routes_are_registered() -> None:
