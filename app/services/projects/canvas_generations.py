@@ -71,6 +71,7 @@ async def submit_generation(db, project_id, user_id, canvas_id, node_id, payload
             raise AppException("幂等键已用于其他内容版本，请使用新键", code=40980, status_code=409)
         task = await db.get(UserTaskRecord, existing.task_record_id)
         result = generation_out(existing, task)
+        result["revision"] = canvas.revision
         await db.commit()
         return result
     nodes, edges = await _graph(db, canvas_id)
@@ -144,6 +145,7 @@ async def submit_generation(db, project_id, user_id, canvas_id, node_id, payload
         canvas.updated_at = beijing_datetime()
         await db.flush()
         result = generation_out(generation, task)
+        result["revision"] = canvas.revision
     await db.commit()
     await dispatch_tasks_best_effort(db, [task.id])
     return result
